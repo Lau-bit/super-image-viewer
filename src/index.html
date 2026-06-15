@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self' asset: http://asset.localhost;
+             style-src 'self' 'unsafe-inline';
+             script-src 'self';
+             img-src 'self' data: asset: http://asset.localhost blob:;">
+  <title>Super Image Viewer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="no-folder">
+
+  <!-- Custom slim title bar -->
+  <div id="titlebar">
+    <div id="titlebar-drag">
+      <span id="titlebar-title">Super Image Viewer</span>
+    </div>
+    <div id="titlebar-controls">
+      <button id="btn-settings" title="Settings">&#x2699;</button>
+      <button id="btn-minimize" title="Minimize">&#x2212;</button>
+      <button id="btn-close" title="Close">&#x2715;</button>
+    </div>
+  </div>
+
+  <!-- Toolbar -->
+  <div id="toolbar">
+    <button id="btn-folder" title="Select image folder" aria-label="Select image folder">
+      <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3.75 6.75h6.1l1.8 2.1h8.6v8.4a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2V6.75Z"></path>
+        <path d="M3.75 9.25h16.5"></path>
+      </svg>
+      <span>Folder</span>
+    </button>
+    <span id="folder-name" class="folder-name"></span>
+
+    <!-- Image count -->
+    <div class="stepper-control" title="Images per set (4&#x2013;99)">
+      <button id="btn-count-dec" title="Fewer images">&#x2212;</button>
+      <span id="count-display">9</span>
+      <button id="btn-count-inc" title="More images">+</button>
+    </div>
+
+    <!-- Empty slots -->
+    <div class="stepper-control" title="Empty slots for breathing room">
+      <span class="stepper-label">&#x25A2;</span>
+      <button id="btn-empty-dec" title="Fewer empty slots">&#x2212;</button>
+      <span id="empty-display">0</span>
+      <button id="btn-empty-inc" title="More empty slots">+</button>
+    </div>
+
+    <!-- Display mode -->
+    <div id="mode-buttons">
+      <button id="btn-mode-random" class="mode-btn active" title="Random images">Random</button>
+      <button id="btn-mode-chrono" class="mode-btn"        title="Recent images by date">Recent</button>
+    </div>
+
+    <!-- Slideshow -->
+    <button id="btn-slideshow" class="toggle-btn" title="Slideshow &#x2014; auto-advance sets">&#x23F5;</button>
+
+    <!-- Shuffle current set -->
+    <button id="btn-shuffle" title="Shuffle current set">&#x21C4;</button>
+
+    <!-- New random set -->
+    <button id="btn-refresh" title="New set (Space)">&#x21BA;</button>
+
+    <!-- History navigation -->
+    <div id="nav-buttons">
+      <button id="btn-nav-prev" title="Previous set (&#x2190;)" disabled>&#x25C4;</button>
+      <button id="btn-nav-next" title="Next set (&#x2192;)">&#x25BA;</button>
+    </div>
+  </div>
+
+  <!-- Image grid (populated by JS) -->
+  <div id="image-grid"></div>
+
+  <!-- Empty state shown until a folder is selected -->
+  <div id="empty-state">
+    <div id="empty-icon">&#x1F5BC;</div>
+    <p>Select a folder to display images</p>
+    <button id="btn-open-empty">Select Folder</button>
+  </div>
+
+  <!-- Settings panel -->
+  <div id="settings-panel">
+    <div class="settings-title">Settings</div>
+
+    <div class="settings-section-title">Window</div>
+    <button type="button" class="settings-btn" id="setting-save-first-window">Save as 1st window default</button>
+    <button type="button" class="settings-btn" id="setting-reset-first-window">Reset 1st window default</button>
+    <button type="button" class="settings-btn" id="setting-save-secondary-window">Save as 2nd+ window default</button>
+    <button type="button" class="settings-btn" id="setting-reset-secondary-window">Reset 2nd+ window default</button>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-square-app-corners">
+      <span>Square app outer corners</span>
+    </label>
+
+    <div class="settings-section-title">Images (4&#x2013;99)</div>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-first-folder-enabled">
+      <span>Default 1st window folder</span>
+    </label>
+    <div class="settings-folder-row">
+      <button type="button" class="settings-btn" id="setting-browse-first-folder">Browse 1st folder</button>
+      <span id="setting-first-folder-name" class="settings-folder-name">None</span>
+    </div>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-secondary-folder-enabled">
+      <span>Default 2nd window folder</span>
+    </label>
+    <div class="settings-folder-row">
+      <button type="button" class="settings-btn" id="setting-browse-secondary-folder">Browse 2nd folder</button>
+      <span id="setting-secondary-folder-name" class="settings-folder-name">None</span>
+    </div>
+    <label class="settings-option">
+      <span class="settings-label">Count</span>
+      <input type="range" id="setting-count-slider" min="4" max="99" step="1" value="9">
+      <span id="setting-count-value" class="settings-value">9</span>
+    </label>
+
+    <div class="settings-section-title">Slideshow</div>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-auto-hide-ui">
+      <span>Autohide UI on startup</span>
+    </label>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-first-auto-open-slideshow">
+      <span>Auto-slideshow 1st window</span>
+    </label>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-secondary-auto-open-slideshow">
+      <span>Auto-slideshow 2nd window</span>
+    </label>
+    <label class="settings-option">
+      <span class="settings-label">Interval (sec)</span>
+      <input type="number" id="setting-slideshow-duration" min="1" max="3600" value="5">
+    </label>
+  </div>
+
+  <script src="api.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>
