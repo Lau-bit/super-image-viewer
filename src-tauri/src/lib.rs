@@ -23,6 +23,7 @@ const DWMWCP_DONOTROUND: u32 = 1;
 const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico", "avif", "tif", "tiff",
 ];
+const RESTORED_WINDOW_PHYSICAL_X_OFFSET: f64 = -1.0;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -197,9 +198,14 @@ fn set_window_bounds(window: &WebviewWindow, state: &WindowState) -> Result<(), 
     if state.width == 0 || state.height == 0 {
         return Ok(());
     }
+    let scale = window
+        .scale_factor()
+        .map_err(|error| format!("Failed to read window scale factor: {error}"))?;
+    let restored_x = f64::from(state.x) + (RESTORED_WINDOW_PHYSICAL_X_OFFSET / scale);
+
     window
         .set_position(Position::Logical(LogicalPosition {
-            x: f64::from(state.x),
+            x: restored_x,
             y: f64::from(state.y),
         }))
         .map_err(|error| format!("Failed to restore window position: {error}"))?;
@@ -211,7 +217,7 @@ fn set_window_bounds(window: &WebviewWindow, state: &WindowState) -> Result<(), 
         .map_err(|error| format!("Failed to restore window size: {error}"))?;
     window
         .set_position(Position::Logical(LogicalPosition {
-            x: f64::from(state.x),
+            x: restored_x,
             y: f64::from(state.y),
         }))
         .map_err(|error| format!("Failed to restore final window position: {error}"))
