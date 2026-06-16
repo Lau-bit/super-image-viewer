@@ -13,6 +13,13 @@ const ZOOM_FILL_SNAP_RADIUS = 3;
 const ZOOM_FILL_PRESETS = { fill: ZOOM_FILL_COVER_AT, 1: 25, 2: 58, 3: 75 };
 const ZOOM_FILL_PARTIAL_MAX_SCALE = 1.12;
 const ZOOM_FILL_MAX_SCALE = 1.32;
+const MANUAL_ZOOM_MAX = 4;
+const MANUAL_DRAG_THRESHOLD_PX = 4;
+const MANUAL_WHEEL_ZOOM_FACTOR = 0.0015;
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
 
 // ==============================
 // State
@@ -35,6 +42,11 @@ const state = {
   uiHidden:     false,
   settingsOpen: false,
 };
+
+// Per-image manual pan/zoom override (grid only) — keyed by <img> so it's
+// automatically dropped once that element is discarded (new image in slot).
+const imageManualZoom = new WeakMap(); // img -> { scale, tx, ty }
+let hoveredCell = null;
 
 // Session history — array of {slots, chronoOffset}
 const hist = { stack: [], pos: -1 };
@@ -247,6 +259,7 @@ function renderGrid(slots) {
       const c = document.createElement('div');
       c.className = 'grid-cell';
       imageGrid.appendChild(c);
+      attachCellInteractions(c);
       return c;
     })();
 
@@ -263,6 +276,7 @@ function renderGrid(slots) {
         cell.appendChild(img);
       }
       if (img.getAttribute('data-src') !== slot) {
+        imageManualZoom.delete(img);
         img.setAttribute('data-src', slot);
         img.classList.remove('loaded');
         img.onload  = () => img.classList.add('loaded');
@@ -272,6 +286,99 @@ function renderGrid(slots) {
     }
   });
   applyZoomFillToImages();
+}
+
+// Wires per-cell drag-to-pan / wheel-to-zoom / click-to-open-floating-view.
+// Attached once per .grid-cell element (cells are reused across renders), so
+// it always looks up the current <img> inside the cell at interaction time.
+function attachCellInteractions(cell) {
+  let drag = null;
+
+  cell.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    const img = cell.querySelector('img');
+    if (!img || !img.naturalWidth) return;
+    drag = {
+      pointerId: e.pointerId,
+      img,
+      startX: e.clientX,
+      startY: e.clientY,
+      dragging: false,
+      baseline: imageManualZoom.get(img) || { scale: 1, tx: 0, ty: 0 },
+    };
+    try { cell.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  });
+
+  cell.addEventListener('pointermove', e => {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+    if (!drag.dragging) {
+      if (Math.hypot(dx, dy) < MANUAL_DRAG_THRESHOLD_PX) return;
+      drag.dragging = true;
+      cell.classList.add('panning');
+    }
+
+    const rect = cell.getBoundingClientRect();
+    const totalScale = zoomFillScale(appSettings.zoomFillAmount) * drag.baseline.scale;
+    const { maxTx, maxTy } = manualZoomOverflow(drag.img, rect, totalScale);
+    imageManualZoom.set(drag.img, {
+      scale: drag.baseline.scale,
+      tx: clamp(drag.baseline.tx + dx, -maxTx, maxTx),
+      ty: clamp(drag.baseline.ty + dy, -maxTy, maxTy),
+    });
+    applyZoomFillToImages();
+  });
+
+  function endDrag(e) {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    const wasDragging = drag.dragging;
+    try { cell.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+    cell.classList.remove('panning');
+    drag = null;
+    if (!wasDragging) openFloatingImage(cell);
+  }
+  cell.addEventListener('pointerup', endDrag);
+  cell.addEventListener('pointercancel', () => {
+    cell.classList.remove('panning');
+    drag = null;
+  });
+
+  cell.addEventListener('wheel', e => {
+    const img = cell.querySelector('img');
+    if (!img || !img.naturalWidth) return;
+    e.preventDefault();
+    const current = imageManualZoom.get(img) || { scale: 1, tx: 0, ty: 0 };
+    const nextScale = clamp(current.scale * Math.exp(-e.deltaY * MANUAL_WHEEL_ZOOM_FACTOR), 1, MANUAL_ZOOM_MAX);
+    const rect = cell.getBoundingClientRect();
+    const totalScale = zoomFillScale(appSettings.zoomFillAmount) * nextScale;
+    const { maxTx, maxTy } = manualZoomOverflow(img, rect, totalScale);
+    imageManualZoom.set(img, {
+      scale: nextScale,
+      tx: clamp(current.tx, -maxTx, maxTx),
+      ty: clamp(current.ty, -maxTy, maxTy),
+    });
+    applyZoomFillToImages();
+  }, { passive: false });
+
+  cell.addEventListener('pointerenter', () => { hoveredCell = cell; });
+  cell.addEventListener('pointerleave', () => {
+    if (hoveredCell === cell) hoveredCell = null;
+  });
+}
+
+function openFloatingImage(cell) {
+  const img = cell.querySelector('img');
+  if (!img || !img.naturalWidth) return;
+  const path = img.getAttribute('data-src');
+  if (!path) return;
+  const rect = cell.getBoundingClientRect();
+  window.viewerAPI
+    .openImageWindow(path, rect, img.naturalWidth, img.naturalHeight)
+    .catch(error => {
+      console.error('Failed to open image window:', error);
+      showToast('Failed to open image');
+    });
 }
 
 // ==============================
@@ -709,6 +816,51 @@ function applyCurtainToCell(cell, side, coveragePercent) {
   el.style[side] = '0';
 }
 
+// Per-image manual pan/zoom (drag + wheel) — layered independently on top of
+// the global zoom-fill system. Active state forces object-fit:cover and a
+// direct translate+scale transform so dragging maps 1:1 to screen pixels
+// regardless of the current zoom level (translate is applied in the already-
+// scaled coordinate system since it's the leftmost transform function).
+function isManualZoomActive(manual) {
+  return !!manual && (manual.scale !== 1 || manual.tx !== 0 || manual.ty !== 0);
+}
+
+function manualZoomOverflow(img, rect, totalScale) {
+  const coverScale = Math.max(rect.width / img.naturalWidth, rect.height / img.naturalHeight);
+  const renderedW = img.naturalWidth * coverScale * totalScale;
+  const renderedH = img.naturalHeight * coverScale * totalScale;
+  return {
+    maxTx: Math.max(0, (renderedW - rect.width) / 2),
+    maxTy: Math.max(0, (renderedH - rect.height) / 2),
+  };
+}
+
+function applyManualOverride(cell) {
+  const img = cell.querySelector('img');
+  if (!img) return false;
+  const manual = imageManualZoom.get(img);
+  const active = isManualZoomActive(manual);
+  cell.classList.toggle('manual-zoom', active);
+  if (!active) {
+    img.style.objectFit = '';
+    img.style.transform = '';
+    return false;
+  }
+  const totalScale = zoomFillScale(appSettings.zoomFillAmount) * manual.scale;
+  img.style.objectFit = 'cover';
+  img.style.objectPosition = '50% 50%';
+  img.style.transformOrigin = '50% 50%';
+  img.style.transform = `translate(${manual.tx}px, ${manual.ty}px) scale(${totalScale})`;
+  return true;
+}
+
+function recenterManualZoom(cell) {
+  const img = cell && cell.querySelector('img');
+  if (!img || !imageManualZoom.has(img)) return;
+  imageManualZoom.delete(img);
+  applyZoomFillToImages();
+}
+
 function applyZoomFillToImages() {
   const coverMode = isZoomFillCover(appSettings.zoomFillAmount);
   const position = coverMode ? zoomBiasPosition() : { x: 50, y: 50 };
@@ -725,7 +877,8 @@ function applyZoomFillToImages() {
       img.style.objectPosition = positionValue;
       img.style.transformOrigin = positionValue;
     }
-    applyCurtainToCell(cell, img ? curtainSide : null, curtainCoverage);
+    const manualActive = applyManualOverride(cell);
+    applyCurtainToCell(cell, img && !manualActive ? curtainSide : null, curtainCoverage);
   });
 }
 
@@ -1127,6 +1280,15 @@ document.addEventListener('keydown', e => {
   if (e.key === ' ' && !e.ctrlKey && !e.metaKey) {
     e.preventDefault();
     refresh();
+    return;
+  }
+
+  // C — recenter the manual pan/zoom of the hovered image
+  if ((e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey) {
+    if (hoveredCell) {
+      e.preventDefault();
+      recenterManualZoom(hoveredCell);
+    }
     return;
   }
 

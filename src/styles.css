@@ -360,7 +360,18 @@ body {
   transform: scale(var(--zoom-fill-scale, 1));
   display: block;
   opacity: 0;
+  cursor: grab;
   transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+/* Manual per-image pan/zoom is driven by direct pointer/wheel input, so its
+   transform must track the cursor without the ambient transition's lag. */
+.grid-cell.manual-zoom img {
+  transition: opacity 0.12s ease;
+}
+
+.grid-cell.panning img {
+  cursor: grabbing;
 }
 
 body.zoom-fill .grid-cell img {

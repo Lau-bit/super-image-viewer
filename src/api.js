@@ -3,6 +3,7 @@
 const tauri = window.__TAURI__;
 const invoke = tauri?.core?.invoke;
 const dialog = tauri?.dialog;
+const opener = tauri?.opener;
 const convertFileSrc = tauri?.core?.convertFileSrc;
 
 if (!invoke || !dialog || !convertFileSrc) {
@@ -32,4 +33,16 @@ window.viewerAPI = {
   windowStartDrag: () => invoke('window_start_drag'),
   windowMinimize: () => invoke('window_minimize'),
   windowClose: () => invoke('window_close'),
+
+  openImageWindow: (path, rect, naturalWidth, naturalHeight) => invoke('open_image_window', {
+    path,
+    rectX: rect.x,
+    rectY: rect.y,
+    rectW: rect.width,
+    rectH: rect.height,
+    naturalW: naturalWidth,
+    naturalH: naturalHeight,
+  }),
+  getAssignedImagePath: () => invoke('get_assigned_image_path'),
+  revealInFolder: (path) => opener.revealItemInDir(path),
 };

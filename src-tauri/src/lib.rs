@@ -1,13 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
     time::UNIX_EPOCH,
 };
 use tauri::{
-    AppHandle, LogicalPosition, LogicalSize, Manager, Position, Size, WebviewWindow,
-    WebviewWindowBuilder,
+    utils::config::Color, AppHandle, LogicalPosition, LogicalSize, Manager, Position, Size,
+    WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 
 #[cfg(windows)]
@@ -135,6 +139,11 @@ impl Default for Settings {
 #[derive(Default)]
 struct AppState {
     window_counter: AtomicUsize,
+    image_window_counter: AtomicUsize,
+    /// Floating image window label -> source file path.
+    image_paths: Mutex<HashMap<String, String>>,
+    /// Floating image window label -> the app window that opened it.
+    image_owners: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,6 +274,35 @@ fn stagger_window_state(bounds: &WindowState, stagger_index: usize) -> WindowSta
     }
 }
 
+/// Closes every floating image window owned by `owner_label` when that
+/// window itself is destroyed, so floating viewers never outlive the app
+/// window that spawned them.
+fn register_owner_cascade_close(app: &AppHandle, owner_label: &str) {
+    let app = app.clone();
+    let owner_label = owner_label.to_string();
+    if let Some(window) = app.get_webview_window(&owner_label) {
+        window.on_window_event(move |event| {
+            if !matches!(event, WindowEvent::Destroyed) {
+                return;
+            }
+            let state = app.state::<AppState>();
+            let owned: Vec<String> = state
+                .image_owners
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, owner)| owner.as_str() == owner_label)
+                .map(|(label, _)| label.clone())
+                .collect();
+            for label in owned {
+                if let Some(image_window) = app.get_webview_window(&label) {
+                    let _ = image_window.close();
+                }
+            }
+        });
+    }
+}
+
 fn create_viewer_window(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let window_id = state.window_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -294,6 +332,7 @@ fn create_viewer_window(app: &AppHandle) -> Result<(), String> {
 
     let _ = window.unminimize();
     let _ = window.set_focus();
+    register_owner_cascade_close(app, window.label());
 
     Ok(())
 }
@@ -452,6 +491,130 @@ fn window_close(window: WebviewWindow) -> Result<(), String> {
     window.close().map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn open_image_window(
+    app: AppHandle,
+    window: WebviewWindow,
+    path: String,
+    rect_x: f64,
+    rect_y: f64,
+    rect_w: f64,
+    rect_h: f64,
+    natural_w: f64,
+    natural_h: f64,
+) -> Result<(), String> {
+    let scale = window
+        .scale_factor()
+        .map_err(|error| format!("Failed to read scale factor: {error}"))?;
+    let owner_position = window
+        .outer_position()
+        .map_err(|error| format!("Failed to read window position: {error}"))?;
+    let owner_x = f64::from(owner_position.x) / scale;
+    let owner_y = f64::from(owner_position.y) / scale;
+    let click_center_x = owner_x + rect_x + rect_w / 2.0;
+    let click_center_y = owner_y + rect_y + rect_h / 2.0;
+
+    let monitor = window
+        .current_monitor()
+        .map_err(|error| format!("Failed to read current monitor: {error}"))?
+        .ok_or_else(|| "No monitor found for window.".to_string())?;
+    let monitor_scale = monitor.scale_factor();
+    let monitor_x = f64::from(monitor.position().x) / monitor_scale;
+    let monitor_y = f64::from(monitor.position().y) / monitor_scale;
+    let monitor_w = f64::from(monitor.size().width) / monitor_scale;
+    let monitor_h = f64::from(monitor.size().height) / monitor_scale;
+
+    const MAX_FRACTION: f64 = 0.9;
+    const MIN_WIDTH: f64 = 200.0;
+    const MIN_HEIGHT: f64 = 150.0;
+
+    let max_w = monitor_w * MAX_FRACTION;
+    let max_h = monitor_h * MAX_FRACTION;
+    let fit_scale = (max_w / natural_w.max(1.0))
+        .min(max_h / natural_h.max(1.0))
+        .min(1.0);
+
+    let width = (natural_w * fit_scale).max(MIN_WIDTH.min(max_w));
+    let height = (natural_h * fit_scale).max(MIN_HEIGHT.min(max_h));
+
+    let target_x = (click_center_x - width / 2.0)
+        .max(monitor_x)
+        .min(monitor_x + monitor_w - width);
+    let target_y = (click_center_y - height / 2.0)
+        .max(monitor_y)
+        .min(monitor_y + monitor_h - height);
+
+    let state = app.state::<AppState>();
+    let window_id = state.image_window_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    let label = format!("image-{window_id}");
+    let settings = load_settings_inner(&app);
+
+    state
+        .image_paths
+        .lock()
+        .unwrap()
+        .insert(label.clone(), path);
+    state
+        .image_owners
+        .lock()
+        .unwrap()
+        .insert(label.clone(), window.label().to_string());
+
+    let image_window = WebviewWindowBuilder::new(
+        &app,
+        label.clone(),
+        WebviewUrl::App("image-view.html".into()),
+    )
+    .title("Image")
+    .decorations(false)
+    .resizable(true)
+    .shadow(true)
+    .background_color(Color(17, 17, 17, 255))
+    .build()
+    .map_err(|error| format!("Failed to build image window: {error}"))?;
+
+    let _ = set_square_window_corners(&image_window, settings.square_app_corners);
+    let _ = set_window_bounds(
+        &image_window,
+        &WindowState {
+            x: target_x.round() as i32,
+            y: target_y.round() as i32,
+            width: width.round() as u32,
+            height: height.round() as u32,
+        },
+    );
+    let _ = image_window.show();
+    let _ = image_window.set_focus();
+
+    let app_for_cleanup = app.clone();
+    let label_for_cleanup = label.clone();
+    image_window.on_window_event(move |event| {
+        if !matches!(event, WindowEvent::Destroyed) {
+            return;
+        }
+        let state = app_for_cleanup.state::<AppState>();
+        state.image_paths.lock().unwrap().remove(&label_for_cleanup);
+        state
+            .image_owners
+            .lock()
+            .unwrap()
+            .remove(&label_for_cleanup);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn get_assigned_image_path(window: WebviewWindow, state: tauri::State<AppState>) -> Option<String> {
+    state
+        .image_paths
+        .lock()
+        .unwrap()
+        .get(window.label())
+        .cloned()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -472,6 +635,7 @@ pub fn run() {
             });
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let settings = load_settings_inner(app.handle());
             if let Some(window) = app.get_webview_window("main") {
@@ -480,6 +644,7 @@ pub fn run() {
                     let _ = set_window_bounds(&window, state);
                 }
             }
+            register_owner_cascade_close(app.handle(), "main");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -493,6 +658,8 @@ pub fn run() {
             window_start_drag,
             window_minimize,
             window_close,
+            open_image_window,
+            get_assigned_image_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
