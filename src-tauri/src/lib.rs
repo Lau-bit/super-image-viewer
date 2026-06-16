@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
+    fs::File,
+    hash::{Hash, Hasher},
+    io::Read as IoRead,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -28,6 +31,9 @@ const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico", "avif", "tif", "tiff",
 ];
 const RESTORED_WINDOW_PHYSICAL_X_OFFSET: f64 = -1.0;
+const CATEGORIZER_SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
+const CATEGORIZER_MAX_SCAN_DEPTH: usize = 4;
+const CATEGORIZER_HASH_SAMPLE_BYTES: usize = 65536;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +57,28 @@ struct Settings {
     secondary_display_folder_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     secondary_display_folder: Option<String>,
+    #[serde(default)]
+    browse_mode: String,
+    #[serde(default)]
+    multi_folders: Vec<String>,
+    #[serde(default)]
+    multi_folder_filter: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    categorized_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    categorized_category_filter: Option<Vec<String>>,
+    #[serde(default)]
+    startup_browse_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_folder: Option<String>,
+    #[serde(default)]
+    startup_multi_folders: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_multi_folder_filter: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_categorized_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_categorized_category_filter: Option<Vec<String>>,
     #[serde(default = "default_image_count")]
     image_count: u32,
     #[serde(default)]
@@ -115,6 +143,17 @@ impl Default for Settings {
             first_display_folder: None,
             secondary_display_folder_enabled: false,
             secondary_display_folder: None,
+            browse_mode: "single".to_string(),
+            multi_folders: Vec::new(),
+            multi_folder_filter: None,
+            categorized_root: None,
+            categorized_category_filter: None,
+            startup_browse_mode: "single".to_string(),
+            startup_folder: None,
+            startup_multi_folders: Vec::new(),
+            startup_multi_folder_filter: None,
+            startup_categorized_root: None,
+            startup_categorized_category_filter: None,
             image_count: 9,
             empty_count: 0,
             display_mode: "random".to_string(),
@@ -153,6 +192,45 @@ struct ImageInfo {
     modified: u64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedCategoryView {
+    name: String,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedImageView {
+    path: String,
+    category: String,
+    modified: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedRootView {
+    root: String,
+    categories: Vec<CategorizedCategoryView>,
+    images: Vec<CategorizedImageView>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizerImageRecord {
+    #[serde(default)]
+    category: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizerSidecar {
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(default)]
+    images: HashMap<String, CategorizerImageRecord>,
+}
+
 fn is_image_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -162,6 +240,113 @@ fn is_image_path(path: &Path) -> bool {
                 .any(|candidate| candidate.eq_ignore_ascii_case(ext))
         })
         .unwrap_or(false)
+}
+
+fn modified_ms(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn categorizer_hash_file(path: &Path, size: u64) -> Result<String, String> {
+    let mut file =
+        File::open(path).map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    let mut buffer = vec![0u8; CATEGORIZER_HASH_SAMPLE_BYTES.min(size as usize).max(1)];
+    let read = file
+        .read(&mut buffer)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    size.hash(&mut hasher);
+    buffer[..read].hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn collect_categorized_images(
+    sidecar: &CategorizerSidecar,
+    folder: &Path,
+    depth: usize,
+    images: &mut Vec<CategorizedImageView>,
+    category_counts: &mut HashMap<String, usize>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(folder)
+        .map_err(|error| format!("Failed to read folder {}: {error}", folder.display()))?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name.starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir() {
+            if depth < CATEGORIZER_MAX_SCAN_DEPTH {
+                collect_categorized_images(sidecar, &path, depth + 1, images, category_counts)?;
+            }
+            continue;
+        }
+
+        if !path.is_file() || !is_image_path(&path) {
+            continue;
+        }
+
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(hash) = categorizer_hash_file(&path, metadata.len()) else {
+            continue;
+        };
+        let Some(record) = sidecar.images.get(&hash) else {
+            continue;
+        };
+        let Some(category) = record.category.clone() else {
+            continue;
+        };
+
+        *category_counts.entry(category.clone()).or_insert(0) += 1;
+        images.push(CategorizedImageView {
+            path: path.to_string_lossy().to_string(),
+            category,
+            modified: modified_ms(&path),
+        });
+    }
+    Ok(())
+}
+
+fn scan_categorized_root_blocking(root: String) -> Result<CategorizedRootView, String> {
+    let root_path = PathBuf::from(&root);
+    let sidecar_path = root_path.join(CATEGORIZER_SIDECAR_FILE_NAME);
+    let sidecar_raw = fs::read_to_string(&sidecar_path)
+        .map_err(|_| "Not a categorized folder (no .image-categorizer.json found).".to_string())?;
+    let sidecar: CategorizerSidecar = serde_json::from_str(&sidecar_raw)
+        .map_err(|error| format!("Failed to parse .image-categorizer.json: {error}"))?;
+
+    let mut images = Vec::new();
+    let mut category_counts: HashMap<String, usize> = HashMap::new();
+    collect_categorized_images(&sidecar, &root_path, 0, &mut images, &mut category_counts)?;
+
+    let categories = sidecar
+        .categories
+        .iter()
+        .filter_map(|name| {
+            let count = *category_counts.get(name).unwrap_or(&0);
+            (count > 0).then(|| CategorizedCategoryView {
+                name: name.clone(),
+                count,
+            })
+        })
+        .collect();
+
+    Ok(CategorizedRootView {
+        root,
+        categories,
+        images,
+    })
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -364,6 +549,45 @@ fn list_folder_images(folder: String) -> Result<Vec<ImageInfo>, String> {
     Ok(images)
 }
 
+fn list_multi_folder_images_blocking(folders: Vec<String>) -> Vec<ImageInfo> {
+    let mut images = Vec::new();
+    for folder in folders {
+        let dir = PathBuf::from(folder);
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_file() || !is_image_path(&path) {
+                continue;
+            }
+            images.push(ImageInfo {
+                path: path.to_string_lossy().to_string(),
+                modified: modified_ms(&path),
+            });
+        }
+    }
+    images.sort_by(|a, b| b.modified.cmp(&a.modified));
+    images
+}
+
+#[tauri::command]
+async fn list_multi_folder_images(folders: Vec<String>) -> Result<Vec<ImageInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_multi_folder_images_blocking(folders))
+        .await
+        .map_err(|error| format!("Multi-folder scan failed: {error}"))
+}
+
+#[tauri::command]
+async fn scan_categorized_root(root: String) -> Result<CategorizedRootView, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_categorized_root_blocking(root))
+        .await
+        .map_err(|error| format!("Categorized folder scan failed: {error}"))?
+}
+
 #[tauri::command]
 fn load_settings(app: AppHandle) -> Settings {
     load_settings_inner(&app)
@@ -377,6 +601,23 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.first_display_folder = settings.first_display_folder;
     current.secondary_display_folder_enabled = settings.secondary_display_folder_enabled;
     current.secondary_display_folder = settings.secondary_display_folder;
+    current.browse_mode = match settings.browse_mode.as_str() {
+        "single" | "multi" | "categorized" => settings.browse_mode,
+        _ => "single".to_string(),
+    };
+    current.multi_folders = settings.multi_folders;
+    current.multi_folder_filter = settings.multi_folder_filter;
+    current.categorized_root = settings.categorized_root;
+    current.categorized_category_filter = settings.categorized_category_filter;
+    current.startup_browse_mode = match settings.startup_browse_mode.as_str() {
+        "single" | "multi" | "categorized" => settings.startup_browse_mode,
+        _ => "single".to_string(),
+    };
+    current.startup_folder = settings.startup_folder;
+    current.startup_multi_folders = settings.startup_multi_folders;
+    current.startup_multi_folder_filter = settings.startup_multi_folder_filter;
+    current.startup_categorized_root = settings.startup_categorized_root;
+    current.startup_categorized_category_filter = settings.startup_categorized_category_filter;
     current.image_count = settings.image_count.clamp(4, 99);
     current.empty_count = settings
         .empty_count
@@ -649,6 +890,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_folder_images,
+            list_multi_folder_images,
+            scan_categorized_root,
             load_settings,
             get_window_label,
             reset_window_position_preset,

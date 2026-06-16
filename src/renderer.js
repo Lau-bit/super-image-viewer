@@ -27,6 +27,14 @@ function clamp(value, min, max) {
 const state = {
   folder:     null,
   allImages:  [],          // [{path, modified}] newest-first
+  browseMode: 'single',    // 'single' | 'multi' | 'categorized'
+  viewedBrowseMode: 'single',
+  multiFolders: [],
+  multiFolderFilter: new Set(),
+  categorizedRoot: null,
+  categorizedCategories: [],
+  categorizedCategoryFilter: new Set(),
+  categorizedImages: [],
 
   imageCount: 9,
   emptyCount: 0,
@@ -72,6 +80,12 @@ const appSettings = {
   firstDisplayFolder: null,
   secondaryDisplayFolderEnabled: false,
   secondaryDisplayFolder: null,
+  startupBrowseMode: 'single',
+  startupFolder: null,
+  startupMultiFolders: [],
+  startupMultiFolderFilter: [],
+  startupCategorizedRoot: null,
+  startupCategorizedCategoryFilter: [],
 };
 
 // ==============================
@@ -79,6 +93,23 @@ const appSettings = {
 // ==============================
 const imageGrid          = document.getElementById('image-grid');
 const folderNameEl       = document.getElementById('folder-name');
+const folderButtonLabel  = document.getElementById('folder-button-label');
+const folderPanel        = document.getElementById('folder-panel');
+const folderModeTabs     = document.querySelectorAll('.folder-mode-tab');
+const folderLoading      = document.getElementById('folder-loading');
+const folderLoadingText  = document.getElementById('folder-loading-text');
+const folderSectionSingle = document.getElementById('folder-section-single');
+const folderSectionMulti = document.getElementById('folder-section-multi');
+const folderSectionCategorized = document.getElementById('folder-section-categorized');
+const folderSingleChoose = document.getElementById('folder-single-choose');
+const folderMultiAdd     = document.getElementById('folder-multi-add');
+const multiFolderListEl  = document.getElementById('multi-folder-list');
+const categorizedRootNameEl = document.getElementById('categorized-root-name');
+const categorizedRootChoose = document.getElementById('categorized-root-choose');
+const categoriesList     = document.getElementById('categories-list');
+const categoriesSelectAll = document.getElementById('categories-select-all');
+const categoriesSelectNone = document.getElementById('categories-select-none');
+const categoriesRescan   = document.getElementById('categories-rescan');
 const countDisplayEl     = document.getElementById('count-display');
 const emptyDisplayEl     = document.getElementById('empty-display');
 const btnFolder          = document.getElementById('btn-folder');
@@ -120,6 +151,9 @@ const settingSecondaryFolderName   = document.getElementById('setting-secondary-
 const settingBrowseSecondaryFolder = document.getElementById('setting-browse-secondary-folder');
 const settingSlider      = document.getElementById('setting-count-slider');
 const settingCountVal    = document.getElementById('setting-count-value');
+const settingStartupBrowseMode = document.getElementById('setting-startup-browse-mode');
+const settingUseCurrentSource = document.getElementById('setting-use-current-source');
+const settingStartupSourceName = document.getElementById('setting-startup-source-name');
 const settingSlideshowDur = document.getElementById('setting-slideshow-duration');
 const btnMinimize        = document.getElementById('btn-minimize');
 const btnClose           = document.getElementById('btn-close');
@@ -216,6 +250,27 @@ function syncStartupFolderSettings() {
   settingBrowseSecondaryFolder.disabled = !appSettings.secondaryDisplayFolderEnabled;
 }
 
+function startupSourceLabel() {
+  if (appSettings.startupBrowseMode === 'single') {
+    return appSettings.startupFolder ? baseName(appSettings.startupFolder) : 'No single folder set';
+  }
+  if (appSettings.startupBrowseMode === 'multi') {
+    const folders = appSettings.startupMultiFolders || [];
+    const enabled = new Set(appSettings.startupMultiFolderFilter || []);
+    const enabledCount = folders.filter(folder => enabled.has(fileKey(folder))).length || folders.length;
+    return folders.length ? `${enabledCount}/${folders.length} folders` : 'No multi-folders set';
+  }
+  return appSettings.startupCategorizedRoot
+    ? baseName(appSettings.startupCategorizedRoot)
+    : 'No categorized root set';
+}
+
+function syncStartupSourceSettings() {
+  settingStartupBrowseMode.value = appSettings.startupBrowseMode;
+  settingStartupSourceName.textContent = startupSourceLabel();
+  settingStartupSourceName.title = startupSourceLabel();
+}
+
 function isSecondWindow() {
   return windowLabel === 'viewer-1';
 }
@@ -241,6 +296,37 @@ function shouldAutoStartSlideshow() {
     return appSettings.firstAutoOpenSlideshow;
   }
   return isSecondWindow() && appSettings.secondaryAutoOpenSlideshow;
+}
+
+function hasConfiguredStartupSource() {
+  if (appSettings.startupBrowseMode === 'single') return !!appSettings.startupFolder;
+  if (appSettings.startupBrowseMode === 'multi') return !!appSettings.startupMultiFolders.length;
+  return !!appSettings.startupCategorizedRoot;
+}
+
+async function loadConfiguredStartupSource() {
+  if (appSettings.startupBrowseMode === 'single') {
+    await loadFolder(appSettings.startupFolder);
+    return;
+  }
+
+  if (appSettings.startupBrowseMode === 'multi') {
+    state.multiFolders = [...appSettings.startupMultiFolders];
+    state.multiFolderFilter = new Set(appSettings.startupMultiFolderFilter);
+    normalizeMultiFolderFilter({ defaultAll: true });
+    renderMultiFolderList();
+    state.viewedBrowseMode = 'multi';
+    renderFolderPanelSections();
+    await enterMultiMode();
+    return;
+  }
+
+  state.categorizedRoot = appSettings.startupCategorizedRoot;
+  state.categorizedCategoryFilter = new Set(appSettings.startupCategorizedCategoryFilter);
+  state.viewedBrowseMode = 'categorized';
+  renderCategorizedRootRow();
+  renderFolderPanelSections();
+  await enterCategorizedMode();
 }
 
 // ==============================
@@ -501,27 +587,111 @@ function clearDisplayFolder() {
   imageGrid.textContent = '';
   folderNameEl.textContent = '';
   document.body.classList.add('no-folder');
+  renderFolderButton();
   stopSlideshow();
   syncNavButtons();
+}
+
+function baseName(path) {
+  return String(path || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || 'Folder';
+}
+
+function fileKey(path) {
+  return String(path || '').toLocaleLowerCase();
+}
+
+function persistMultiFolderFilter() {
+  localStorage.setItem('superImageViewer.multiFolderFilter', JSON.stringify([...state.multiFolderFilter]));
+}
+
+function loadMultiFolderFilter() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('superImageViewer.multiFolderFilter') || '[]');
+    state.multiFolderFilter = new Set(Array.isArray(raw) ? raw : []);
+  } catch {
+    state.multiFolderFilter = new Set();
+  }
+}
+
+function normalizeMultiFolderFilter({ defaultAll = true } = {}) {
+  const folderKeys = new Set(state.multiFolders.map(fileKey));
+  state.multiFolderFilter = new Set([...state.multiFolderFilter].filter(key => folderKeys.has(key)));
+  if (defaultAll && !state.multiFolderFilter.size) {
+    state.multiFolderFilter = new Set(folderKeys);
+  }
+  persistMultiFolderFilter();
+}
+
+function enabledMultiFolders() {
+  return state.multiFolders.filter(folder => state.multiFolderFilter.has(fileKey(folder)));
+}
+
+function setFolderLoading(loading, message = 'Loading...') {
+  folderPanel.classList.toggle('loading', loading);
+  folderLoading.hidden = !loading;
+  folderLoadingText.textContent = message;
+}
+
+function setFolderPanelOpen(open) {
+  folderPanel.classList.toggle('open', open);
+}
+
+function renderFolderButton() {
+  let label = 'Folder';
+  if (state.browseMode === 'single') {
+    label = state.folder ? baseName(state.folder) : 'Folder';
+  } else if (state.browseMode === 'multi') {
+    const enabled = enabledMultiFolders();
+    label = !state.multiFolders.length
+      ? 'Multi-Folder'
+      : enabled.length === 1
+        ? baseName(enabled[0])
+        : `${enabled.length}/${state.multiFolders.length} folders`;
+  } else {
+    label = state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized';
+  }
+
+  folderButtonLabel.textContent = label;
+  btnFolder.classList.toggle('mode-single', state.browseMode === 'single');
+  btnFolder.classList.toggle('mode-multi', state.browseMode === 'multi');
+  btnFolder.classList.toggle('mode-categorized', state.browseMode === 'categorized');
+}
+
+function renderFolderPanelSections() {
+  folderModeTabs.forEach(tab => {
+    tab.classList.toggle('active', tab.dataset.browseMode === state.viewedBrowseMode);
+  });
+  folderSectionSingle.classList.toggle('visible', state.viewedBrowseMode === 'single');
+  folderSectionMulti.classList.toggle('visible', state.viewedBrowseMode === 'multi');
+  folderSectionCategorized.classList.toggle('visible', state.viewedBrowseMode === 'categorized');
+}
+
+function loadImagePool(images, label, mode, folder = null) {
+  state.allImages = [...images].sort((a, b) => b.modified - a.modified);
+  state.folder = folder;
+  state.browseMode = mode;
+  state.viewedBrowseMode = mode;
+  state.chronoOffset = 0;
+  hist.stack = [];
+  hist.pos = -1;
+  folderNameEl.textContent = label;
+  document.body.classList.toggle('no-folder', !state.allImages.length);
+  renderFolderButton();
+  renderFolderPanelSections();
+  if (state.allImages.length) refresh();
+  else {
+    state.displayedSlots = [];
+    imageGrid.textContent = '';
+    syncNavButtons();
+  }
+  persistSettings();
 }
 
 async function loadFolder(folder) {
   if (!folder) return;
   try {
     const images = await window.viewerAPI.listFolderImages(folder);
-    state.allImages    = images;
-    state.folder       = folder;
-    state.chronoOffset = 0;
-
-    // Fresh history for the new folder
-    hist.stack = [];
-    hist.pos   = -1;
-
-    folderNameEl.textContent = folder.replace(/\\/g, '/').split('/').pop();
-    document.body.classList.remove('no-folder');
-
-    refresh();
-    persistSettings();
+    loadImagePool(images, baseName(folder), 'single', folder);
   } catch (err) {
     clearDisplayFolder();
     showToast('Failed to load folder');
@@ -532,6 +702,180 @@ async function loadFolder(folder) {
 async function selectFolder() {
   const folder = await window.viewerAPI.selectFolder();
   if (folder) loadFolder(folder);
+}
+
+function renderMultiFolderList() {
+  multiFolderListEl.textContent = '';
+  normalizeMultiFolderFilter({ defaultAll: false });
+  if (!state.multiFolders.length) {
+    const empty = document.createElement('div');
+    empty.className = 'categories-empty';
+    empty.textContent = 'No folders added yet.';
+    multiFolderListEl.append(empty);
+    return;
+  }
+  for (const folder of state.multiFolders) {
+    const row = document.createElement('div');
+    row.className = 'multi-folder-row';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = state.multiFolderFilter.has(fileKey(folder));
+    checkbox.addEventListener('change', () => toggleMultiFolder(folder));
+    const name = document.createElement('span');
+    name.className = 'multi-folder-name';
+    name.textContent = baseName(folder);
+    name.title = folder;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'multi-folder-remove';
+    remove.textContent = 'x';
+    remove.title = `Remove ${folder}`;
+    remove.addEventListener('click', e => {
+      e.stopPropagation();
+      removeMultiFolder(folder);
+    });
+    row.append(checkbox, name, remove);
+    multiFolderListEl.append(row);
+  }
+}
+
+async function enterMultiMode() {
+  normalizeMultiFolderFilter({ defaultAll: false });
+  const folders = enabledMultiFolders();
+  if (!folders.length) {
+    loadImagePool([], 'No multi-folders enabled', 'multi');
+    return;
+  }
+  setFolderLoading(true, 'Scanning folders...');
+  try {
+    const images = await window.viewerAPI.listMultiFolderImages(folders);
+    loadImagePool(images, `${folders.length} folder${folders.length === 1 ? '' : 's'}`, 'multi');
+  } catch (error) {
+    showToast('Failed to load folders');
+    console.error(error);
+  } finally {
+    setFolderLoading(false);
+  }
+}
+
+async function addMultiFolder() {
+  const folder = await window.viewerAPI.selectFolder();
+  if (!folder) return;
+  const key = fileKey(folder);
+  if (state.multiFolders.some(item => fileKey(item) === key)) {
+    showToast('Folder already added');
+    return;
+  }
+  state.multiFolders.push(folder);
+  state.multiFolderFilter.add(key);
+  persistMultiFolderFilter();
+  renderMultiFolderList();
+  await enterMultiMode();
+}
+
+async function removeMultiFolder(folder) {
+  const key = fileKey(folder);
+  state.multiFolders = state.multiFolders.filter(item => fileKey(item) !== key);
+  state.multiFolderFilter.delete(key);
+  persistMultiFolderFilter();
+  renderMultiFolderList();
+  await enterMultiMode();
+}
+
+async function toggleMultiFolder(folder) {
+  const key = fileKey(folder);
+  if (state.multiFolderFilter.has(key)) state.multiFolderFilter.delete(key);
+  else state.multiFolderFilter.add(key);
+  persistMultiFolderFilter();
+  renderMultiFolderList();
+  await enterMultiMode();
+}
+
+function renderCategorizedRootRow() {
+  categorizedRootNameEl.textContent = state.categorizedRoot ? baseName(state.categorizedRoot) : 'No root chosen';
+  categorizedRootNameEl.title = state.categorizedRoot || '';
+}
+
+function renderCategoriesPanel() {
+  categoriesList.textContent = '';
+  if (!state.categorizedCategories.length) {
+    const empty = document.createElement('div');
+    empty.className = 'categories-empty';
+    empty.textContent = 'No categorized images found.';
+    categoriesList.append(empty);
+    return;
+  }
+  for (const category of state.categorizedCategories) {
+    const row = document.createElement('label');
+    row.className = 'category-checkbox-row';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = state.categorizedCategoryFilter.has(category.name);
+    checkbox.addEventListener('change', () => toggleCategorizedCategory(category.name));
+    const name = document.createElement('span');
+    name.className = 'category-checkbox-name';
+    name.textContent = category.name;
+    const count = document.createElement('span');
+    count.className = 'category-checkbox-count';
+    count.textContent = category.count;
+    row.append(checkbox, name, count);
+    categoriesList.append(row);
+  }
+}
+
+function categorizedFilteredImages() {
+  return state.categorizedImages.filter(image => state.categorizedCategoryFilter.has(image.category));
+}
+
+async function enterCategorizedMode(root = state.categorizedRoot) {
+  if (!root) {
+    loadImagePool([], 'No categorized root', 'categorized');
+    renderCategorizedRootRow();
+    renderCategoriesPanel();
+    return;
+  }
+  setFolderLoading(true, 'Scanning categories...');
+  try {
+    const scan = await window.viewerAPI.scanCategorizedRoot(root);
+    state.categorizedRoot = scan.root;
+    state.categorizedImages = scan.images;
+    state.categorizedCategories = scan.categories;
+    const available = new Set(scan.categories.map(category => category.name));
+    const kept = [...state.categorizedCategoryFilter].filter(name => available.has(name));
+    state.categorizedCategoryFilter = new Set(kept.length ? kept : [...available]);
+    renderCategorizedRootRow();
+    renderCategoriesPanel();
+    loadImagePool(categorizedFilteredImages(), baseName(scan.root), 'categorized');
+  } catch (error) {
+    showToast('Failed to load categorized root');
+    console.error(error);
+  } finally {
+    setFolderLoading(false);
+  }
+}
+
+async function chooseCategorizedRoot() {
+  const folder = await window.viewerAPI.selectFolder();
+  if (!folder) return;
+  await enterCategorizedMode(folder);
+}
+
+function applyCategorizedFilter() {
+  renderCategoriesPanel();
+  loadImagePool(categorizedFilteredImages(), state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized', 'categorized');
+}
+
+function toggleCategorizedCategory(name) {
+  if (state.categorizedCategoryFilter.has(name)) state.categorizedCategoryFilter.delete(name);
+  else state.categorizedCategoryFilter.add(name);
+  applyCategorizedFilter();
+}
+
+function setAllCategorizedCategories(checked) {
+  state.categorizedCategoryFilter = checked
+    ? new Set(state.categorizedCategories.map(category => category.name))
+    : new Set();
+  applyCategorizedFilter();
 }
 
 // ==============================
@@ -1021,6 +1365,17 @@ async function persistSettings() {
   try {
     await window.viewerAPI.saveSettings({
       folder:            state.folder,
+      browseMode:        state.browseMode,
+      multiFolders:      state.multiFolders,
+      multiFolderFilter: [...state.multiFolderFilter],
+      categorizedRoot:   state.categorizedRoot,
+      categorizedCategoryFilter: [...state.categorizedCategoryFilter],
+      startupBrowseMode: appSettings.startupBrowseMode,
+      startupFolder:     appSettings.startupFolder,
+      startupMultiFolders: appSettings.startupMultiFolders,
+      startupMultiFolderFilter: appSettings.startupMultiFolderFilter,
+      startupCategorizedRoot: appSettings.startupCategorizedRoot,
+      startupCategorizedCategoryFilter: appSettings.startupCategorizedCategoryFilter,
       imageCount:        state.imageCount,
       emptyCount:        state.emptyCount,
       displayMode:       state.displayMode,
@@ -1056,6 +1411,24 @@ async function browseStartupFolder(kind) {
   syncStartupFolderSettings();
   await persistSettings();
   showToast(kind === 'first' ? 'Set 1st window folder' : 'Set 2nd window folder');
+}
+
+async function useCurrentSourceAtStartup() {
+  appSettings.startupBrowseMode = state.browseMode;
+
+  if (state.browseMode === 'single') {
+    appSettings.startupFolder = state.folder;
+  } else if (state.browseMode === 'multi') {
+    appSettings.startupMultiFolders = [...state.multiFolders];
+    appSettings.startupMultiFolderFilter = [...state.multiFolderFilter];
+  } else if (state.browseMode === 'categorized') {
+    appSettings.startupCategorizedRoot = state.categorizedRoot;
+    appSettings.startupCategorizedCategoryFilter = [...state.categorizedCategoryFilter];
+  }
+
+  syncStartupSourceSettings();
+  await persistSettings();
+  showToast('Saved startup source');
 }
 
 async function saveWindowPositionPreset(preset) {
@@ -1107,8 +1480,25 @@ document.getElementById('titlebar-drag').addEventListener('mousedown', e => {
 btnMinimize.addEventListener('click', () => window.viewerAPI.windowMinimize());
 btnClose.addEventListener('click',    () => window.viewerAPI.windowClose());
 
-btnFolder.addEventListener('click',    selectFolder);
+btnFolder.addEventListener('click', e => {
+  e.stopPropagation();
+  setFolderPanelOpen(!folderPanel.classList.contains('open'));
+});
 btnOpenEmpty.addEventListener('click', selectFolder);
+folderSingleChoose.addEventListener('click', selectFolder);
+folderMultiAdd.addEventListener('click', addMultiFolder);
+categorizedRootChoose.addEventListener('click', chooseCategorizedRoot);
+categoriesSelectAll.addEventListener('click', () => setAllCategorizedCategories(true));
+categoriesSelectNone.addEventListener('click', () => setAllCategorizedCategories(false));
+categoriesRescan.addEventListener('click', () => enterCategorizedMode());
+folderModeTabs.forEach(tab => {
+  tab.addEventListener('click', async () => {
+    state.viewedBrowseMode = tab.dataset.browseMode;
+    renderFolderPanelSections();
+    if (state.viewedBrowseMode === 'multi') await enterMultiMode();
+    if (state.viewedBrowseMode === 'categorized') await enterCategorizedMode();
+  });
+});
 
 btnCountDec.addEventListener('click', () => bumpCount(false));
 btnCountInc.addEventListener('click', () => bumpCount(true));
@@ -1245,6 +1635,17 @@ settingBrowseSecondaryFolder.addEventListener('click', e => {
   browseStartupFolder('secondary');
 });
 
+settingStartupBrowseMode.addEventListener('change', async () => {
+  appSettings.startupBrowseMode = settingStartupBrowseMode.value;
+  syncStartupSourceSettings();
+  await persistSettings();
+});
+
+settingUseCurrentSource.addEventListener('click', e => {
+  e.stopPropagation();
+  useCurrentSourceAtStartup();
+});
+
 settingSlider.addEventListener('input', () => {
   const v = parseInt(settingSlider.value, 10);
   settingCountVal.textContent = v;
@@ -1260,7 +1661,11 @@ settingSlideshowDur.addEventListener('change', () => {
 });
 
 settingsPanel.addEventListener('click', e => e.stopPropagation());
-document.addEventListener('click', () => setSettingsOpen(false));
+folderPanel.addEventListener('click', e => e.stopPropagation());
+document.addEventListener('click', () => {
+  setSettingsOpen(false);
+  setFolderPanelOpen(false);
+});
 
 // ==============================
 // Keyboard shortcuts
@@ -1338,6 +1743,17 @@ document.addEventListener('keydown', e => {
     state.imageCount       = Math.max(4, Math.min(99, s.imageCount || 9));
     state.emptyCount       = Math.max(0, Math.min(state.imageCount - 1, s.emptyCount || 0));
     state.displayMode      = s.displayMode || 'random';
+    state.browseMode       = ['single', 'multi', 'categorized'].includes(s.browseMode) ? s.browseMode : 'single';
+    state.viewedBrowseMode = state.browseMode;
+    state.multiFolders     = Array.isArray(s.multiFolders) ? s.multiFolders : [];
+    if (Array.isArray(s.multiFolderFilter)) {
+      state.multiFolderFilter = new Set(s.multiFolderFilter);
+    } else {
+      loadMultiFolderFilter();
+    }
+    normalizeMultiFolderFilter({ defaultAll: true });
+    state.categorizedRoot  = s.categorizedRoot || null;
+    state.categorizedCategoryFilter = new Set(Array.isArray(s.categorizedCategoryFilter) ? s.categorizedCategoryFilter : []);
     state.slideshowDuration = Math.max(1000, s.slideshowDuration || 5000);
     appSettings.squareAppCorners = !!s.squareAppCorners;
     appSettings.zoomFillVersion = 6;
@@ -1357,6 +1773,16 @@ document.addEventListener('keydown', e => {
     appSettings.firstDisplayFolder = s.firstDisplayFolder || null;
     appSettings.secondaryDisplayFolderEnabled = !!s.secondaryDisplayFolderEnabled;
     appSettings.secondaryDisplayFolder = s.secondaryDisplayFolder || null;
+    appSettings.startupBrowseMode = ['single', 'multi', 'categorized'].includes(s.startupBrowseMode)
+      ? s.startupBrowseMode
+      : 'single';
+    appSettings.startupFolder = s.startupFolder || null;
+    appSettings.startupMultiFolders = Array.isArray(s.startupMultiFolders) ? s.startupMultiFolders : [];
+    appSettings.startupMultiFolderFilter = Array.isArray(s.startupMultiFolderFilter) ? s.startupMultiFolderFilter : [];
+    appSettings.startupCategorizedRoot = s.startupCategorizedRoot || null;
+    appSettings.startupCategorizedCategoryFilter = Array.isArray(s.startupCategorizedCategoryFilter)
+      ? s.startupCategorizedCategoryFilter
+      : [];
 
     // Sync UI without triggering refresh/persist
     countDisplayEl.textContent   = state.imageCount;
@@ -1368,6 +1794,12 @@ document.addEventListener('keydown', e => {
     settingFirstAutoOpenSlideshow.checked = appSettings.firstAutoOpenSlideshow;
     settingSecondaryAutoOpenSlideshow.checked = appSettings.secondaryAutoOpenSlideshow;
     settingAutoHideUi.checked = appSettings.autoHideUiOnStartup;
+    renderMultiFolderList();
+    renderCategorizedRootRow();
+    renderCategoriesPanel();
+    renderFolderPanelSections();
+    renderFolderButton();
+    syncStartupSourceSettings();
     syncStartupFolderSettings();
     syncSlideshowButton();
     syncModeButtons();
@@ -1378,13 +1810,33 @@ document.addEventListener('keydown', e => {
     }
     await window.viewerAPI.setWindowSquareCorners(appSettings.squareAppCorners).catch(() => {});
 
-    const startupFolder = startupFolderForWindow();
-    if (startupFolder) {
-      await loadFolder(startupFolder);  // calls refresh() which calls pushHistory()
+    if ((windowLabel === 'main' || isSecondWindow()) && hasConfiguredStartupSource()) {
+      await loadConfiguredStartupSource();
     } else {
-      clearDisplayFolder();
+      const startupFolder = startupFolderForWindow();
+      if (startupFolder) {
+        await loadFolder(startupFolder);  // calls refresh() which calls pushHistory()
+      } else if (windowLabel === 'main' || isSecondWindow()) {
+        if (state.browseMode === 'multi' && state.multiFolders.length) {
+          await enterMultiMode();
+        } else if (state.browseMode === 'categorized' && state.categorizedRoot) {
+          await enterCategorizedMode();
+        } else if (s.folder) {
+          await loadFolder(s.folder);
+        } else {
+          clearDisplayFolder();
+        }
+      } else {
+        clearDisplayFolder();
+      }
     }
   } catch {
+    renderMultiFolderList();
+    renderCategorizedRootRow();
+    renderCategoriesPanel();
+    renderFolderPanelSections();
+    renderFolderButton();
+    syncStartupSourceSettings();
     syncStartupFolderSettings();
     syncSlideshowButton();
     syncModeButtons();

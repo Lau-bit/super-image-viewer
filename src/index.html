@@ -27,13 +27,45 @@
 
   <!-- Toolbar -->
   <div id="toolbar">
-    <button id="btn-folder" title="Select image folder" aria-label="Select image folder">
-      <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M3.75 6.75h6.1l1.8 2.1h8.6v8.4a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2V6.75Z"></path>
-        <path d="M3.75 9.25h16.5"></path>
-      </svg>
-      <span>Folder</span>
-    </button>
+    <div id="folder-wrapper">
+      <button id="btn-folder" title="Open / manage image sources" aria-label="Open / manage image sources">
+        <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3.75 6.75h6.1l1.8 2.1h8.6v8.4a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2V6.75Z"></path>
+          <path d="M3.75 9.25h16.5"></path>
+        </svg>
+        <span id="folder-button-label">Folder</span>
+      </button>
+      <div id="folder-panel">
+        <div id="folder-mode-tabs">
+          <button type="button" class="folder-mode-tab active" data-browse-mode="single">Single</button>
+          <button type="button" class="folder-mode-tab" data-browse-mode="multi">Multi-Folder</button>
+          <button type="button" class="folder-mode-tab" data-browse-mode="categorized">Categorized</button>
+        </div>
+        <div id="folder-loading" hidden>
+          <span class="folder-loading-spinner" aria-hidden="true"></span>
+          <span id="folder-loading-text">Loading...</span>
+        </div>
+        <div id="folder-section-single" class="folder-section visible">
+          <button type="button" class="folder-panel-btn" id="folder-single-choose">Choose Folder</button>
+        </div>
+        <div id="folder-section-multi" class="folder-section">
+          <button type="button" class="folder-panel-btn" id="folder-multi-add">Add Folder</button>
+          <div id="multi-folder-list"></div>
+        </div>
+        <div id="folder-section-categorized" class="folder-section">
+          <div id="categorized-root-row">
+            <span id="categorized-root-name">No root chosen</span>
+            <button type="button" class="folder-panel-btn" id="categorized-root-choose">Choose</button>
+          </div>
+          <div id="categories-panel-bulk">
+            <button type="button" id="categories-select-all">All</button>
+            <button type="button" id="categories-select-none">None</button>
+            <button type="button" id="categories-rescan" title="Rescan categorized root">&#x21BB;</button>
+          </div>
+          <div id="categories-list"></div>
+        </div>
+      </div>
+    </div>
     <span id="folder-name" class="folder-name"></span>
 
     <!-- Image count -->
@@ -137,6 +169,18 @@
       <input type="range" id="setting-count-slider" min="4" max="99" step="1" value="9">
       <span id="setting-count-value" class="settings-value">9</span>
     </label>
+
+    <div class="settings-section-title">Startup Source</div>
+    <label class="settings-option">
+      <span class="settings-label">Mode</span>
+      <select id="setting-startup-browse-mode" class="settings-select">
+        <option value="single">Single</option>
+        <option value="multi">Multi-Folder</option>
+        <option value="categorized">Categorized</option>
+      </select>
+    </label>
+    <button type="button" class="settings-btn" id="setting-use-current-source">Use current source at startup</button>
+    <div id="setting-startup-source-name" class="settings-source-summary">None</div>
 
     <div class="settings-section-title">Slideshow</div>
     <label class="settings-option">
