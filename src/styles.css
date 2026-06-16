@@ -257,6 +257,75 @@ body {
   flex-shrink: 0;
 }
 
+#zoom-fill-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+#zoom-fill-controls button {
+  min-width: 24px;
+  height: 22px;
+  padding: 0 6px;
+}
+
+#zoom-fill-slider {
+  width: 150px;
+  height: 22px;
+  margin: 0 3px;
+  accent-color: var(--accent);
+}
+
+.zoom-level-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+#zoom-bias-control {
+  display: grid;
+  grid-template-columns: 18px 20px 18px;
+  align-items: center;
+  gap: 1px;
+  margin-left: 2px;
+}
+
+#zoom-bias-control button {
+  width: 18px !important;
+  min-width: 18px;
+  height: 12px;
+  padding: 0 !important;
+  font-size: 8px;
+  line-height: 1;
+}
+
+.zoom-bias-middle {
+  display: grid;
+  grid-template-rows: 12px 10px 12px;
+  align-items: center;
+  justify-items: center;
+  gap: 1px;
+}
+
+#zoom-bias-display {
+  min-width: 20px;
+  height: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  color: var(--text-muted);
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#zoom-bias-letter {
+  color: var(--text);
+}
+
 #nav-buttons {
   display: flex;
   gap: 2px;
@@ -285,14 +354,35 @@ body {
 .grid-cell img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: var(--zoom-fill-fit, contain);
+  object-position: var(--zoom-fill-x, 50%) var(--zoom-fill-y, 50%);
+  transform-origin: var(--zoom-fill-x, 50%) var(--zoom-fill-y, 50%);
+  transform: scale(var(--zoom-fill-scale, 1));
   display: block;
   opacity: 0;
-  transition: opacity 0.12s ease;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+body.zoom-fill .grid-cell img {
+  --zoom-fill-scale: var(--zoom-fill-active-scale, 1.08);
+}
+
+body.zoom-fill-cover .grid-cell img {
+  --zoom-fill-fit: cover;
 }
 
 .grid-cell img.loaded {
   opacity: 1;
+}
+
+/* Sub-fill bias — a black curtain slides in from the biased edge instead of
+   panning the (uncropped) image, since there's no overflow to pan into. */
+.zoom-curtain {
+  position: absolute;
+  background: #000;
+  pointer-events: none;
+  transition: top 0.12s ease, right 0.12s ease, bottom 0.12s ease, left 0.12s ease,
+    width 0.12s ease, height 0.12s ease;
 }
 
 /* Empty slot — intentionally blank, subtle visual cue */

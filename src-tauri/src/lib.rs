@@ -55,6 +55,16 @@ struct Settings {
     display_mode: String,
     #[serde(default = "default_slideshow_duration")]
     slideshow_duration: u64,
+    #[serde(default = "default_zoom_fill_enabled")]
+    zoom_fill_enabled: bool,
+    #[serde(default = "default_zoom_fill_level")]
+    zoom_fill_level: u32,
+    #[serde(default)]
+    zoom_fill_version: u32,
+    #[serde(default)]
+    zoom_fill_bias_direction: String,
+    #[serde(default)]
+    zoom_fill_bias_amount: u32,
     #[serde(default)]
     square_app_corners: bool,
     #[serde(default)]
@@ -85,6 +95,14 @@ fn default_slideshow_duration() -> u64 {
     5000
 }
 
+fn default_zoom_fill_enabled() -> bool {
+    true
+}
+
+fn default_zoom_fill_level() -> u32 {
+    2
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -97,6 +115,11 @@ impl Default for Settings {
             empty_count: 0,
             display_mode: "random".to_string(),
             slideshow_duration: 5000,
+            zoom_fill_enabled: true,
+            zoom_fill_level: 2,
+            zoom_fill_version: 2,
+            zoom_fill_bias_direction: String::new(),
+            zoom_fill_bias_amount: 0,
             square_app_corners: false,
             auto_open_slideshow: false,
             first_auto_open_slideshow: false,
@@ -321,6 +344,18 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
         .min(settings.image_count.saturating_sub(1));
     current.display_mode = settings.display_mode;
     current.slideshow_duration = settings.slideshow_duration.max(1000);
+    current.zoom_fill_enabled = settings.zoom_fill_enabled;
+    current.zoom_fill_level = settings.zoom_fill_level.clamp(1, 3);
+    current.zoom_fill_version = settings.zoom_fill_version.max(2);
+    current.zoom_fill_bias_direction = match settings.zoom_fill_bias_direction.as_str() {
+        "L" | "R" | "U" | "D" => settings.zoom_fill_bias_direction,
+        _ => String::new(),
+    };
+    current.zoom_fill_bias_amount = if current.zoom_fill_bias_direction.is_empty() {
+        0
+    } else {
+        settings.zoom_fill_bias_amount
+    };
     current.square_app_corners = settings.square_app_corners;
     current.auto_open_slideshow = false;
     current.first_auto_open_slideshow = settings.first_auto_open_slideshow;

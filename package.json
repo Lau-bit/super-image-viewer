@@ -5,8 +5,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "tauri dev",
-    "dev": "tauri dev",
+    "start": "tauri dev --config src-tauri/tauri.dev.conf.json",
+    "dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
     "build": "tauri build",
     "tauri": "tauri"
   },
@@ -15,6 +15,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.1"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.0.0"
+    "@tauri-apps/cli": "^2.0.0",
+    "live-server": "^1.2.2"
   }
 }

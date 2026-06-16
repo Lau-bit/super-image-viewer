@@ -5,6 +5,14 @@
 // ==============================
 const HISTORY_MAX   = 50;
 const COUNT_PRESETS = [4, 6, 8, 9, 12, 16, 20, 25, 32, 40, 49, 64, 81, 99];
+const ZOOM_BIAS_REPEAT_MS = 1000 / 24;
+const ZOOM_BIAS_HOLD_DELAY_MS = 180;
+const ZOOM_BIAS_STEP_SCALE = 0.25;
+const ZOOM_FILL_COVER_AT = 50;
+const ZOOM_FILL_SNAP_RADIUS = 3;
+const ZOOM_FILL_PRESETS = { fill: ZOOM_FILL_COVER_AT, 1: 25, 2: 58, 3: 75 };
+const ZOOM_FILL_PARTIAL_MAX_SCALE = 1.12;
+const ZOOM_FILL_MAX_SCALE = 1.32;
 
 // ==============================
 // State
@@ -34,8 +42,17 @@ const hist = { stack: [], pos: -1 };
 // Blocks persistSettings() during the startup load
 let startupDone = false;
 let windowLabel = 'main';
+let zoomBiasRepeatTimer = null;
+let zoomBiasHoldTimer = null;
+let zoomBiasRepeatPointerId = null;
 const appSettings = {
   squareAppCorners: false,
+  zoomFillEnabled: true,
+  zoomFillLevel: 2,
+  zoomFillAmount: ZOOM_FILL_PRESETS.fill,
+  zoomFillVersion: 6,
+  zoomFillBiasDirection: '',
+  zoomFillBiasAmount: 0,
   firstAutoOpenSlideshow: false,
   secondaryAutoOpenSlideshow: false,
   autoHideUiOnStartup: false,
@@ -60,6 +77,14 @@ const btnEmptyDec        = document.getElementById('btn-empty-dec');
 const btnEmptyInc        = document.getElementById('btn-empty-inc');
 const btnModeRandom      = document.getElementById('btn-mode-random');
 const btnModeChrono      = document.getElementById('btn-mode-chrono');
+const btnZoomFill        = document.getElementById('btn-zoom-fill');
+const btnZoomLevel1      = document.getElementById('btn-zoom-level-1');
+const btnZoomLevel2      = document.getElementById('btn-zoom-level-2');
+const btnZoomLevel3      = document.getElementById('btn-zoom-level-3');
+const zoomFillSlider     = document.getElementById('zoom-fill-slider');
+const zoomBiasControl    = document.getElementById('zoom-bias-control');
+const zoomBiasLetter     = document.getElementById('zoom-bias-letter');
+const zoomBiasValue      = document.getElementById('zoom-bias-value');
 const btnSlideshow       = document.getElementById('btn-slideshow');
 const btnShuffle         = document.getElementById('btn-shuffle');
 const btnRefresh         = document.getElementById('btn-refresh');
@@ -246,6 +271,7 @@ function renderGrid(slots) {
       }
     }
   });
+  applyZoomFillToImages();
 }
 
 // ==============================
@@ -497,6 +523,326 @@ function syncModeButtons() {
   btnModeChrono.classList.toggle('active', state.displayMode === 'chrono');
 }
 
+function normalizeZoomFillLevel(level) {
+  return Math.max(1, Math.min(3, Math.round(level || 2)));
+}
+
+function normalizeZoomFillAmount(amount) {
+  return Math.max(0, Math.min(100, Math.round(amount || 0)));
+}
+
+function snapZoomFillAmount(amount) {
+  const normalized = normalizeZoomFillAmount(amount);
+  return Math.abs(normalized - ZOOM_FILL_COVER_AT) <= ZOOM_FILL_SNAP_RADIUS
+    ? ZOOM_FILL_COVER_AT
+    : normalized;
+}
+
+function zoomFillAmountForLevel(level) {
+  return ZOOM_FILL_PRESETS[normalizeZoomFillLevel(level)];
+}
+
+function zoomFillScale(amount) {
+  const normalized = normalizeZoomFillAmount(amount);
+  if (normalized <= 0) return 1;
+
+  if (normalized < ZOOM_FILL_COVER_AT) {
+    const partialProgress = normalized / ZOOM_FILL_COVER_AT;
+    const easedProgress = partialProgress * partialProgress;
+    return 1 + easedProgress * (ZOOM_FILL_PARTIAL_MAX_SCALE - 1);
+  }
+
+  const coverProgress = (normalized - ZOOM_FILL_COVER_AT) / (100 - ZOOM_FILL_COVER_AT);
+  return 1 + coverProgress * (ZOOM_FILL_MAX_SCALE - 1);
+}
+
+function isZoomFillCover(amount) {
+  return normalizeZoomFillAmount(amount) >= ZOOM_FILL_COVER_AT;
+}
+
+function zoomFillLevelForAmount(amount) {
+  const normalized = normalizeZoomFillAmount(amount);
+  let closestLevel = 1;
+  let closestDistance = Infinity;
+
+  [1, 2, 3].forEach(level => {
+    const distance = Math.abs(normalized - ZOOM_FILL_PRESETS[level]);
+    if (distance < closestDistance) {
+      closestLevel = level;
+      closestDistance = distance;
+    }
+  });
+
+  return closestLevel;
+}
+
+function mapZoomFillAmount(amount, fromStops, toStops) {
+  const mappedAmount = normalizeZoomFillAmount(amount);
+
+  for (let i = 1; i < fromStops.length; i++) {
+    if (mappedAmount <= fromStops[i]) {
+      const fromSpan = fromStops[i] - fromStops[i - 1];
+      const toSpan = toStops[i] - toStops[i - 1];
+      const progress = fromSpan > 0
+        ? (mappedAmount - fromStops[i - 1]) / fromSpan
+        : 0;
+      return normalizeZoomFillAmount(toStops[i - 1] + progress * toSpan);
+    }
+  }
+
+  return 100;
+}
+
+function migrateLegacyZoomFillAmount(amount) {
+  const legacyAmount = normalizeZoomFillAmount(amount);
+  const legacyStops = [0, 7, 30, 57, 100];
+  const nextStops = [0, ZOOM_FILL_PRESETS[1], ZOOM_FILL_PRESETS[2], ZOOM_FILL_PRESETS[3], 100];
+
+  return mapZoomFillAmount(legacyAmount, legacyStops, nextStops);
+}
+
+function migratePreviousZoomFillAmount(amount) {
+  return mapZoomFillAmount(amount, [0, 25, 70, 85, 100], [
+    0,
+    ZOOM_FILL_PRESETS[1],
+    ZOOM_FILL_PRESETS[2],
+    ZOOM_FILL_PRESETS[3],
+    100,
+  ]);
+}
+
+// v5 used a cover crossover of 86 (fill/Z2 sat exactly on it, with presets 34/86/93).
+// v6 moves the crossover to the center of the slider (50) and gives Z2 real crop
+// overhead, so old saved amounts need remapping onto the new stops.
+function migrateV5ZoomFillAmount(amount) {
+  return mapZoomFillAmount(amount, [0, 34, 86, 93, 100], [
+    0,
+    ZOOM_FILL_PRESETS[1],
+    ZOOM_FILL_PRESETS.fill,
+    ZOOM_FILL_PRESETS[3],
+    100,
+  ]);
+}
+
+function loadZoomFillAmount(settings) {
+  if (Number.isFinite(settings.zoomFillAmount)) {
+    if (settings.zoomFillVersion >= 6) {
+      return normalizeZoomFillAmount(settings.zoomFillAmount);
+    }
+
+    if (settings.zoomFillVersion >= 5) {
+      return migrateV5ZoomFillAmount(settings.zoomFillAmount);
+    }
+
+    return settings.zoomFillVersion >= 4
+      ? migratePreviousZoomFillAmount(settings.zoomFillAmount)
+      : migrateLegacyZoomFillAmount(settings.zoomFillAmount);
+  }
+
+  if (settings.zoomFillEnabled === false) return 0;
+
+  if (settings.zoomFillVersion >= 2) {
+    return zoomFillAmountForLevel(settings.zoomFillLevel);
+  }
+
+  if (settings.zoomFillLevel === 2) return zoomFillAmountForLevel(3);
+  if (settings.zoomFillLevel === 1) return zoomFillAmountForLevel(2);
+  return ZOOM_FILL_PRESETS.fill;
+}
+
+function zoomBiasPosition() {
+  const amount = Math.max(0, Math.round(appSettings.zoomFillBiasAmount || 0));
+  const step = amount * 5 * ZOOM_BIAS_STEP_SCALE;
+  switch (appSettings.zoomFillBiasDirection) {
+    case 'L': return { x: 50 - step, y: 50 };
+    case 'R': return { x: 50 + step, y: 50 };
+    case 'U': return { x: 50, y: 50 - step };
+    case 'D': return { x: 50, y: 50 + step };
+    default: return { x: 50, y: 50 };
+  }
+}
+
+// Below fill, the image is uncropped (object-fit: contain), so there's nothing
+// to pan into — instead bias slides a black curtain in from the biased edge.
+// Mirrors the cover-mode pan direction: 'L' favors the left, hiding the right.
+function zoomCurtainSide() {
+  switch (appSettings.zoomFillBiasDirection) {
+    case 'L': return 'right';
+    case 'R': return 'left';
+    case 'U': return 'bottom';
+    case 'D': return 'top';
+    default:  return null;
+  }
+}
+
+function zoomCurtainCoverage() {
+  const amount = Math.max(0, Math.round(appSettings.zoomFillBiasAmount || 0));
+  return Math.min(45, amount * ZOOM_BIAS_STEP_SCALE);
+}
+
+function applyCurtainToCell(cell, side, coveragePercent) {
+  const curtain = cell.querySelector('.zoom-curtain');
+  if (!side || coveragePercent <= 0) {
+    if (curtain) curtain.remove();
+    return;
+  }
+
+  const el = curtain || cell.appendChild(Object.assign(document.createElement('div'), {
+    className: 'zoom-curtain',
+  }));
+  el.style.top = '';
+  el.style.right = '';
+  el.style.bottom = '';
+  el.style.left = '';
+  el.style.width = '';
+  el.style.height = '';
+
+  if (side === 'left' || side === 'right') {
+    el.style.top = '0';
+    el.style.bottom = '0';
+    el.style.width = `${coveragePercent}%`;
+  } else {
+    el.style.left = '0';
+    el.style.right = '0';
+    el.style.height = `${coveragePercent}%`;
+  }
+  el.style[side] = '0';
+}
+
+function applyZoomFillToImages() {
+  const coverMode = isZoomFillCover(appSettings.zoomFillAmount);
+  const position = coverMode ? zoomBiasPosition() : { x: 50, y: 50 };
+  const positionValue = `${position.x}% ${position.y}%`;
+  imageGrid.style.setProperty('--zoom-fill-x', `${position.x}%`);
+  imageGrid.style.setProperty('--zoom-fill-y', `${position.y}%`);
+
+  const curtainSide = coverMode ? null : zoomCurtainSide();
+  const curtainCoverage = curtainSide ? zoomCurtainCoverage() : 0;
+
+  imageGrid.querySelectorAll('.grid-cell').forEach(cell => {
+    const img = cell.querySelector('img');
+    if (img) {
+      img.style.objectPosition = positionValue;
+      img.style.transformOrigin = positionValue;
+    }
+    applyCurtainToCell(cell, img ? curtainSide : null, curtainCoverage);
+  });
+}
+
+function syncZoomFillControls() {
+  const fillAmount = normalizeZoomFillAmount(Number.isFinite(appSettings.zoomFillAmount)
+    ? appSettings.zoomFillAmount
+    : ZOOM_FILL_PRESETS.fill);
+  const fillEnabled = fillAmount > 0;
+  const coverEnabled = isZoomFillCover(fillAmount);
+  const level = zoomFillLevelForAmount(fillAmount);
+  const amount = Math.max(0, Math.round(appSettings.zoomFillBiasAmount || 0));
+  const direction = amount > 0 ? appSettings.zoomFillBiasDirection : '';
+
+  appSettings.zoomFillLevel = level;
+  appSettings.zoomFillAmount = fillAmount;
+  appSettings.zoomFillEnabled = fillEnabled;
+  imageGrid.style.setProperty('--zoom-fill-active-scale', zoomFillScale(fillAmount).toFixed(3));
+  document.body.classList.toggle('zoom-fill', fillEnabled);
+  document.body.classList.toggle('zoom-fill-cover', coverEnabled);
+  applyZoomFillToImages();
+
+  btnZoomFill.classList.toggle('active', fillEnabled);
+  btnZoomFill.textContent = fillEnabled ? 'Fill' : 'Fit';
+  btnZoomFill.title = coverEnabled
+    ? 'Zoom to fill is on'
+    : fillEnabled
+      ? 'Partial zoom is on'
+      : 'Zoom to fill is off';
+  btnZoomLevel1.classList.toggle('active', fillEnabled && fillAmount === ZOOM_FILL_PRESETS[1]);
+  btnZoomLevel2.classList.toggle('active', fillEnabled && fillAmount === ZOOM_FILL_PRESETS[2]);
+  btnZoomLevel3.classList.toggle('active', fillEnabled && fillAmount === ZOOM_FILL_PRESETS[3]);
+  zoomFillSlider.value = String(fillAmount);
+  zoomFillSlider.title = fillEnabled
+    ? `Zoom to fill amount ${fillAmount}`
+    : 'No zoom to fill';
+  zoomBiasLetter.textContent = direction;
+  zoomBiasValue.textContent = String(amount);
+}
+
+function setZoomFillEnabled(enabled) {
+  appSettings.zoomFillAmount = enabled ? ZOOM_FILL_PRESETS.fill : 0;
+  syncZoomFillControls();
+  persistSettings();
+}
+
+function setZoomFillLevel(level) {
+  appSettings.zoomFillAmount = zoomFillAmountForLevel(level);
+  syncZoomFillControls();
+  persistSettings();
+}
+
+function setZoomFillAmount(amount, shouldPersist = true) {
+  appSettings.zoomFillAmount = normalizeZoomFillAmount(amount);
+  syncZoomFillControls();
+  if (shouldPersist) persistSettings();
+}
+
+function nudgeZoomBias(direction, shouldPersist = true) {
+  if (!['L', 'R', 'U', 'D'].includes(direction)) return;
+  const opposites = { L: 'R', R: 'L', U: 'D', D: 'U' };
+  const currentDirection = appSettings.zoomFillBiasDirection;
+  const currentAmount = Math.max(0, Math.round(appSettings.zoomFillBiasAmount || 0));
+
+  if (!currentDirection || currentAmount === 0) {
+    appSettings.zoomFillBiasDirection = direction;
+    appSettings.zoomFillBiasAmount = 1;
+  } else if (currentDirection === direction) {
+    appSettings.zoomFillBiasAmount = currentAmount + 1;
+  } else if (opposites[currentDirection] === direction) {
+    const nextAmount = currentAmount - 1;
+    appSettings.zoomFillBiasDirection = nextAmount > 0 ? currentDirection : '';
+    appSettings.zoomFillBiasAmount = Math.max(0, nextAmount);
+  } else {
+    appSettings.zoomFillBiasDirection = direction;
+    appSettings.zoomFillBiasAmount = 1;
+  }
+  appSettings.zoomFillEnabled = true;
+  syncZoomFillControls();
+  if (shouldPersist) persistSettings();
+}
+
+function stopZoomBiasRepeat() {
+  if (zoomBiasHoldTimer === null && zoomBiasRepeatTimer === null) return;
+  if (zoomBiasHoldTimer !== null) {
+    clearTimeout(zoomBiasHoldTimer);
+    zoomBiasHoldTimer = null;
+  }
+  if (zoomBiasRepeatTimer !== null) {
+    clearInterval(zoomBiasRepeatTimer);
+    zoomBiasRepeatTimer = null;
+  }
+  zoomBiasRepeatPointerId = null;
+  persistSettings();
+}
+
+function startZoomBiasRepeat(button, pointerId) {
+  const direction = button.dataset.biasDirection;
+  if (!direction) return;
+
+  stopZoomBiasRepeat();
+  zoomBiasRepeatPointerId = pointerId;
+  nudgeZoomBias(direction, false);
+
+  // Wait before auto-repeating so a quick click only nudges once — without
+  // this, a click slightly longer than the repeat interval double-steps.
+  zoomBiasHoldTimer = setTimeout(() => {
+    zoomBiasHoldTimer = null;
+    zoomBiasRepeatTimer = setInterval(() => {
+      nudgeZoomBias(direction, false);
+    }, ZOOM_BIAS_REPEAT_MS);
+  }, ZOOM_BIAS_HOLD_DELAY_MS);
+
+  try {
+    button.setPointerCapture(pointerId);
+  } catch { /* ignore */ }
+}
+
 // ==============================
 // UI toggle (Shift+Q)
 // ==============================
@@ -526,6 +872,12 @@ async function persistSettings() {
       emptyCount:        state.emptyCount,
       displayMode:       state.displayMode,
       slideshowDuration: state.slideshowDuration,
+      zoomFillEnabled: appSettings.zoomFillEnabled,
+      zoomFillLevel: appSettings.zoomFillLevel,
+      zoomFillAmount: appSettings.zoomFillAmount,
+      zoomFillVersion: appSettings.zoomFillVersion,
+      zoomFillBiasDirection: appSettings.zoomFillBiasDirection,
+      zoomFillBiasAmount: appSettings.zoomFillBiasAmount,
       squareAppCorners:  appSettings.squareAppCorners,
       firstAutoOpenSlideshow: appSettings.firstAutoOpenSlideshow,
       secondaryAutoOpenSlideshow: appSettings.secondaryAutoOpenSlideshow,
@@ -617,6 +969,53 @@ emptyDisplayEl.addEventListener('click', () =>
 
 btnModeRandom.addEventListener('click', () => setDisplayMode('random'));
 btnModeChrono.addEventListener('click', () => setDisplayMode('chrono'));
+
+btnZoomFill.addEventListener('click', () => {
+  setZoomFillAmount(ZOOM_FILL_PRESETS.fill);
+});
+
+btnZoomLevel1.addEventListener('click', () => setZoomFillLevel(1));
+btnZoomLevel2.addEventListener('click', () => setZoomFillLevel(2));
+btnZoomLevel3.addEventListener('click', () => setZoomFillLevel(3));
+
+zoomFillSlider.addEventListener('input', () => {
+  setZoomFillAmount(snapZoomFillAmount(zoomFillSlider.value), false);
+});
+
+zoomFillSlider.addEventListener('change', () => {
+  setZoomFillAmount(snapZoomFillAmount(zoomFillSlider.value));
+  zoomFillSlider.blur();
+});
+
+zoomBiasControl.addEventListener('pointerdown', e => {
+  const button = e.target.closest('button[data-bias-direction]');
+  if (!button) return;
+  e.preventDefault();
+  e.stopPropagation();
+  startZoomBiasRepeat(button, e.pointerId);
+});
+
+zoomBiasControl.addEventListener('pointerup', e => {
+  if (e.pointerId === zoomBiasRepeatPointerId) stopZoomBiasRepeat();
+});
+
+zoomBiasControl.addEventListener('pointercancel', e => {
+  if (e.pointerId === zoomBiasRepeatPointerId) stopZoomBiasRepeat();
+});
+
+zoomBiasControl.addEventListener('lostpointercapture', e => {
+  if (e.pointerId === zoomBiasRepeatPointerId) stopZoomBiasRepeat();
+});
+
+window.addEventListener('blur', stopZoomBiasRepeat);
+
+document.getElementById('zoom-bias-display').addEventListener('click', e => {
+  e.stopPropagation();
+  appSettings.zoomFillBiasDirection = '';
+  appSettings.zoomFillBiasAmount = 0;
+  syncZoomFillControls();
+  persistSettings();
+});
 
 btnSlideshow.addEventListener('click', toggleSlideshow);
 btnShuffle.addEventListener('click',   shuffleCurrent);
@@ -779,6 +1178,16 @@ document.addEventListener('keydown', e => {
     state.displayMode      = s.displayMode || 'random';
     state.slideshowDuration = Math.max(1000, s.slideshowDuration || 5000);
     appSettings.squareAppCorners = !!s.squareAppCorners;
+    appSettings.zoomFillVersion = 6;
+    appSettings.zoomFillAmount = loadZoomFillAmount(s);
+    appSettings.zoomFillEnabled = appSettings.zoomFillAmount > 0;
+    appSettings.zoomFillLevel = zoomFillLevelForAmount(appSettings.zoomFillAmount);
+    appSettings.zoomFillBiasDirection = ['L', 'R', 'U', 'D'].includes(s.zoomFillBiasDirection)
+      ? s.zoomFillBiasDirection
+      : '';
+    appSettings.zoomFillBiasAmount = appSettings.zoomFillBiasDirection
+      ? Math.max(0, Math.round(s.zoomFillBiasAmount || 0))
+      : 0;
     appSettings.firstAutoOpenSlideshow = !!(s.firstAutoOpenSlideshow || s.autoOpenSlideshow);
     appSettings.secondaryAutoOpenSlideshow = !!s.secondaryAutoOpenSlideshow;
     appSettings.autoHideUiOnStartup = !!s.autoHideUiOnStartup;
@@ -800,6 +1209,7 @@ document.addEventListener('keydown', e => {
     syncStartupFolderSettings();
     syncSlideshowButton();
     syncModeButtons();
+    syncZoomFillControls();
     syncNavButtons();
     if (appSettings.autoHideUiOnStartup) {
       setUiHidden(true);
@@ -816,6 +1226,7 @@ document.addEventListener('keydown', e => {
     syncStartupFolderSettings();
     syncSlideshowButton();
     syncModeButtons();
+    syncZoomFillControls();
     syncNavButtons();
   }
 

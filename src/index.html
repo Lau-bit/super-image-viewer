@@ -57,6 +57,24 @@
       <button id="btn-mode-chrono" class="mode-btn"        title="Recent images by date">Recent</button>
     </div>
 
+    <!-- Fill/crop controls -->
+    <div id="zoom-fill-controls">
+      <button id="btn-zoom-fill" class="toggle-btn" title="Toggle zoom to fill">Fill</button>
+      <button id="btn-zoom-level-1" class="zoom-level-btn active" title="Zoom to fill level 1">Z1</button>
+      <button id="btn-zoom-level-2" class="zoom-level-btn" title="Zoom to fill level 2">Z2</button>
+      <button id="btn-zoom-level-3" class="zoom-level-btn" title="Zoom to fill level 3">Z3</button>
+      <input id="zoom-fill-slider" type="range" min="0" max="100" step="1" value="30" title="Zoom to fill amount">
+      <div id="zoom-bias-control" title="Nudge zoom-to-fill centering">
+        <button id="btn-bias-left" data-bias-direction="L" title="Bias left">L</button>
+        <div class="zoom-bias-middle">
+          <button id="btn-bias-up" data-bias-direction="U" title="Bias up">U</button>
+          <span id="zoom-bias-display" title="Reset bias"><span id="zoom-bias-letter"></span><span id="zoom-bias-value">0</span></span>
+          <button id="btn-bias-down" data-bias-direction="D" title="Bias down">D</button>
+        </div>
+        <button id="btn-bias-right" data-bias-direction="R" title="Bias right">R</button>
+      </div>
+    </div>
+
     <!-- Slideshow -->
     <button id="btn-slideshow" class="toggle-btn" title="Slideshow &#x2014; auto-advance sets">&#x23F5;</button>
 

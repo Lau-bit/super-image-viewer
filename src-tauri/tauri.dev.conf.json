@@ -1,0 +1,11 @@
+{
+  "build": {
+    "devUrl": "http://localhost:1430",
+    "beforeDevCommand": "live-server src --port=1430 --no-browser"
+  },
+  "app": {
+    "security": {
+      "csp": "default-src 'self' http://localhost:1430 ws://localhost:1430 asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost blob:; connect-src 'self' ws://localhost:1430"
+    }
+  }
+}
