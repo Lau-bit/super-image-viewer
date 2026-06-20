@@ -16,6 +16,13 @@ const ZOOM_FILL_MAX_SCALE = 1.32;
 const MANUAL_ZOOM_MAX = 4;
 const MANUAL_DRAG_THRESHOLD_PX = 4;
 const MANUAL_WHEEL_ZOOM_FACTOR = 0.0015;
+const SLIDESHOW_PRELOAD_LEAD_MS = 1200;
+const SLIDESHOW_STAGGER_BATCH_SIZE = 6;
+const SLIDESHOW_STAGGER_DELAY_MS = 28;
+const PORTRAIT_AUTO_BIAS_MIN_ASPECT = 1.02;
+const PORTRAIT_FILL_MAX_EXTRA_SCALE = 1.08;
+const PORTRAIT_FACE_SAFE_PAN = 0.78;
+const PORTRAIT_BIAS_STEP_CELL_RATIO = 0.0015;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -27,8 +34,8 @@ function clamp(value, min, max) {
 const state = {
   folder:     null,
   allImages:  [],          // [{path, modified}] newest-first
-  browseMode: 'single',    // 'single' | 'multi' | 'categorized'
-  viewedBrowseMode: 'single',
+  browseMode: 'multi',    // 'multi' | 'categorized'
+  viewedBrowseMode: 'multi',
   multiFolders: [],
   multiFolderFilter: new Set(),
   categorizedRoot: null,
@@ -46,6 +53,10 @@ const state = {
   slideshow:         false,
   slideshowDuration: 5000,
   slideshowTimer:    null,
+  slideshowPreloadTimer: null,
+  slideshowPreload: null,
+  slideshowPreloadToken: 0,
+  gridRenderToken: 0,
 
   uiHidden:     false,
   settingsOpen: false,
@@ -55,6 +66,53 @@ const state = {
 // automatically dropped once that element is discarded (new image in slot).
 const imageManualZoom = new WeakMap(); // img -> { scale, tx, ty }
 let hoveredCell = null;
+let lastManualZoomCell = null;
+let manualZoomActiveCount = 0;
+
+function setImageManualZoom(img, value) {
+  img.style.transition = '';
+  if (!imageManualZoom.has(img)) manualZoomActiveCount++;
+  imageManualZoom.set(img, value);
+}
+
+function deleteImageManualZoom(img) {
+  if (imageManualZoom.delete(img)) {
+    manualZoomActiveCount = Math.max(0, manualZoomActiveCount - 1);
+  }
+}
+
+function clearImageManualZoom(img, animate = false) {
+  const cell = img.closest('.grid-cell');
+
+  if (animate && imageManualZoom.has(img)) {
+    const resetManual = { scale: 1, tx: 0, ty: 0, resetting: true };
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      if (imageManualZoom.get(img) !== resetManual) return;
+      finished = true;
+      img.style.transition = '';
+      deleteImageManualZoom(img);
+      if (cell === lastManualZoomCell) lastManualZoomCell = null;
+      cell?.classList.remove('manual-zoom');
+      img.style.objectFit = '';
+      img.style.transform = '';
+      applyZoomFillToImages();
+    };
+
+    img.style.transition = 'transform 0.3s ease-out';
+    img.addEventListener('transitionend', finish, { once: true });
+    setTimeout(finish, 360);
+    imageManualZoom.set(img, resetManual);
+    return;
+  }
+
+  deleteImageManualZoom(img);
+  if (cell === lastManualZoomCell) lastManualZoomCell = null;
+  cell?.classList.remove('manual-zoom');
+  img.style.objectFit = '';
+  img.style.transform = '';
+}
 
 // Session history — array of {slots, chronoOffset}
 const hist = { stack: [], pos: -1 };
@@ -75,13 +133,10 @@ const appSettings = {
   zoomFillBiasAmount: 0,
   firstAutoOpenSlideshow: false,
   secondaryAutoOpenSlideshow: false,
+  autoSlideshowSource: 'folders',
   autoHideUiOnStartup: false,
-  firstDisplayFolderEnabled: false,
-  firstDisplayFolder: null,
-  secondaryDisplayFolderEnabled: false,
-  secondaryDisplayFolder: null,
-  startupBrowseMode: 'single',
-  startupFolder: null,
+  instantFilterCategorized: true,
+  startupBrowseMode: 'multi',
   startupMultiFolders: [],
   startupMultiFolderFilter: [],
   startupCategorizedRoot: null,
@@ -98,10 +153,8 @@ const folderPanel        = document.getElementById('folder-panel');
 const folderModeTabs     = document.querySelectorAll('.folder-mode-tab');
 const folderLoading      = document.getElementById('folder-loading');
 const folderLoadingText  = document.getElementById('folder-loading-text');
-const folderSectionSingle = document.getElementById('folder-section-single');
 const folderSectionMulti = document.getElementById('folder-section-multi');
 const folderSectionCategorized = document.getElementById('folder-section-categorized');
-const folderSingleChoose = document.getElementById('folder-single-choose');
 const folderMultiAdd     = document.getElementById('folder-multi-add');
 const multiFolderListEl  = document.getElementById('multi-folder-list');
 const categorizedRootNameEl = document.getElementById('categorized-root-name');
@@ -141,14 +194,11 @@ const settingSaveSecondaryWindow   = document.getElementById('setting-save-secon
 const settingResetSecondaryWindow  = document.getElementById('setting-reset-secondary-window');
 const settingSquareAppCorners      = document.getElementById('setting-square-app-corners');
 const settingAutoHideUi            = document.getElementById('setting-auto-hide-ui');
+const settingInstantFilter         = document.getElementById('setting-instant-filter');
 const settingFirstAutoOpenSlideshow = document.getElementById('setting-first-auto-open-slideshow');
 const settingSecondaryAutoOpenSlideshow = document.getElementById('setting-secondary-auto-open-slideshow');
-const settingFirstFolderEnabled    = document.getElementById('setting-first-folder-enabled');
-const settingFirstFolderName       = document.getElementById('setting-first-folder-name');
-const settingBrowseFirstFolder     = document.getElementById('setting-browse-first-folder');
-const settingSecondaryFolderEnabled = document.getElementById('setting-secondary-folder-enabled');
-const settingSecondaryFolderName   = document.getElementById('setting-secondary-folder-name');
-const settingBrowseSecondaryFolder = document.getElementById('setting-browse-secondary-folder');
+const settingAutoSlideshowSource   = document.getElementById('setting-auto-slideshow-source');
+const settingAutoSlideshowFolderNeeded = document.getElementById('setting-auto-slideshow-folder-needed');
 const settingSlider      = document.getElementById('setting-count-slider');
 const settingCountVal    = document.getElementById('setting-count-value');
 const settingStartupBrowseMode = document.getElementById('setting-startup-browse-mode');
@@ -157,6 +207,7 @@ const settingStartupSourceName = document.getElementById('setting-startup-source
 const settingSlideshowDur = document.getElementById('setting-slideshow-duration');
 const btnMinimize        = document.getElementById('btn-minimize');
 const btnClose           = document.getElementById('btn-close');
+const gridContextMenu    = document.getElementById('grid-context-menu');
 
 // ==============================
 // Grid layout
@@ -189,14 +240,14 @@ function pickChrono(n, offset) {
 }
 
 // Build a slot array: image paths + null empty slots, all shuffled together
-function generateSlots() {
+function generateSlots(chronoOffset = state.chronoOffset) {
   const total   = state.imageCount;
   const empties = Math.min(state.emptyCount, total - 1);
   const imgN    = total - empties;
 
   const paths = state.displayMode === 'random'
     ? pickRandom(imgN)
-    : pickChrono(imgN, state.chronoOffset);
+    : pickChrono(imgN, chronoOffset);
 
   // Pad with nulls if fewer images than requested (e.g. small folder)
   const imagePart = [
@@ -224,36 +275,17 @@ function pushHistory(slots, chronoOffset) {
   syncNavButtons();
 }
 
-function restoreEntry(entry) {
+function restoreEntry(entry, options = {}) {
   state.displayedSlots = [...entry.slots];
   state.chronoOffset   = entry.chronoOffset;
-  renderGrid(state.displayedSlots);
+  renderGrid(state.displayedSlots, options);
 }
 
 function syncNavButtons() {
   btnNavPrev.disabled = hist.pos <= 0;
 }
 
-function displayFolderName(folder) {
-  return folder ? folder.replace(/\\/g, '/').split('/').pop() : 'None';
-}
-
-function syncStartupFolderSettings() {
-  settingFirstFolderEnabled.checked = appSettings.firstDisplayFolderEnabled;
-  settingFirstFolderName.textContent = displayFolderName(appSettings.firstDisplayFolder);
-  settingFirstFolderName.title = appSettings.firstDisplayFolder || 'No folder selected';
-  settingBrowseFirstFolder.disabled = !appSettings.firstDisplayFolderEnabled;
-
-  settingSecondaryFolderEnabled.checked = appSettings.secondaryDisplayFolderEnabled;
-  settingSecondaryFolderName.textContent = displayFolderName(appSettings.secondaryDisplayFolder);
-  settingSecondaryFolderName.title = appSettings.secondaryDisplayFolder || 'No folder selected';
-  settingBrowseSecondaryFolder.disabled = !appSettings.secondaryDisplayFolderEnabled;
-}
-
 function startupSourceLabel() {
-  if (appSettings.startupBrowseMode === 'single') {
-    return appSettings.startupFolder ? baseName(appSettings.startupFolder) : 'No single folder set';
-  }
   if (appSettings.startupBrowseMode === 'multi') {
     const folders = appSettings.startupMultiFolders || [];
     const enabled = new Set(appSettings.startupMultiFolderFilter || []);
@@ -269,26 +301,11 @@ function syncStartupSourceSettings() {
   settingStartupBrowseMode.value = appSettings.startupBrowseMode;
   settingStartupSourceName.textContent = startupSourceLabel();
   settingStartupSourceName.title = startupSourceLabel();
+  syncAutoSlideshowSourceSettings();
 }
 
 function isSecondWindow() {
   return windowLabel === 'viewer-1';
-}
-
-function startupFolderForWindow() {
-  if (windowLabel === 'main') {
-    return appSettings.firstDisplayFolderEnabled && appSettings.firstDisplayFolder
-      ? appSettings.firstDisplayFolder
-      : null;
-  }
-
-  if (!isSecondWindow()) {
-    return null;
-  }
-
-  const enabled = appSettings.secondaryDisplayFolderEnabled;
-  const folder = appSettings.secondaryDisplayFolder;
-  return enabled && folder ? folder : null;
 }
 
 function shouldAutoStartSlideshow() {
@@ -298,18 +315,41 @@ function shouldAutoStartSlideshow() {
   return isSecondWindow() && appSettings.secondaryAutoOpenSlideshow;
 }
 
+function hasStartupFolders() {
+  return !!(appSettings.startupMultiFolders && appSettings.startupMultiFolders.length);
+}
+
+function shouldShowAutoSlideshowFolderPrompt() {
+  const autoStartEnabled = appSettings.firstAutoOpenSlideshow || appSettings.secondaryAutoOpenSlideshow;
+  return autoStartEnabled && appSettings.autoSlideshowSource === 'folders' && !hasStartupFolders();
+}
+
+function syncAutoSlideshowSourceSettings() {
+  settingAutoSlideshowSource.value = appSettings.autoSlideshowSource;
+  settingAutoSlideshowFolderNeeded.hidden = !shouldShowAutoSlideshowFolderPrompt();
+}
+
+async function loadAutoSlideshowCategorizedSource() {
+  const root = appSettings.startupCategorizedRoot || state.categorizedRoot;
+  if (appSettings.startupCategorizedRoot) {
+    state.categorizedRoot = appSettings.startupCategorizedRoot;
+    state.categorizedCategoryFilter = new Set(appSettings.startupCategorizedCategoryFilter);
+  }
+  state.viewedBrowseMode = 'categorized';
+  renderCategorizedRootRow();
+  renderFolderPanelSections();
+  await enterCategorizedMode(root);
+  if (state.browseMode !== 'categorized') {
+    loadImagePool([], root ? baseName(root) : 'No categorized root', 'categorized');
+  }
+}
+
 function hasConfiguredStartupSource() {
-  if (appSettings.startupBrowseMode === 'single') return !!appSettings.startupFolder;
   if (appSettings.startupBrowseMode === 'multi') return !!appSettings.startupMultiFolders.length;
   return !!appSettings.startupCategorizedRoot;
 }
 
 async function loadConfiguredStartupSource() {
-  if (appSettings.startupBrowseMode === 'single') {
-    await loadFolder(appSettings.startupFolder);
-    return;
-  }
-
   if (appSettings.startupBrowseMode === 'multi') {
     state.multiFolders = [...appSettings.startupMultiFolders];
     state.multiFolderFilter = new Set(appSettings.startupMultiFolderFilter);
@@ -329,16 +369,52 @@ async function loadConfiguredStartupSource() {
   await enterCategorizedMode();
 }
 
+async function loadAutoSlideshowSource() {
+  if (appSettings.autoSlideshowSource === 'categorized') {
+    await loadAutoSlideshowCategorizedSource();
+    return;
+  }
+
+  state.multiFolders = [...appSettings.startupMultiFolders];
+  state.multiFolderFilter = new Set(appSettings.startupMultiFolderFilter);
+  normalizeMultiFolderFilter({ defaultAll: true });
+  renderMultiFolderList();
+  state.viewedBrowseMode = 'multi';
+  renderFolderPanelSections();
+  await enterMultiMode();
+}
+
 // ==============================
 // Render grid
 // ==============================
-function renderGrid(slots) {
+function applyImageSlot(img, slot) {
+  if (img.getAttribute('data-src') === slot) return;
+  clearImageManualZoom(img);
+  img.setAttribute('data-src', slot);
+  img.removeAttribute('data-pending-src');
+  img.classList.remove('loaded');
+  img.onload  = () => {
+    img.classList.add('loaded');
+    applyZoomFillToImages();
+  };
+  img.onerror = () => {};
+  img.src = window.viewerAPI.getFileUrl(slot);
+}
+
+function renderGrid(slots, options = {}) {
+  const stagger = !!options.stagger;
+  const renderToken = ++state.gridRenderToken;
   applyGridLayout(slots.length || state.imageCount);
 
   const existing = [...imageGrid.querySelectorAll('.grid-cell')];
+  const pendingImageUpdates = [];
 
   // Remove excess cells
-  for (let i = slots.length; i < existing.length; i++) existing[i].remove();
+  for (let i = slots.length; i < existing.length; i++) {
+    const img = existing[i].querySelector('img');
+    if (img) clearImageManualZoom(img);
+    existing[i].remove();
+  }
 
   slots.forEach((slot, i) => {
     let cell = i < existing.length ? existing[i] : (() => {
@@ -352,7 +428,10 @@ function renderGrid(slots) {
     if (slot === null) {
       cell.classList.add('empty-slot');
       const img = cell.querySelector('img');
-      if (img) img.remove();
+      if (img) {
+        clearImageManualZoom(img);
+        img.remove();
+      }
     } else {
       cell.classList.remove('empty-slot');
       let img = cell.querySelector('img');
@@ -362,16 +441,27 @@ function renderGrid(slots) {
         cell.appendChild(img);
       }
       if (img.getAttribute('data-src') !== slot) {
-        imageManualZoom.delete(img);
-        img.setAttribute('data-src', slot);
-        img.classList.remove('loaded');
-        img.onload  = () => img.classList.add('loaded');
-        img.onerror = () => {};
-        img.src = window.viewerAPI.getFileUrl(slot);
+        if (stagger) {
+          img.setAttribute('data-pending-src', slot);
+          pendingImageUpdates.push({ img, slot });
+        }
+        else applyImageSlot(img, slot);
+      } else {
+        img.removeAttribute('data-pending-src');
       }
     }
   });
   applyZoomFillToImages();
+
+  if (!pendingImageUpdates.length) return;
+
+  pendingImageUpdates.forEach((update, index) => {
+    const batch = Math.floor(index / SLIDESHOW_STAGGER_BATCH_SIZE);
+    window.setTimeout(() => {
+      if (renderToken !== state.gridRenderToken) return;
+      applyImageSlot(update.img, update.slot);
+    }, batch * SLIDESHOW_STAGGER_DELAY_MS);
+  });
 }
 
 // Wires per-cell drag-to-pan / wheel-to-zoom / click-to-open-floating-view.
@@ -382,6 +472,12 @@ function attachCellInteractions(cell) {
 
   cell.addEventListener('pointerdown', e => {
     if (e.button !== 0) return;
+    // A left-click while the categorize menu is open just dismisses it —
+    // don't start a drag or open the floating image on that same click.
+    if (gridContextMenu.classList.contains('open')) {
+      closeGridContextMenu();
+      return;
+    }
     const img = cell.querySelector('img');
     if (!img || !img.naturalWidth) return;
     drag = {
@@ -402,13 +498,14 @@ function attachCellInteractions(cell) {
     if (!drag.dragging) {
       if (Math.hypot(dx, dy) < MANUAL_DRAG_THRESHOLD_PX) return;
       drag.dragging = true;
+      lastManualZoomCell = cell;
       cell.classList.add('panning');
     }
 
     const rect = cell.getBoundingClientRect();
     const totalScale = zoomFillScale(appSettings.zoomFillAmount) * drag.baseline.scale;
     const { maxTx, maxTy } = manualZoomOverflow(drag.img, rect, totalScale);
-    imageManualZoom.set(drag.img, {
+    setImageManualZoom(drag.img, {
       scale: drag.baseline.scale,
       tx: clamp(drag.baseline.tx + dx, -maxTx, maxTx),
       ty: clamp(drag.baseline.ty + dy, -maxTy, maxTy),
@@ -437,13 +534,17 @@ function attachCellInteractions(cell) {
     const current = imageManualZoom.get(img) || { scale: 1, tx: 0, ty: 0 };
     const nextScale = clamp(current.scale * Math.exp(-e.deltaY * MANUAL_WHEEL_ZOOM_FACTOR), 1, MANUAL_ZOOM_MAX);
     const rect = cell.getBoundingClientRect();
+    const scaleRatio = nextScale / current.scale;
+    const pointerX = e.clientX - rect.left - rect.width / 2;
+    const pointerY = e.clientY - rect.top - rect.height / 2;
     const totalScale = zoomFillScale(appSettings.zoomFillAmount) * nextScale;
     const { maxTx, maxTy } = manualZoomOverflow(img, rect, totalScale);
-    imageManualZoom.set(img, {
+    setImageManualZoom(img, {
       scale: nextScale,
-      tx: clamp(current.tx, -maxTx, maxTx),
-      ty: clamp(current.ty, -maxTy, maxTy),
+      tx: clamp(pointerX - (pointerX - current.tx) * scaleRatio, -maxTx, maxTx),
+      ty: clamp(pointerY - (pointerY - current.ty) * scaleRatio, -maxTy, maxTy),
     });
+    lastManualZoomCell = cell;
     applyZoomFillToImages();
   }, { passive: false });
 
@@ -456,6 +557,7 @@ function attachCellInteractions(cell) {
 function openFloatingImage(cell) {
   const img = cell.querySelector('img');
   if (!img || !img.naturalWidth) return;
+  if (img.hasAttribute('data-pending-src')) return;
   const path = img.getAttribute('data-src');
   if (!path) return;
   const rect = cell.getBoundingClientRect();
@@ -468,13 +570,117 @@ function openFloatingImage(cell) {
 }
 
 // ==============================
+// Slideshow preloading
+// ==============================
+function nextChronoOffset() {
+  if (state.displayMode !== 'chrono') return state.chronoOffset;
+  const step = Math.max(1, state.imageCount - state.emptyCount);
+  return Math.min(state.allImages.length - 1, state.chronoOffset + step);
+}
+
+function buildNextSlideshowPlan() {
+  if (hist.pos < hist.stack.length - 1) {
+    const entry = hist.stack[hist.pos + 1];
+    return {
+      slots: [...entry.slots],
+      chronoOffset: entry.chronoOffset,
+      fromHistory: true,
+    };
+  }
+
+  const chronoOffset = nextChronoOffset();
+  return {
+    slots: generateSlots(chronoOffset),
+    chronoOffset,
+    fromHistory: false,
+  };
+}
+
+function preloadImage(path, keepAlive) {
+  return new Promise(resolve => {
+    if (!path) {
+      resolve();
+      return;
+    }
+
+    const img = new Image();
+    keepAlive.push(img);
+    img.decoding = 'async';
+    img.loading = 'eager';
+    let doneCalled = false;
+
+    const done = () => {
+      if (doneCalled) return;
+      doneCalled = true;
+      if (typeof img.decode === 'function') {
+        img.decode().catch(() => {}).finally(resolve);
+      } else {
+        resolve();
+      }
+    };
+
+    img.onload = done;
+    img.onerror = resolve;
+    img.src = window.viewerAPI.getFileUrl(path);
+    if (img.complete) done();
+  });
+}
+
+function clearSlideshowPreload() {
+  clearTimeout(state.slideshowPreloadTimer);
+  state.slideshowPreloadTimer = null;
+  state.slideshowPreload = null;
+  state.slideshowPreloadToken++;
+}
+
+function startSlideshowPreload() {
+  if (!state.slideshow || document.hidden || !state.allImages.length) return;
+
+  const token = ++state.slideshowPreloadToken;
+  const plan = buildNextSlideshowPlan();
+  const keepAlive = [];
+  const paths = [...new Set(plan.slots.filter(Boolean))];
+
+  const preload = {
+    ...plan,
+    token,
+    keepAlive,
+    ready: false,
+  };
+  state.slideshowPreload = preload;
+
+  Promise
+    .all(paths.map(path => preloadImage(path, keepAlive)))
+    .then(() => {
+      if (state.slideshowPreload !== preload || state.slideshowPreloadToken !== token) return;
+      preload.ready = true;
+    });
+}
+
+function scheduleSlideshowPreload() {
+  clearTimeout(state.slideshowPreloadTimer);
+  state.slideshowPreloadTimer = null;
+  if (!state.slideshow || document.hidden || !state.allImages.length) return;
+
+  const delay = Math.max(0, state.slideshowDuration - SLIDESHOW_PRELOAD_LEAD_MS);
+  state.slideshowPreloadTimer = setTimeout(startSlideshowPreload, delay);
+}
+
+function takeSlideshowPreloadPlan() {
+  const preload = state.slideshowPreload;
+  if (!preload || !preload.ready) return null;
+  state.slideshowPreload = null;
+  return preload;
+}
+
+// ==============================
 // Refresh — generate a new set
 // ==============================
-function refresh() {
+function refresh(options = {}) {
   if (!state.allImages.length) return;
   const slots = generateSlots();
   state.displayedSlots = slots;
-  renderGrid(slots);
+  renderGrid(slots, options);
   pushHistory(slots, state.chronoOffset);
   rescheduleSlideshowTick();
 }
@@ -485,7 +691,7 @@ function refresh() {
 function navigateBack() {
   if (hist.pos <= 0) return;
   hist.pos--;
-  restoreEntry(hist.stack[hist.pos]);
+  restoreEntry(hist.stack[hist.pos], { stagger: state.slideshow });
   syncNavButtons();
   rescheduleSlideshowTick();
 }
@@ -494,18 +700,24 @@ function navigateForward() {
   if (hist.pos < hist.stack.length - 1) {
     // Re-play a set from history
     hist.pos++;
-    restoreEntry(hist.stack[hist.pos]);
+    restoreEntry(hist.stack[hist.pos], { stagger: state.slideshow });
     syncNavButtons();
   } else {
+    const preloadedPlan = state.slideshow ? takeSlideshowPreloadPlan() : null;
+    if (preloadedPlan) {
+      state.chronoOffset = preloadedPlan.chronoOffset;
+      state.displayedSlots = [...preloadedPlan.slots];
+      renderGrid(state.displayedSlots, { stagger: true });
+      pushHistory(state.displayedSlots, state.chronoOffset);
+      rescheduleSlideshowTick();
+      return;
+    }
+
     // At the head — generate a new set
     if (state.displayMode === 'chrono') {
-      const step = Math.max(1, state.imageCount - state.emptyCount);
-      state.chronoOffset = Math.min(
-        state.allImages.length - 1,
-        state.chronoOffset + step,
-      );
+      state.chronoOffset = nextChronoOffset();
     }
-    refresh();
+    refresh({ stagger: state.slideshow });
   }
   rescheduleSlideshowTick();
 }
@@ -530,6 +742,7 @@ function shuffleCurrent() {
 // ==============================
 function syncSlideshowButton() {
   btnSlideshow.classList.toggle('active', state.slideshow);
+  document.body.classList.toggle('slideshow-active', state.slideshow);
   btnSlideshow.textContent = state.slideshow ? 'ON' : '\u23F5';
   btnSlideshow.title = state.slideshow
     ? 'Slideshow is on - click to stop'
@@ -548,6 +761,7 @@ function stopSlideshow() {
   syncSlideshowButton();
   clearTimeout(state.slideshowTimer);
   state.slideshowTimer = null;
+  clearSlideshowPreload();
 }
 
 function toggleSlideshow() {
@@ -557,11 +771,13 @@ function toggleSlideshow() {
 
 function rescheduleSlideshowTick() {
   clearTimeout(state.slideshowTimer);
+  clearSlideshowPreload();
   if (!state.slideshow) return;
   state.slideshowTimer = setTimeout(() => {
     if (!state.slideshow) return;
     navigateForward();
   }, state.slideshowDuration);
+  scheduleSlideshowPreload();
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -569,6 +785,7 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     clearTimeout(state.slideshowTimer);
     state.slideshowTimer = null;
+    clearSlideshowPreload();
   } else {
     rescheduleSlideshowTick();
   }
@@ -578,6 +795,10 @@ document.addEventListener('visibilitychange', () => {
 // Folder loading
 // ==============================
 function clearDisplayFolder() {
+  state.gridRenderToken++;
+  clearSlideshowPreload();
+  hoveredCell = null;
+  lastManualZoomCell = null;
   state.folder = null;
   state.allImages = [];
   state.displayedSlots = [];
@@ -598,6 +819,22 @@ function baseName(path) {
 
 function fileKey(path) {
   return String(path || '').toLocaleLowerCase();
+}
+
+function normalizeBrowseMode(mode) {
+  return mode === 'categorized' ? 'categorized' : 'multi';
+}
+
+function uniqueFolders(folders) {
+  const seen = new Set();
+  const result = [];
+  for (const folder of folders.filter(Boolean)) {
+    const key = fileKey(folder);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(folder);
+  }
+  return result;
 }
 
 function persistMultiFolderFilter() {
@@ -638,12 +875,10 @@ function setFolderPanelOpen(open) {
 
 function renderFolderButton() {
   let label = 'Folder';
-  if (state.browseMode === 'single') {
-    label = state.folder ? baseName(state.folder) : 'Folder';
-  } else if (state.browseMode === 'multi') {
+  if (state.browseMode === 'multi') {
     const enabled = enabledMultiFolders();
     label = !state.multiFolders.length
-      ? 'Multi-Folder'
+      ? 'Folders'
       : enabled.length === 1
         ? baseName(enabled[0])
         : `${enabled.length}/${state.multiFolders.length} folders`;
@@ -652,7 +887,6 @@ function renderFolderButton() {
   }
 
   folderButtonLabel.textContent = label;
-  btnFolder.classList.toggle('mode-single', state.browseMode === 'single');
   btnFolder.classList.toggle('mode-multi', state.browseMode === 'multi');
   btnFolder.classList.toggle('mode-categorized', state.browseMode === 'categorized');
 }
@@ -660,13 +894,14 @@ function renderFolderButton() {
 function renderFolderPanelSections() {
   folderModeTabs.forEach(tab => {
     tab.classList.toggle('active', tab.dataset.browseMode === state.viewedBrowseMode);
+    tab.classList.toggle('current-mode', tab.dataset.browseMode === state.browseMode);
   });
-  folderSectionSingle.classList.toggle('visible', state.viewedBrowseMode === 'single');
   folderSectionMulti.classList.toggle('visible', state.viewedBrowseMode === 'multi');
   folderSectionCategorized.classList.toggle('visible', state.viewedBrowseMode === 'categorized');
 }
 
 function loadImagePool(images, label, mode, folder = null) {
+  clearSlideshowPreload();
   state.allImages = [...images].sort((a, b) => b.modified - a.modified);
   state.folder = folder;
   state.browseMode = mode;
@@ -685,23 +920,6 @@ function loadImagePool(images, label, mode, folder = null) {
     syncNavButtons();
   }
   persistSettings();
-}
-
-async function loadFolder(folder) {
-  if (!folder) return;
-  try {
-    const images = await window.viewerAPI.listFolderImages(folder);
-    loadImagePool(images, baseName(folder), 'single', folder);
-  } catch (err) {
-    clearDisplayFolder();
-    showToast('Failed to load folder');
-    console.error(err);
-  }
-}
-
-async function selectFolder() {
-  const folder = await window.viewerAPI.selectFolder();
-  if (folder) loadFolder(folder);
 }
 
 function renderMultiFolderList() {
@@ -876,6 +1094,158 @@ function setAllCategorizedCategories(checked) {
     ? new Set(state.categorizedCategories.map(category => category.name))
     : new Set();
   applyCategorizedFilter();
+}
+
+// ==============================
+// Right-click categorize menu (categorized mode only)
+// ==============================
+function categoryForPath(path) {
+  const entry = state.categorizedImages.find(image => image.path === path);
+  return entry ? entry.category : null;
+}
+
+function closeGridContextMenu() {
+  gridContextMenu.classList.remove('open');
+}
+
+function openGridContextMenu(x, y) {
+  gridContextMenu.classList.add('open');
+  const maxX = window.innerWidth - gridContextMenu.offsetWidth - 4;
+  const maxY = window.innerHeight - gridContextMenu.offsetHeight - 4;
+  gridContextMenu.style.left = `${Math.max(4, Math.min(x, maxX))}px`;
+  gridContextMenu.style.top = `${Math.max(4, Math.min(y, maxY))}px`;
+}
+
+function openImageContextMenu(path, x, y) {
+  gridContextMenu.textContent = '';
+
+  // Hide — available in every browse mode; view-only, no categorization change.
+  const hideBtn = document.createElement('button');
+  hideBtn.type = 'button';
+  const hideLabel = document.createElement('span');
+  hideLabel.textContent = 'Hide image';
+  hideBtn.append(hideLabel);
+  hideBtn.addEventListener('click', () => {
+    closeGridContextMenu();
+    hideImage(path);
+  });
+  gridContextMenu.append(hideBtn);
+
+  // Categorize — only meaningful when browsing a categorized root.
+  if (state.browseMode === 'categorized') {
+    const separator = document.createElement('div');
+    separator.className = 'context-menu-separator';
+    gridContextMenu.append(separator);
+
+    const title = document.createElement('div');
+    title.className = 'context-menu-title';
+    title.textContent = 'Move to category';
+    gridContextMenu.append(title);
+
+    if (!state.categorizedCategories.length) {
+      const empty = document.createElement('div');
+      empty.className = 'context-menu-empty';
+      empty.textContent = 'No categories available';
+      gridContextMenu.append(empty);
+    } else {
+      const current = categoryForPath(path);
+      for (const category of state.categorizedCategories) {
+        const isCurrent = category.name === current;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.classList.toggle('current', isCurrent);
+        const name = document.createElement('span');
+        name.textContent = category.name;
+        const mark = document.createElement('span');
+        mark.textContent = isCurrent ? '✓' : '';
+        btn.append(name, mark);
+        btn.addEventListener('click', () => {
+          closeGridContextMenu();
+          if (!isCurrent) categorizeImage(path, category.name);
+        });
+        gridContextMenu.append(btn);
+      }
+    }
+  }
+
+  openGridContextMenu(x, y);
+}
+
+// Reflect a category change locally so counts and the filter panel update
+// without re-hashing the whole root; the sidecar on disk is the source of
+// truth on the next rescan.
+function applyLocalCategoryChange(path, category) {
+  const entry = state.categorizedImages.find(image => image.path === path);
+  const previous = entry ? entry.category : null;
+  if (previous === category) return;
+  if (entry) entry.category = category;
+
+  if (previous) {
+    const prevCategory = state.categorizedCategories.find(item => item.name === previous);
+    if (prevCategory) prevCategory.count = Math.max(0, prevCategory.count - 1);
+  }
+  let nextCategory = state.categorizedCategories.find(item => item.name === category);
+  if (!nextCategory) {
+    nextCategory = { name: category, count: 0 };
+    state.categorizedCategories.push(nextCategory);
+  }
+  nextCategory.count += 1;
+
+  renderCategoriesPanel();
+}
+
+// Keep the current history entry in sync after an in-place slot edit (hide /
+// instant filter) so navigating away and back doesn't resurrect the old image.
+function syncHistoryHead() {
+  if (hist.pos >= 0 && hist.stack[hist.pos]) {
+    hist.stack[hist.pos].slots = [...state.displayedSlots];
+  }
+}
+
+// Pick a fresh image from the current pool that isn't already on screen.
+function pickReplacementImage(shownPaths) {
+  const candidates = state.allImages.filter(image => !shownPaths.has(image.path));
+  if (!candidates.length) return null;
+  return candidates[Math.floor(Math.random() * candidates.length)].path;
+}
+
+// Drop `path` from the session pool and swap its on-screen slot for a new
+// image (or an empty slot if the pool is exhausted). Shared by hide + instant
+// filter; never touches categorization on disk.
+function removeDisplayedImage(path) {
+  const index = state.displayedSlots.indexOf(path);
+  state.allImages = state.allImages.filter(image => image.path !== path);
+  clearSlideshowPreload();
+  if (index === -1) return;
+  const shown = new Set(state.displayedSlots.filter(Boolean));
+  state.displayedSlots[index] = pickReplacementImage(shown);
+  renderGrid(state.displayedSlots);
+  syncHistoryHead();
+  if (state.slideshow) rescheduleSlideshowTick();
+}
+
+function hideImage(path) {
+  removeDisplayedImage(path);
+}
+
+async function categorizeImage(path, category) {
+  if (!state.categorizedRoot) return;
+  try {
+    await window.viewerAPI.setImageCategory(state.categorizedRoot, path, category);
+    applyLocalCategoryChange(path, category);
+
+    const filteredOut = state.browseMode === 'categorized'
+      && !state.categorizedCategoryFilter.has(category);
+    if (appSettings.instantFilterCategorized && filteredOut) {
+      removeDisplayedImage(path);
+      showToast(`Moved to ${category} — hidden`);
+    } else {
+      showToast(`Moved to ${category}`);
+    }
+  } catch (error) {
+    console.error('Failed to categorize image:', error);
+    showToast('Failed to categorize image');
+  }
 }
 
 // ==============================
@@ -1113,6 +1483,45 @@ function zoomBiasPosition() {
   }
 }
 
+function zoomPositionForImage(img, basePosition, coverMode) {
+  return coverMode ? basePosition : { x: 50, y: 50 };
+}
+
+function portraitFillTransformForImage(img, cell, coverMode, basePosition) {
+  if (!coverMode || !img || !img.naturalWidth || !img.naturalHeight) return null;
+  const rect = cell.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+
+  const imageAspect = img.naturalHeight / img.naturalWidth;
+  const cellAspect = rect.height / rect.width;
+  if (imageAspect <= Math.max(PORTRAIT_AUTO_BIAS_MIN_ASPECT, cellAspect * 1.05)) {
+    return null;
+  }
+
+  const containScale = Math.min(rect.width / img.naturalWidth, rect.height / img.naturalHeight);
+  const coverScale = Math.max(rect.width / img.naturalWidth, rect.height / img.naturalHeight);
+  if (containScale <= 0) return null;
+
+  const fillScale = coverScale / containScale;
+  const extraScale = Math.min(zoomFillScale(appSettings.zoomFillAmount), PORTRAIT_FILL_MAX_EXTRA_SCALE);
+  const scale = fillScale * extraScale;
+  const renderedW = img.naturalWidth * containScale * scale;
+  const renderedH = img.naturalHeight * containScale * scale;
+  const maxTx = Math.max(0, (renderedW - rect.width) / 2);
+  const maxTy = Math.max(0, (renderedH - rect.height) / 2);
+  const biasStepPercent = 5 * ZOOM_BIAS_STEP_SCALE;
+  const userXSteps = (basePosition.x - 50) / biasStepPercent;
+  const userYSteps = (basePosition.y - 50) / biasStepPercent;
+  const userXOffset = userXSteps * rect.width * PORTRAIT_BIAS_STEP_CELL_RATIO;
+  const userYOffset = userYSteps * rect.height * PORTRAIT_BIAS_STEP_CELL_RATIO;
+
+  return {
+    scale,
+    tx: clamp(-userXOffset, -maxTx, maxTx),
+    ty: clamp(maxTy * PORTRAIT_FACE_SAFE_PAN - userYOffset, -maxTy, maxTy),
+  };
+}
+
 // Below fill, the image is uncropped (object-fit: contain), so there's nothing
 // to pan into — instead bias slides a black curtain in from the biased edge.
 // Mirrors the cover-mode pan direction: 'L' favors the left, hiding the right.
@@ -1161,12 +1570,17 @@ function applyCurtainToCell(cell, side, coveragePercent) {
 }
 
 // Per-image manual pan/zoom (drag + wheel) — layered independently on top of
-// the global zoom-fill system. Active state forces object-fit:cover and a
+// the global zoom-fill system. Active state uses object-fit:contain plus a
 // direct translate+scale transform so dragging maps 1:1 to screen pixels
 // regardless of the current zoom level (translate is applied in the already-
 // scaled coordinate system since it's the leftmost transform function).
+// We deliberately avoid object-fit:cover here: cover clips the off-axis edges
+// before the transform runs, so those pixels are never painted and panning
+// only slides the fixed center-crop over the cell background. contain keeps the
+// whole image painted, and we scale up by coverScale/containScale to reproduce
+// the cover sizing while leaving every edge reachable by panning.
 function isManualZoomActive(manual) {
-  return !!manual && (manual.scale !== 1 || manual.tx !== 0 || manual.ty !== 0);
+  return !!manual && (manual.resetting || manual.scale !== 1 || manual.tx !== 0 || manual.ty !== 0);
 }
 
 function manualZoomOverflow(img, rect, totalScale) {
@@ -1184,31 +1598,61 @@ function applyManualOverride(cell) {
   if (!img) return false;
   const manual = imageManualZoom.get(img);
   const active = isManualZoomActive(manual);
+  const wasManual = cell.classList.contains('manual-zoom');
   cell.classList.toggle('manual-zoom', active);
   if (!active) {
-    img.style.objectFit = '';
-    img.style.transform = '';
+    if (wasManual) {
+      img.style.objectFit = '';
+      img.style.transform = '';
+    }
     return false;
   }
   const totalScale = zoomFillScale(appSettings.zoomFillAmount) * manual.scale;
-  img.style.objectFit = 'cover';
+  const rect = cell.getBoundingClientRect();
+  const containScale = Math.min(rect.width / img.naturalWidth, rect.height / img.naturalHeight);
+  const coverScale = Math.max(rect.width / img.naturalWidth, rect.height / img.naturalHeight);
+  const resetToContainFit = manual.resetting && !isZoomFillCover(appSettings.zoomFillAmount);
+  // contain paints the whole image at containScale; scaling by coverScale/
+  // containScale brings it to the cover size manualZoomOverflow assumes, so the
+  // pan clamp matches what's actually on screen and no edge is unreachable.
+  const renderScale = resetToContainFit
+    ? totalScale
+    : containScale > 0
+    ? (coverScale / containScale) * totalScale
+    : totalScale;
+  img.style.objectFit = 'contain';
   img.style.objectPosition = '50% 50%';
   img.style.transformOrigin = '50% 50%';
-  img.style.transform = `translate(${manual.tx}px, ${manual.ty}px) scale(${totalScale})`;
+  img.style.transform = `translate(${manual.tx}px, ${manual.ty}px) scale(${renderScale})`;
   return true;
 }
 
 function recenterManualZoom(cell) {
   const img = cell && cell.querySelector('img');
   if (!img || !imageManualZoom.has(img)) return;
-  imageManualZoom.delete(img);
+  clearImageManualZoom(img, true);
   applyZoomFillToImages();
+}
+
+function cellHasManualZoom(cell) {
+  const img = cell && cell.querySelector('img');
+  return !!img && imageManualZoom.has(img);
+}
+
+function recenterAllManualZoom() {
+  let changed = false;
+  imageGrid.querySelectorAll('.grid-cell img').forEach(img => {
+    if (imageManualZoom.has(img)) {
+      clearImageManualZoom(img, true);
+      changed = true;
+    }
+  });
+  if (changed) applyZoomFillToImages();
 }
 
 function applyZoomFillToImages() {
   const coverMode = isZoomFillCover(appSettings.zoomFillAmount);
   const position = coverMode ? zoomBiasPosition() : { x: 50, y: 50 };
-  const positionValue = `${position.x}% ${position.y}%`;
   imageGrid.style.setProperty('--zoom-fill-x', `${position.x}%`);
   imageGrid.style.setProperty('--zoom-fill-y', `${position.y}%`);
 
@@ -1218,10 +1662,22 @@ function applyZoomFillToImages() {
   imageGrid.querySelectorAll('.grid-cell').forEach(cell => {
     const img = cell.querySelector('img');
     if (img) {
-      img.style.objectPosition = positionValue;
-      img.style.transformOrigin = positionValue;
+      const imgPosition = zoomPositionForImage(img, position, coverMode);
+      const imgPositionValue = `${imgPosition.x}% ${imgPosition.y}%`;
+      const portraitFill = portraitFillTransformForImage(img, cell, coverMode, position);
+      if (portraitFill !== null) {
+        img.style.objectFit = 'contain';
+        img.style.objectPosition = '50% 50%';
+        img.style.transformOrigin = '50% 50%';
+        img.style.transform = `translate(${portraitFill.tx}px, ${portraitFill.ty}px) scale(${portraitFill.scale})`;
+      } else {
+        img.style.objectFit = '';
+        img.style.transform = '';
+        img.style.objectPosition = imgPositionValue;
+        img.style.transformOrigin = imgPositionValue;
+      }
     }
-    const manualActive = applyManualOverride(cell);
+    const manualActive = manualZoomActiveCount > 0 && applyManualOverride(cell);
     applyCurtainToCell(cell, img && !manualActive ? curtainSide : null, curtainCoverage);
   });
 }
@@ -1371,7 +1827,7 @@ async function persistSettings() {
       categorizedRoot:   state.categorizedRoot,
       categorizedCategoryFilter: [...state.categorizedCategoryFilter],
       startupBrowseMode: appSettings.startupBrowseMode,
-      startupFolder:     appSettings.startupFolder,
+      startupFolder:     null,
       startupMultiFolders: appSettings.startupMultiFolders,
       startupMultiFolderFilter: appSettings.startupMultiFolderFilter,
       startupCategorizedRoot: appSettings.startupCategorizedRoot,
@@ -1389,36 +1845,39 @@ async function persistSettings() {
       squareAppCorners:  appSettings.squareAppCorners,
       firstAutoOpenSlideshow: appSettings.firstAutoOpenSlideshow,
       secondaryAutoOpenSlideshow: appSettings.secondaryAutoOpenSlideshow,
+      autoSlideshowSource: appSettings.autoSlideshowSource,
       autoHideUiOnStartup: appSettings.autoHideUiOnStartup,
-      firstDisplayFolderEnabled: appSettings.firstDisplayFolderEnabled,
-      firstDisplayFolder: appSettings.firstDisplayFolder,
-      secondaryDisplayFolderEnabled: appSettings.secondaryDisplayFolderEnabled,
-      secondaryDisplayFolder: appSettings.secondaryDisplayFolder,
+      instantFilterCategorized: appSettings.instantFilterCategorized,
+      firstDisplayFolderEnabled: false,
+      firstDisplayFolder: null,
+      secondaryDisplayFolderEnabled: false,
+      secondaryDisplayFolder: null,
     });
   } catch { /* ignore */ }
 }
 
-async function browseStartupFolder(kind) {
+async function addStartupSlideshowFolder() {
   const folder = await window.viewerAPI.selectFolder();
   if (!folder) return;
 
-  if (kind === 'first') {
-    appSettings.firstDisplayFolder = folder;
-  } else {
-    appSettings.secondaryDisplayFolder = folder;
+  const key = fileKey(folder);
+  if (!appSettings.startupMultiFolders.some(item => fileKey(item) === key)) {
+    appSettings.startupMultiFolders.push(folder);
   }
+  appSettings.startupMultiFolderFilter = [key];
+  appSettings.startupBrowseMode = 'multi';
+  appSettings.autoSlideshowSource = 'folders';
 
-  syncStartupFolderSettings();
+  syncStartupSourceSettings();
   await persistSettings();
-  showToast(kind === 'first' ? 'Set 1st window folder' : 'Set 2nd window folder');
+  showToast('Set slideshow startup folder');
 }
 
 async function useCurrentSourceAtStartup() {
   appSettings.startupBrowseMode = state.browseMode;
+  appSettings.autoSlideshowSource = state.browseMode === 'categorized' ? 'categorized' : 'folders';
 
-  if (state.browseMode === 'single') {
-    appSettings.startupFolder = state.folder;
-  } else if (state.browseMode === 'multi') {
+  if (state.browseMode === 'multi') {
     appSettings.startupMultiFolders = [...state.multiFolders];
     appSettings.startupMultiFolderFilter = [...state.multiFolderFilter];
   } else if (state.browseMode === 'categorized') {
@@ -1484,8 +1943,7 @@ btnFolder.addEventListener('click', e => {
   e.stopPropagation();
   setFolderPanelOpen(!folderPanel.classList.contains('open'));
 });
-btnOpenEmpty.addEventListener('click', selectFolder);
-folderSingleChoose.addEventListener('click', selectFolder);
+btnOpenEmpty.addEventListener('click', addMultiFolder);
 folderMultiAdd.addEventListener('click', addMultiFolder);
 categorizedRootChoose.addEventListener('click', chooseCategorizedRoot);
 categoriesSelectAll.addEventListener('click', () => setAllCategorizedCategories(true));
@@ -1600,11 +2058,13 @@ settingSquareAppCorners.addEventListener('change', async () => {
 
 settingFirstAutoOpenSlideshow.addEventListener('change', async () => {
   appSettings.firstAutoOpenSlideshow = settingFirstAutoOpenSlideshow.checked;
+  syncAutoSlideshowSourceSettings();
   await persistSettings();
 });
 
 settingSecondaryAutoOpenSlideshow.addEventListener('change', async () => {
   appSettings.secondaryAutoOpenSlideshow = settingSecondaryAutoOpenSlideshow.checked;
+  syncAutoSlideshowSourceSettings();
   await persistSettings();
 });
 
@@ -1613,30 +2073,27 @@ settingAutoHideUi.addEventListener('change', async () => {
   await persistSettings();
 });
 
-settingFirstFolderEnabled.addEventListener('change', async () => {
-  appSettings.firstDisplayFolderEnabled = settingFirstFolderEnabled.checked;
-  syncStartupFolderSettings();
+settingInstantFilter.addEventListener('change', async () => {
+  appSettings.instantFilterCategorized = settingInstantFilter.checked;
   await persistSettings();
 });
 
-settingBrowseFirstFolder.addEventListener('click', e => {
-  e.stopPropagation();
-  browseStartupFolder('first');
-});
-
-settingSecondaryFolderEnabled.addEventListener('change', async () => {
-  appSettings.secondaryDisplayFolderEnabled = settingSecondaryFolderEnabled.checked;
-  syncStartupFolderSettings();
+settingAutoSlideshowSource.addEventListener('change', async () => {
+  appSettings.autoSlideshowSource = settingAutoSlideshowSource.value;
+  syncAutoSlideshowSourceSettings();
   await persistSettings();
 });
 
-settingBrowseSecondaryFolder.addEventListener('click', e => {
+settingAutoSlideshowFolderNeeded.addEventListener('click', e => {
   e.stopPropagation();
-  browseStartupFolder('secondary');
+  addStartupSlideshowFolder();
 });
 
 settingStartupBrowseMode.addEventListener('change', async () => {
   appSettings.startupBrowseMode = settingStartupBrowseMode.value;
+  appSettings.autoSlideshowSource = appSettings.startupBrowseMode === 'categorized'
+    ? 'categorized'
+    : 'folders';
   syncStartupSourceSettings();
   await persistSettings();
 });
@@ -1665,7 +2122,34 @@ folderPanel.addEventListener('click', e => e.stopPropagation());
 document.addEventListener('click', () => {
   setSettingsOpen(false);
   setFolderPanelOpen(false);
+  closeGridContextMenu();
 });
+
+// Suppress the native webview context menu everywhere (removes "More tools"
+// and "Inspect"). Right-clicking an image opens a custom menu: Hide in any
+// mode, plus move-to-category when browsing a categorized root.
+document.addEventListener('contextmenu', e => {
+  e.preventDefault();
+
+  // A right-click while the menu is open dismisses it instead of reopening.
+  if (gridContextMenu.classList.contains('open')) {
+    closeGridContextMenu();
+    return;
+  }
+
+  const cell = e.target.closest && e.target.closest('.grid-cell');
+  if (!cell || cell.classList.contains('empty-slot')) return;
+  const img = cell.querySelector('img');
+  const path = img && img.getAttribute('data-src');
+  if (!path) return;
+
+  openImageContextMenu(path, e.clientX, e.clientY);
+});
+
+// Keep the menu glued to where it was opened rather than letting it drift on
+// scroll/resize; simplest is to just dismiss it.
+window.addEventListener('resize', closeGridContextMenu);
+imageGrid.addEventListener('scroll', closeGridContextMenu, true);
 
 // ==============================
 // Keyboard shortcuts
@@ -1688,18 +2172,27 @@ document.addEventListener('keydown', e => {
     return;
   }
 
-  // C — recenter the manual pan/zoom of the hovered image
+  // C — recenter the hovered image, or the most recently panned/zoomed image
   if ((e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey) {
-    if (hoveredCell) {
+    const targetCell = cellHasManualZoom(hoveredCell) ? hoveredCell : lastManualZoomCell;
+    if (targetCell) {
       e.preventDefault();
-      recenterManualZoom(hoveredCell);
+      recenterManualZoom(targetCell);
     }
+    return;
+  }
+
+  // H — recenter the manual pan/zoom of every displayed image
+  if ((e.key === 'h' || e.key === 'H') && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    recenterAllManualZoom();
     return;
   }
 
   // Escape — unwind modals one level at a time
   if (e.key === 'Escape') {
     e.preventDefault();
+    if (gridContextMenu.classList.contains('open')) { closeGridContextMenu(); return; }
     if (state.settingsOpen) { setSettingsOpen(false); return; }
     if (state.uiHidden)     { setUiHidden(false);     return; }
     return;
@@ -1743,9 +2236,12 @@ document.addEventListener('keydown', e => {
     state.imageCount       = Math.max(4, Math.min(99, s.imageCount || 9));
     state.emptyCount       = Math.max(0, Math.min(state.imageCount - 1, s.emptyCount || 0));
     state.displayMode      = s.displayMode || 'random';
-    state.browseMode       = ['single', 'multi', 'categorized'].includes(s.browseMode) ? s.browseMode : 'single';
+    state.browseMode       = normalizeBrowseMode(s.browseMode);
     state.viewedBrowseMode = state.browseMode;
-    state.multiFolders     = Array.isArray(s.multiFolders) ? s.multiFolders : [];
+    state.multiFolders     = uniqueFolders([
+      ...(Array.isArray(s.multiFolders) ? s.multiFolders : []),
+      s.folder,
+    ]);
     if (Array.isArray(s.multiFolderFilter)) {
       state.multiFolderFilter = new Set(s.multiFolderFilter);
     } else {
@@ -1768,17 +2264,29 @@ document.addEventListener('keydown', e => {
       : 0;
     appSettings.firstAutoOpenSlideshow = !!(s.firstAutoOpenSlideshow || s.autoOpenSlideshow);
     appSettings.secondaryAutoOpenSlideshow = !!s.secondaryAutoOpenSlideshow;
+    const loadedStartupBrowseMode = normalizeBrowseMode(s.startupBrowseMode);
+    const loadedAutoSource = ['folders', 'categorized'].includes(s.autoSlideshowSource)
+      ? s.autoSlideshowSource
+      : loadedStartupBrowseMode === 'categorized'
+        ? 'categorized'
+        : 'folders';
+    appSettings.autoSlideshowSource = loadedStartupBrowseMode === 'categorized'
+      ? 'categorized'
+      : loadedAutoSource;
     appSettings.autoHideUiOnStartup = !!s.autoHideUiOnStartup;
-    appSettings.firstDisplayFolderEnabled = !!s.firstDisplayFolderEnabled;
-    appSettings.firstDisplayFolder = s.firstDisplayFolder || null;
-    appSettings.secondaryDisplayFolderEnabled = !!s.secondaryDisplayFolderEnabled;
-    appSettings.secondaryDisplayFolder = s.secondaryDisplayFolder || null;
-    appSettings.startupBrowseMode = ['single', 'multi', 'categorized'].includes(s.startupBrowseMode)
-      ? s.startupBrowseMode
-      : 'single';
-    appSettings.startupFolder = s.startupFolder || null;
-    appSettings.startupMultiFolders = Array.isArray(s.startupMultiFolders) ? s.startupMultiFolders : [];
-    appSettings.startupMultiFolderFilter = Array.isArray(s.startupMultiFolderFilter) ? s.startupMultiFolderFilter : [];
+    appSettings.instantFilterCategorized = s.instantFilterCategorized !== false;
+    appSettings.startupBrowseMode = loadedStartupBrowseMode;
+    appSettings.startupMultiFolders = uniqueFolders([
+      ...(Array.isArray(s.startupMultiFolders) ? s.startupMultiFolders : []),
+      s.startupFolder,
+      s.firstDisplayFolderEnabled ? s.firstDisplayFolder : null,
+      s.secondaryDisplayFolderEnabled ? s.secondaryDisplayFolder : null,
+      s.folder,
+    ]);
+    const savedStartupFilter = Array.isArray(s.startupMultiFolderFilter) ? s.startupMultiFolderFilter : [];
+    appSettings.startupMultiFolderFilter = savedStartupFilter.length
+      ? savedStartupFilter
+      : appSettings.startupMultiFolders.map(fileKey);
     appSettings.startupCategorizedRoot = s.startupCategorizedRoot || null;
     appSettings.startupCategorizedCategoryFilter = Array.isArray(s.startupCategorizedCategoryFilter)
       ? s.startupCategorizedCategoryFilter
@@ -1793,14 +2301,15 @@ document.addEventListener('keydown', e => {
     settingSquareAppCorners.checked = appSettings.squareAppCorners;
     settingFirstAutoOpenSlideshow.checked = appSettings.firstAutoOpenSlideshow;
     settingSecondaryAutoOpenSlideshow.checked = appSettings.secondaryAutoOpenSlideshow;
+    settingAutoSlideshowSource.value = appSettings.autoSlideshowSource;
     settingAutoHideUi.checked = appSettings.autoHideUiOnStartup;
+    settingInstantFilter.checked = appSettings.instantFilterCategorized;
     renderMultiFolderList();
     renderCategorizedRootRow();
     renderCategoriesPanel();
     renderFolderPanelSections();
     renderFolderButton();
     syncStartupSourceSettings();
-    syncStartupFolderSettings();
     syncSlideshowButton();
     syncModeButtons();
     syncZoomFillControls();
@@ -1810,19 +2319,16 @@ document.addEventListener('keydown', e => {
     }
     await window.viewerAPI.setWindowSquareCorners(appSettings.squareAppCorners).catch(() => {});
 
-    if ((windowLabel === 'main' || isSecondWindow()) && hasConfiguredStartupSource()) {
+    if (shouldAutoStartSlideshow() && (windowLabel === 'main' || isSecondWindow())) {
+      await loadAutoSlideshowSource();
+    } else if ((windowLabel === 'main' || isSecondWindow()) && hasConfiguredStartupSource()) {
       await loadConfiguredStartupSource();
     } else {
-      const startupFolder = startupFolderForWindow();
-      if (startupFolder) {
-        await loadFolder(startupFolder);  // calls refresh() which calls pushHistory()
-      } else if (windowLabel === 'main' || isSecondWindow()) {
+      if (windowLabel === 'main' || isSecondWindow()) {
         if (state.browseMode === 'multi' && state.multiFolders.length) {
           await enterMultiMode();
         } else if (state.browseMode === 'categorized' && state.categorizedRoot) {
           await enterCategorizedMode();
-        } else if (s.folder) {
-          await loadFolder(s.folder);
         } else {
           clearDisplayFolder();
         }
@@ -1837,11 +2343,12 @@ document.addEventListener('keydown', e => {
     renderFolderPanelSections();
     renderFolderButton();
     syncStartupSourceSettings();
-    syncStartupFolderSettings();
     syncSlideshowButton();
     syncModeButtons();
     syncZoomFillControls();
     syncNavButtons();
+  } finally {
+    document.body.classList.remove('app-starting');
   }
 
   startupDone = true;

@@ -31,6 +31,8 @@ body.load-error::before {
   width: 100%;
   height: 100%;
   object-fit: contain;
+  transform-origin: 0 0;
+  will-change: transform;
 }
 
 body.load-error #image {
@@ -43,17 +45,19 @@ body.load-error #image {
   position: absolute;
   top: 0;
   right: 0;
-  width: 64px;
+  width: 110px;
   height: 64px;
   display: flex;
   align-items: flex-start;
   justify-content: flex-end;
+  gap: 6px;
   padding: 6px;
   opacity: 0;
   transition: opacity 0.12s ease;
 }
 
-#close-zone:hover {
+#close-zone:hover,
+#close-zone.keep-visible {
   opacity: 1;
 }
 
@@ -71,6 +75,18 @@ body.load-error #image {
 #close-zone button:hover {
   background: #c42b1c;
   border-color: #c42b1c;
+  color: #fff;
+}
+
+#btn-drag {
+  cursor: move;
+  letter-spacing: -2px;
+  line-height: 1;
+}
+
+#btn-drag:hover {
+  background: rgba(40, 40, 40, 0.95);
+  border-color: rgba(255, 255, 255, 0.45);
   color: #fff;
 }
 

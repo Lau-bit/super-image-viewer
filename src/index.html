@@ -11,7 +11,7 @@
   <title>Super Image Viewer</title>
   <link rel="stylesheet" href="styles.css">
 </head>
-<body class="no-folder">
+<body class="no-folder app-starting">
 
   <!-- Custom slim title bar -->
   <div id="titlebar">
@@ -37,18 +37,37 @@
       </button>
       <div id="folder-panel">
         <div id="folder-mode-tabs">
-          <button type="button" class="folder-mode-tab active" data-browse-mode="single">Single</button>
-          <button type="button" class="folder-mode-tab" data-browse-mode="multi">Multi-Folder</button>
+          <button type="button" class="folder-mode-tab active" data-browse-mode="multi">Folders</button>
           <button type="button" class="folder-mode-tab" data-browse-mode="categorized">Categorized</button>
+        </div>
+        <div class="folder-panel-group">
+          <div class="folder-panel-title">Startup</div>
+          <label class="folder-panel-option">
+            <span>Mode</span>
+            <select id="setting-startup-browse-mode" class="settings-select">
+              <option value="multi">Folders</option>
+              <option value="categorized">Categorized</option>
+            </select>
+          </label>
+          <button type="button" class="folder-panel-btn" id="setting-use-current-source">Use current source at startup</button>
+          <div id="setting-startup-source-name" class="settings-source-summary">None</div>
+        </div>
+        <div class="folder-panel-group">
+          <div class="folder-panel-title">Startup Slideshow</div>
+          <label class="folder-panel-option">
+            <span>Source</span>
+            <select id="setting-auto-slideshow-source" class="settings-select">
+              <option value="folders">Folders</option>
+              <option value="categorized">Categorized</option>
+            </select>
+          </label>
+          <button type="button" class="folder-panel-btn" id="setting-auto-slideshow-folder-needed" hidden>Set slideshow startup folder</button>
         </div>
         <div id="folder-loading" hidden>
           <span class="folder-loading-spinner" aria-hidden="true"></span>
           <span id="folder-loading-text">Loading...</span>
         </div>
-        <div id="folder-section-single" class="folder-section visible">
-          <button type="button" class="folder-panel-btn" id="folder-single-choose">Choose Folder</button>
-        </div>
-        <div id="folder-section-multi" class="folder-section">
+        <div id="folder-section-multi" class="folder-section visible">
           <button type="button" class="folder-panel-btn" id="folder-multi-add">Add Folder</button>
           <div id="multi-folder-list"></div>
         </div>
@@ -123,14 +142,20 @@
     </div>
   </div>
 
+  <!-- Startup/loading overlay -->
+  <div id="startup-loading-overlay" aria-live="polite">
+    <span id="startup-loading-spinner" aria-hidden="true"></span>
+    <span>Loading...</span>
+  </div>
+
   <!-- Image grid (populated by JS) -->
   <div id="image-grid"></div>
 
   <!-- Empty state shown until a folder is selected -->
   <div id="empty-state">
     <div id="empty-icon">&#x1F5BC;</div>
-    <p>Select a folder to display images</p>
-    <button id="btn-open-empty">Select Folder</button>
+    <p>Add a folder to display images</p>
+    <button id="btn-open-empty">Add Folder</button>
   </div>
 
   <!-- Settings panel -->
@@ -149,38 +174,16 @@
 
     <div class="settings-section-title">Images (4&#x2013;99)</div>
     <label class="settings-option">
-      <input type="checkbox" id="setting-first-folder-enabled">
-      <span>Default 1st window folder</span>
-    </label>
-    <div class="settings-folder-row">
-      <button type="button" class="settings-btn" id="setting-browse-first-folder">Browse 1st folder</button>
-      <span id="setting-first-folder-name" class="settings-folder-name">None</span>
-    </div>
-    <label class="settings-option">
-      <input type="checkbox" id="setting-secondary-folder-enabled">
-      <span>Default 2nd window folder</span>
-    </label>
-    <div class="settings-folder-row">
-      <button type="button" class="settings-btn" id="setting-browse-secondary-folder">Browse 2nd folder</button>
-      <span id="setting-secondary-folder-name" class="settings-folder-name">None</span>
-    </div>
-    <label class="settings-option">
       <span class="settings-label">Count</span>
       <input type="range" id="setting-count-slider" min="4" max="99" step="1" value="9">
       <span id="setting-count-value" class="settings-value">9</span>
     </label>
 
-    <div class="settings-section-title">Startup Source</div>
-    <label class="settings-option">
-      <span class="settings-label">Mode</span>
-      <select id="setting-startup-browse-mode" class="settings-select">
-        <option value="single">Single</option>
-        <option value="multi">Multi-Folder</option>
-        <option value="categorized">Categorized</option>
-      </select>
+    <div class="settings-section-title">Categorized</div>
+    <label class="settings-option" title="When you categorize an image into a category that isn't currently shown, hide it immediately and pull in a replacement">
+      <input type="checkbox" id="setting-instant-filter">
+      <span>Instant filter on categorize</span>
     </label>
-    <button type="button" class="settings-btn" id="setting-use-current-source">Use current source at startup</button>
-    <div id="setting-startup-source-name" class="settings-source-summary">None</div>
 
     <div class="settings-section-title">Slideshow</div>
     <label class="settings-option">
@@ -200,6 +203,9 @@
       <input type="number" id="setting-slideshow-duration" min="1" max="3600" value="5">
     </label>
   </div>
+
+  <!-- Right-click categorize menu (categorized mode); populated by JS -->
+  <div id="grid-context-menu" class="context-menu"></div>
 
   <script src="api.js"></script>
   <script src="renderer.js"></script>

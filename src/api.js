@@ -20,9 +20,9 @@ window.viewerAPI = {
     return selected || null;
   },
 
-  listFolderImages: (folder) => invoke('list_folder_images', { folder }),
   listMultiFolderImages: (folders) => invoke('list_multi_folder_images', { folders }),
   scanCategorizedRoot: (root) => invoke('scan_categorized_root', { root }),
+  setImageCategory: (root, path, category) => invoke('set_image_category', { root, path, category }),
   loadSettings: () => invoke('load_settings'),
   saveSettings: (settings) => invoke('save_settings', { settings }),
   getWindowLabel: () => invoke('get_window_label'),

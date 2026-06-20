@@ -15,6 +15,7 @@
   --text:        #ccc;
   --text-muted:  #666;
   --accent:      #4a7acc;
+  --mode-current: #f0b429;
   --btn-hover:   #272727;
   --btn-active:  #333;
   --cell-bg:     #0a0a0a;
@@ -125,6 +126,63 @@ body {
   display: none;
 }
 
+/* ==============================
+   Startup loading
+   ============================== */
+#startup-loading-overlay {
+  position: fixed;
+  top: calc(var(--titlebar-h) + var(--toolbar-h));
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 180;
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+body.app-starting #startup-loading-overlay {
+  display: flex;
+}
+
+body.app-starting #empty-state {
+  opacity: 0;
+  pointer-events: none;
+}
+
+body.app-starting #toolbar,
+body.app-starting #settings-panel,
+body.app-starting #folder-panel {
+  pointer-events: none;
+}
+
+body.app-starting #toolbar {
+  opacity: 0.55;
+}
+
+body.ui-hidden #startup-loading-overlay {
+  top: 0;
+}
+
+#startup-loading-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid rgba(255, 255, 255, 0.16);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: startup-loading-spin 0.8s linear infinite;
+}
+
+@keyframes startup-loading-spin {
+  to { transform: rotate(360deg); }
+}
+
 /* Base toolbar button */
 #toolbar button {
   background: transparent;
@@ -167,7 +225,6 @@ body {
   white-space: nowrap;
 }
 
-#btn-folder.mode-single,
 #btn-folder.mode-multi,
 #btn-folder.mode-categorized {
   color: #fff;
@@ -222,6 +279,44 @@ body.ui-hidden #folder-panel {
   background: var(--accent) !important;
   border-color: var(--accent) !important;
   color: #fff !important;
+}
+
+.folder-mode-tab.current-mode {
+  background: var(--mode-current) !important;
+  border-color: #ffd166 !important;
+  color: #111 !important;
+  box-shadow: 0 0 0 2px rgba(240, 180, 41, 0.22);
+}
+
+.folder-mode-tab.current-mode.active {
+  box-shadow: 0 0 0 2px rgba(240, 180, 41, 0.32);
+}
+
+.folder-panel-group {
+  border-bottom: 1px solid var(--border);
+  padding: 8px;
+}
+
+.folder-panel-title {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+}
+
+.folder-panel-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.folder-panel-option select {
+  flex: 0 0 120px;
 }
 
 #folder-loading {
@@ -563,6 +658,10 @@ body.ui-hidden #folder-panel {
   transition: opacity 0.12s ease;
 }
 
+body.slideshow-active .grid-cell img {
+  transition: opacity 0.08s linear;
+}
+
 .grid-cell.panning img {
   cursor: grabbing;
 }
@@ -814,6 +913,74 @@ body.ui-hidden #settings-panel {
   color: var(--text-muted);
   font-size: 11px;
   flex-shrink: 0;
+}
+
+/* ==============================
+   Right-click context menu (categorize)
+   ============================== */
+.context-menu {
+  position: fixed;
+  display: none;
+  flex-direction: column;
+  min-width: 170px;
+  max-height: min(360px, calc(100vh - 16px));
+  overflow-y: auto;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  z-index: 300;
+}
+
+.context-menu.open {
+  display: flex;
+}
+
+.context-menu-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding: 5px 10px 4px;
+}
+
+.context-menu button {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font-size: 12px;
+  padding: 7px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.context-menu button:hover {
+  background: var(--btn-hover);
+  color: #fff;
+}
+
+.context-menu button.current {
+  color: var(--accent);
+}
+
+.context-menu-empty {
+  padding: 7px 10px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.context-menu-separator {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 6px;
 }
 
 /* ==============================

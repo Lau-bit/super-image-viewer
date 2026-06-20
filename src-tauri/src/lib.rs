@@ -13,8 +13,8 @@ use std::{
     time::UNIX_EPOCH,
 };
 use tauri::{
-    utils::config::Color, AppHandle, LogicalPosition, LogicalSize, Manager, Position, Size,
-    WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    utils::config::Color, AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition,
+    PhysicalSize, Position, Size, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 
 #[cfg(windows)]
@@ -105,8 +105,12 @@ struct Settings {
     first_auto_open_slideshow: bool,
     #[serde(default)]
     secondary_auto_open_slideshow: bool,
+    #[serde(default = "default_auto_slideshow_source")]
+    auto_slideshow_source: String,
     #[serde(default)]
     auto_hide_ui_on_startup: bool,
+    #[serde(default = "default_instant_filter_categorized")]
+    instant_filter_categorized: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window: Option<WindowState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +139,14 @@ fn default_zoom_fill_level() -> u32 {
     2
 }
 
+fn default_instant_filter_categorized() -> bool {
+    true
+}
+
+fn default_auto_slideshow_source() -> String {
+    String::new()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -143,12 +155,12 @@ impl Default for Settings {
             first_display_folder: None,
             secondary_display_folder_enabled: false,
             secondary_display_folder: None,
-            browse_mode: "single".to_string(),
+            browse_mode: "multi".to_string(),
             multi_folders: Vec::new(),
             multi_folder_filter: None,
             categorized_root: None,
             categorized_category_filter: None,
-            startup_browse_mode: "single".to_string(),
+            startup_browse_mode: "multi".to_string(),
             startup_folder: None,
             startup_multi_folders: Vec::new(),
             startup_multi_folder_filter: None,
@@ -167,7 +179,9 @@ impl Default for Settings {
             auto_open_slideshow: false,
             first_auto_open_slideshow: false,
             secondary_auto_open_slideshow: false,
+            auto_slideshow_source: String::new(),
             auto_hide_ui_on_startup: false,
+            instant_filter_categorized: true,
             window: None,
             first_window: None,
             secondary_window: None,
@@ -349,6 +363,107 @@ fn scan_categorized_root_blocking(root: String) -> Result<CategorizedRootView, S
     })
 }
 
+fn now_iso() -> String {
+    let duration = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    let millis = duration.subsec_millis();
+    let days = secs / 86400;
+    let (y, m, d) = civil_from_days(days as i64);
+    let rem = secs % 86400;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+// Howard Hinnant's days-from-civil algorithm (inverse), public-domain.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn set_image_category_blocking(root: String, path: String, category: String) -> Result<(), String> {
+    let sidecar_path = PathBuf::from(&root).join(CATEGORIZER_SIDECAR_FILE_NAME);
+    let raw = fs::read_to_string(&sidecar_path)
+        .map_err(|_| "Not a categorized folder (no .image-categorizer.json found).".to_string())?;
+    // Parse as a generic value so any fields the external categorizer tool
+    // wrote (beyond `category`) survive the write-back untouched.
+    let mut sidecar: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("Failed to parse .image-categorizer.json: {error}"))?;
+
+    let file_path = PathBuf::from(&path);
+    let metadata = fs::metadata(&file_path)
+        .map_err(|error| format!("Failed to read {}: {error}", file_path.display()))?;
+    let hash = categorizer_hash_file(&file_path, metadata.len())?;
+
+    let root_obj = sidecar
+        .as_object_mut()
+        .ok_or_else(|| "Invalid .image-categorizer.json structure.".to_string())?;
+
+    let categories = root_obj
+        .entry("categories")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(list) = categories.as_array_mut() {
+        if !list
+            .iter()
+            .any(|value| value.as_str() == Some(category.as_str()))
+        {
+            list.push(serde_json::Value::String(category.clone()));
+        }
+    }
+
+    let images = root_obj
+        .entry("images")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let images_obj = images
+        .as_object_mut()
+        .ok_or_else(|| "Invalid .image-categorizer.json images map.".to_string())?;
+    let record = images_obj
+        .entry(hash)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    // Mirror the categorizer's own manual assignment: classifiedBy "manual"
+    // marks it as a user override so the categorizer's next scan keeps the
+    // choice instead of re-running auto-classification over it.
+    let classified_at = now_iso();
+    match record.as_object_mut() {
+        Some(record_obj) => {
+            record_obj.insert("category".to_string(), serde_json::Value::String(category));
+            record_obj.insert(
+                "classifiedBy".to_string(),
+                serde_json::Value::String("manual".to_string()),
+            );
+            record_obj.insert(
+                "classifiedAt".to_string(),
+                serde_json::Value::String(classified_at),
+            );
+        }
+        None => {
+            *record = serde_json::json!({
+                "category": category,
+                "classifiedBy": "manual",
+                "classifiedAt": classified_at,
+            });
+        }
+    }
+
+    let data = serde_json::to_string_pretty(&sidecar)
+        .map_err(|error| format!("Failed to serialize .image-categorizer.json: {error}"))?;
+    fs::write(&sidecar_path, data)
+        .map_err(|error| format!("Failed to write .image-categorizer.json: {error}"))
+}
+
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app
         .path()
@@ -522,33 +637,6 @@ fn create_viewer_window(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn list_folder_images(folder: String) -> Result<Vec<ImageInfo>, String> {
-    let dir = PathBuf::from(&folder);
-    let mut images = fs::read_dir(&dir)
-        .map_err(|error| format!("Failed to read folder: {error}"))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && is_image_path(path))
-        .filter_map(|path| {
-            let modified = fs::metadata(&path)
-                .ok()?
-                .modified()
-                .ok()?
-                .duration_since(UNIX_EPOCH)
-                .ok()?
-                .as_millis() as u64;
-            Some(ImageInfo {
-                path: path.to_string_lossy().to_string(),
-                modified,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    images.sort_by(|a, b| b.modified.cmp(&a.modified));
-    Ok(images)
-}
-
 fn list_multi_folder_images_blocking(folders: Vec<String>) -> Vec<ImageInfo> {
     let mut images = Vec::new();
     for folder in folders {
@@ -589,6 +677,13 @@ async fn scan_categorized_root(root: String) -> Result<CategorizedRootView, Stri
 }
 
 #[tauri::command]
+async fn set_image_category(root: String, path: String, category: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || set_image_category_blocking(root, path, category))
+        .await
+        .map_err(|error| format!("Failed to set image category: {error}"))?
+}
+
+#[tauri::command]
 fn load_settings(app: AppHandle) -> Settings {
     load_settings_inner(&app)
 }
@@ -602,16 +697,16 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.secondary_display_folder_enabled = settings.secondary_display_folder_enabled;
     current.secondary_display_folder = settings.secondary_display_folder;
     current.browse_mode = match settings.browse_mode.as_str() {
-        "single" | "multi" | "categorized" => settings.browse_mode,
-        _ => "single".to_string(),
+        "multi" | "categorized" => settings.browse_mode,
+        _ => "multi".to_string(),
     };
     current.multi_folders = settings.multi_folders;
     current.multi_folder_filter = settings.multi_folder_filter;
     current.categorized_root = settings.categorized_root;
     current.categorized_category_filter = settings.categorized_category_filter;
     current.startup_browse_mode = match settings.startup_browse_mode.as_str() {
-        "single" | "multi" | "categorized" => settings.startup_browse_mode,
-        _ => "single".to_string(),
+        "multi" | "categorized" => settings.startup_browse_mode,
+        _ => "multi".to_string(),
     };
     current.startup_folder = settings.startup_folder;
     current.startup_multi_folders = settings.startup_multi_folders;
@@ -640,7 +735,12 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.auto_open_slideshow = false;
     current.first_auto_open_slideshow = settings.first_auto_open_slideshow;
     current.secondary_auto_open_slideshow = settings.secondary_auto_open_slideshow;
+    current.auto_slideshow_source = match settings.auto_slideshow_source.as_str() {
+        "folders" | "categorized" => settings.auto_slideshow_source,
+        _ => "folders".to_string(),
+    };
     current.auto_hide_ui_on_startup = settings.auto_hide_ui_on_startup;
+    current.instant_filter_categorized = settings.instant_filter_categorized;
     save_settings_inner(&app, &current)
 }
 
@@ -751,27 +851,54 @@ async fn open_image_window(
     let owner_position = window
         .outer_position()
         .map_err(|error| format!("Failed to read window position: {error}"))?;
-    let owner_x = f64::from(owner_position.x) / scale;
-    let owner_y = f64::from(owner_position.y) / scale;
-    let click_center_x = owner_x + rect_x + rect_w / 2.0;
-    let click_center_y = owner_y + rect_y + rect_h / 2.0;
+    let click_center_x_phys = f64::from(owner_position.x) + (rect_x + rect_w / 2.0) * scale;
+    let click_center_y_phys = f64::from(owner_position.y) + (rect_y + rect_h / 2.0) * scale;
 
     let monitor = window
         .current_monitor()
         .map_err(|error| format!("Failed to read current monitor: {error}"))?
         .ok_or_else(|| "No monitor found for window.".to_string())?;
-    let monitor_scale = monitor.scale_factor();
-    let monitor_x = f64::from(monitor.position().x) / monitor_scale;
-    let monitor_y = f64::from(monitor.position().y) / monitor_scale;
-    let monitor_w = f64::from(monitor.size().width) / monitor_scale;
-    let monitor_h = f64::from(monitor.size().height) / monitor_scale;
+    let mut monitor_scale = monitor.scale_factor();
+    let mut mon_left = monitor.position().x;
+    let mut mon_top = monitor.position().y;
+    let mut mon_right = mon_left + monitor.size().width as i32;
+    let mut mon_bottom = mon_top + monitor.size().height as i32;
+
+    if let Ok(monitors) = window.available_monitors() {
+        for candidate in monitors {
+            let left = candidate.position().x;
+            let top = candidate.position().y;
+            let right = left + candidate.size().width as i32;
+            let bottom = top + candidate.size().height as i32;
+            if click_center_x_phys >= f64::from(left)
+                && click_center_x_phys < f64::from(right)
+                && click_center_y_phys >= f64::from(top)
+                && click_center_y_phys < f64::from(bottom)
+            {
+                monitor_scale = candidate.scale_factor();
+                mon_left = left;
+                mon_top = top;
+                mon_right = right;
+                mon_bottom = bottom;
+                break;
+            }
+        }
+    }
+
+    // Cap the viewer at 90% of the spawning app window (not the whole monitor),
+    // so floating viewers stay smaller than the app that opened them.
+    let owner_size = window
+        .inner_size()
+        .map_err(|error| format!("Failed to read window size: {error}"))?;
+    let owner_w = f64::from(owner_size.width) / scale;
+    let owner_h = f64::from(owner_size.height) / scale;
 
     const MAX_FRACTION: f64 = 0.9;
     const MIN_WIDTH: f64 = 200.0;
     const MIN_HEIGHT: f64 = 150.0;
 
-    let max_w = monitor_w * MAX_FRACTION;
-    let max_h = monitor_h * MAX_FRACTION;
+    let max_w = owner_w * MAX_FRACTION;
+    let max_h = owner_h * MAX_FRACTION;
     let fit_scale = (max_w / natural_w.max(1.0))
         .min(max_h / natural_h.max(1.0))
         .min(1.0);
@@ -779,12 +906,25 @@ async fn open_image_window(
     let width = (natural_w * fit_scale).max(MIN_WIDTH.min(max_w));
     let height = (natural_h * fit_scale).max(MIN_HEIGHT.min(max_h));
 
-    let target_x = (click_center_x - width / 2.0)
-        .max(monitor_x)
-        .min(monitor_x + monitor_w - width);
-    let target_y = (click_center_y - height / 2.0)
-        .max(monitor_y)
-        .min(monitor_y + monitor_h - height);
+    // Clamp the initial placement in physical pixels against the monitor under
+    // the clicked cell. Keep global monitor origins in physical coordinates the
+    // whole way through; converting an origin to logical pixels and back can
+    // drift on mixed-DPI multi-monitor layouts.
+    const EDGE_INSET_PHYS: i32 = 8;
+    const WINDOWS_FRAME_OVERHANG_PHYS: i32 = 2;
+    let clamp_left = mon_left + EDGE_INSET_PHYS;
+    let clamp_top = mon_top + EDGE_INSET_PHYS;
+    let clamp_right = mon_right - EDGE_INSET_PHYS - WINDOWS_FRAME_OVERHANG_PHYS;
+    let clamp_bottom = mon_bottom - EDGE_INSET_PHYS - WINDOWS_FRAME_OVERHANG_PHYS;
+    let available_w_phys = (clamp_right - clamp_left).max(1);
+    let available_h_phys = (clamp_bottom - clamp_top).max(1);
+
+    let width_phys = ((width * monitor_scale).round().max(1.0) as i32).min(available_w_phys);
+    let height_phys = ((height * monitor_scale).round().max(1.0) as i32).min(available_h_phys);
+    let target_x_phys = (click_center_x_phys - f64::from(width_phys) / 2.0).round() as i32;
+    let target_y_phys = (click_center_y_phys - f64::from(height_phys) / 2.0).round() as i32;
+    let target_x_phys = target_x_phys.min(clamp_right - width_phys).max(clamp_left);
+    let target_y_phys = target_y_phys.min(clamp_bottom - height_phys).max(clamp_top);
 
     let state = app.state::<AppState>();
     let window_id = state.image_window_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -810,22 +950,29 @@ async fn open_image_window(
     .title("Image")
     .decorations(false)
     .resizable(true)
+    .always_on_top(true)
     .shadow(true)
     .background_color(Color(17, 17, 17, 255))
     .build()
     .map_err(|error| format!("Failed to build image window: {error}"))?;
 
     let _ = set_square_window_corners(&image_window, settings.square_app_corners);
-    let _ = set_window_bounds(
-        &image_window,
-        &WindowState {
-            x: target_x.round() as i32,
-            y: target_y.round() as i32,
-            width: width.round() as u32,
-            height: height.round() as u32,
-        },
-    );
+    // Set size first, then position last: on Windows a resize can nudge the
+    // window across DPI boundaries, so the final `set_position` pins the
+    // clamped placement. Physical units avoid any logical round-trip drift.
+    let _ = image_window.set_size(Size::Physical(PhysicalSize {
+        width: width_phys as u32,
+        height: height_phys as u32,
+    }));
+    let _ = image_window.set_position(Position::Physical(PhysicalPosition {
+        x: target_x_phys,
+        y: target_y_phys,
+    }));
     let _ = image_window.show();
+    let _ = image_window.set_position(Position::Physical(PhysicalPosition {
+        x: target_x_phys,
+        y: target_y_phys,
+    }));
     let _ = image_window.set_focus();
 
     let app_for_cleanup = app.clone();
@@ -889,9 +1036,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            list_folder_images,
             list_multi_folder_images,
             scan_categorized_root,
+            set_image_category,
             load_settings,
             get_window_label,
             reset_window_position_preset,
