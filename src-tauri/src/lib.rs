@@ -13,8 +13,9 @@ use std::{
     time::UNIX_EPOCH,
 };
 use tauri::{
-    utils::config::Color, AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition,
-    PhysicalSize, Position, Size, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    image::Image, utils::config::Color, AppHandle, LogicalPosition, LogicalSize, Manager,
+    PhysicalPosition, PhysicalSize, Position, Size, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
 };
 
 #[cfg(windows)]
@@ -34,6 +35,11 @@ const RESTORED_WINDOW_PHYSICAL_X_OFFSET: f64 = -1.0;
 const CATEGORIZER_SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
 const CATEGORIZER_MAX_SCAN_DEPTH: usize = 4;
 const CATEGORIZER_HASH_SAMPLE_BYTES: usize = 65536;
+
+fn set_app_window_icon(window: &WebviewWindow) {
+    let icon = Image::new_owned(include_bytes!("../icons/icon.rgba").to_vec(), 1024, 1024);
+    let _ = window.set_icon(icon);
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -624,6 +630,7 @@ fn create_viewer_window(app: &AppHandle) -> Result<(), String> {
         .build()
         .map_err(|error| format!("Failed to build viewer window: {error}"))?;
 
+    set_app_window_icon(&window);
     let _ = set_square_window_corners(&window, settings.square_app_corners);
     if let Some(bounds) = settings.secondary_window.as_ref() {
         let bounds = stagger_window_state(bounds, stagger_index);
@@ -956,6 +963,7 @@ async fn open_image_window(
     .build()
     .map_err(|error| format!("Failed to build image window: {error}"))?;
 
+    set_app_window_icon(&image_window);
     let _ = set_square_window_corners(&image_window, settings.square_app_corners);
     // Set size first, then position last: on Windows a resize can nudge the
     // window across DPI boundaries, so the final `set_position` pins the
@@ -1027,6 +1035,7 @@ pub fn run() {
         .setup(|app| {
             let settings = load_settings_inner(app.handle());
             if let Some(window) = app.get_webview_window("main") {
+                set_app_window_icon(&window);
                 let _ = set_square_window_corners(&window, settings.square_app_corners);
                 if let Some(ref state) = settings.first_window {
                     let _ = set_window_bounds(&window, state);
