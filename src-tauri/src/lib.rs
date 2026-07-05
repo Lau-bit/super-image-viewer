@@ -564,7 +564,7 @@ fn set_window_bounds(window: &WebviewWindow, state: &WindowState) -> Result<(), 
 fn secondary_window_count(app: &AppHandle) -> usize {
     app.webview_windows()
         .keys()
-        .filter(|label| label.as_str() != "main")
+        .filter(|label| label.as_str() != "main" && !label.starts_with("image-"))
         .count()
 }
 
@@ -723,7 +723,7 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.image_count = settings.image_count.clamp(4, 99);
     current.empty_count = settings
         .empty_count
-        .min(settings.image_count.saturating_sub(1));
+        .min(current.image_count.saturating_sub(1));
     current.display_mode = settings.display_mode;
     current.slideshow_duration = settings.slideshow_duration.max(1000);
     current.zoom_fill_enabled = settings.zoom_fill_enabled;

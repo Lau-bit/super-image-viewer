@@ -97,7 +97,7 @@ function clearImageManualZoom(img, animate = false) {
       cell?.classList.remove('manual-zoom');
       img.style.objectFit = '';
       img.style.transform = '';
-      applyZoomFillToImages();
+      if (cell) applyZoomFillToCell(cell);
     };
 
     img.style.transition = 'transform 0.3s ease-out';
@@ -395,7 +395,8 @@ function applyImageSlot(img, slot) {
   img.classList.remove('loaded');
   img.onload  = () => {
     img.classList.add('loaded');
-    applyZoomFillToImages();
+    const cell = img.closest('.grid-cell');
+    if (cell) applyZoomFillToCell(cell);
   };
   img.onerror = () => {};
   img.src = window.viewerAPI.getFileUrl(slot);
@@ -510,7 +511,7 @@ function attachCellInteractions(cell) {
       tx: clamp(drag.baseline.tx + dx, -maxTx, maxTx),
       ty: clamp(drag.baseline.ty + dy, -maxTy, maxTy),
     });
-    applyZoomFillToImages();
+    applyZoomFillToCell(cell);
   });
 
   function endDrag(e) {
@@ -545,7 +546,7 @@ function attachCellInteractions(cell) {
       ty: clamp(pointerY - (pointerY - current.ty) * scaleRatio, -maxTy, maxTy),
     });
     lastManualZoomCell = cell;
-    applyZoomFillToImages();
+    applyZoomFillToCell(cell);
   }, { passive: false });
 
   cell.addEventListener('pointerenter', () => { hoveredCell = cell; });
@@ -1631,7 +1632,7 @@ function recenterManualZoom(cell) {
   const img = cell && cell.querySelector('img');
   if (!img || !imageManualZoom.has(img)) return;
   clearImageManualZoom(img, true);
-  applyZoomFillToImages();
+  applyZoomFillToCell(cell);
 }
 
 function cellHasManualZoom(cell) {
@@ -1650,36 +1651,50 @@ function recenterAllManualZoom() {
   if (changed) applyZoomFillToImages();
 }
 
-function applyZoomFillToImages() {
+// Grid-wide zoom-fill inputs that don't depend on any single cell — computed
+// once per call site instead of once per cell, so hot paths that only touch
+// one cell (an image finishing loading, a drag/wheel pan-zoom tick) don't
+// redo this work for every other cell in the grid.
+function zoomFillGlobals() {
   const coverMode = isZoomFillCover(appSettings.zoomFillAmount);
   const position = coverMode ? zoomBiasPosition() : { x: 50, y: 50 };
-  imageGrid.style.setProperty('--zoom-fill-x', `${position.x}%`);
-  imageGrid.style.setProperty('--zoom-fill-y', `${position.y}%`);
-
   const curtainSide = coverMode ? null : zoomCurtainSide();
   const curtainCoverage = curtainSide ? zoomCurtainCoverage() : 0;
+  return { coverMode, position, curtainSide, curtainCoverage };
+}
 
-  imageGrid.querySelectorAll('.grid-cell').forEach(cell => {
-    const img = cell.querySelector('img');
-    if (img) {
-      const imgPosition = zoomPositionForImage(img, position, coverMode);
-      const imgPositionValue = `${imgPosition.x}% ${imgPosition.y}%`;
-      const portraitFill = portraitFillTransformForImage(img, cell, coverMode, position);
-      if (portraitFill !== null) {
-        img.style.objectFit = 'contain';
-        img.style.objectPosition = '50% 50%';
-        img.style.transformOrigin = '50% 50%';
-        img.style.transform = `translate(${portraitFill.tx}px, ${portraitFill.ty}px) scale(${portraitFill.scale})`;
-      } else {
-        img.style.objectFit = '';
-        img.style.transform = '';
-        img.style.objectPosition = imgPositionValue;
-        img.style.transformOrigin = imgPositionValue;
-      }
+// Applies zoom-fill/portrait-fill/manual-zoom/curtain to a single cell. Call
+// this directly (instead of applyZoomFillToImages) whenever only one cell
+// changed — it skips the getBoundingClientRect layout read that a full-grid
+// pass would otherwise force on every *other* cell.
+function applyZoomFillToCell(cell, globals = zoomFillGlobals()) {
+  const { coverMode, position, curtainSide, curtainCoverage } = globals;
+  const img = cell.querySelector('img');
+  if (img) {
+    const imgPosition = zoomPositionForImage(img, position, coverMode);
+    const imgPositionValue = `${imgPosition.x}% ${imgPosition.y}%`;
+    const portraitFill = portraitFillTransformForImage(img, cell, coverMode, position);
+    if (portraitFill !== null) {
+      img.style.objectFit = 'contain';
+      img.style.objectPosition = '50% 50%';
+      img.style.transformOrigin = '50% 50%';
+      img.style.transform = `translate(${portraitFill.tx}px, ${portraitFill.ty}px) scale(${portraitFill.scale})`;
+    } else {
+      img.style.objectFit = '';
+      img.style.transform = '';
+      img.style.objectPosition = imgPositionValue;
+      img.style.transformOrigin = imgPositionValue;
     }
-    const manualActive = manualZoomActiveCount > 0 && applyManualOverride(cell);
-    applyCurtainToCell(cell, img && !manualActive ? curtainSide : null, curtainCoverage);
-  });
+  }
+  const manualActive = manualZoomActiveCount > 0 && applyManualOverride(cell);
+  applyCurtainToCell(cell, img && !manualActive ? curtainSide : null, curtainCoverage);
+}
+
+function applyZoomFillToImages() {
+  const globals = zoomFillGlobals();
+  imageGrid.style.setProperty('--zoom-fill-x', `${globals.position.x}%`);
+  imageGrid.style.setProperty('--zoom-fill-y', `${globals.position.y}%`);
+  imageGrid.querySelectorAll('.grid-cell').forEach(cell => applyZoomFillToCell(cell, globals));
 }
 
 function syncZoomFillControls() {
