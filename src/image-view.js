@@ -238,11 +238,14 @@ menuClose.addEventListener('click', () => {
 });
 
 document.addEventListener('keydown', (e) => {
+  // Escape backs out one layer at a time: menu first, then the window.
+  // Delete is deliberately unbound — every other image viewer deletes the
+  // file with it, so closing on Delete reads as data loss that didn't happen.
   if (e.key === 'Escape') {
-    closeContextMenu();
-    return;
-  }
-  if (e.key === 'Delete') {
+    if (contextMenu.classList.contains('open')) {
+      closeContextMenu();
+      return;
+    }
     e.preventDefault();
     closeWindow();
     return;

@@ -207,6 +207,48 @@
   <!-- Right-click categorize menu (categorized mode); populated by JS -->
   <div id="grid-context-menu" class="context-menu"></div>
 
+  <!-- Shortcut reference (?); deliberately outside the ui-hidden chrome so it
+       still answers "how do I get the UI back?" while the UI is hidden. -->
+  <div id="shortcuts-overlay">
+    <div id="shortcuts-panel">
+      <div class="shortcuts-header">
+        <span class="shortcuts-title">Keyboard shortcuts</span>
+        <button type="button" id="shortcuts-close" title="Close">&#10005;</button>
+      </div>
+
+      <div class="shortcuts-columns">
+        <div class="shortcuts-group">
+          <div class="shortcuts-group-title">Grid</div>
+          <div class="shortcut-row"><kbd>Space</kbd><span>New set</span></div>
+          <div class="shortcut-row"><kbd>S</kbd><span>Shuffle current set</span></div>
+          <div class="shortcut-row"><kbd>P</kbd><span>Play / pause slideshow</span></div>
+          <div class="shortcut-row"><kbd>&#8592;</kbd><span>Previous set</span></div>
+          <div class="shortcut-row"><kbd>&#8594;</kbd><span>Next set</span></div>
+          <div class="shortcut-row"><kbd>Ctrl</kbd><kbd>Z</kbd><span>Undo hide / categorize</span></div>
+          <div class="shortcut-row"><kbd>Shift</kbd><kbd>Q</kbd><span>Show / hide the UI</span></div>
+          <div class="shortcut-row"><kbd>?</kbd><span>This list</span></div>
+          <div class="shortcut-row"><kbd>Esc</kbd><span>Close menu / panel</span></div>
+        </div>
+
+        <div class="shortcuts-group">
+          <div class="shortcuts-group-title">Image cell</div>
+          <div class="shortcut-row"><kbd>Click</kbd><span>Open floating viewer</span></div>
+          <div class="shortcut-row"><kbd>Drag</kbd><span>Pan within the cell</span></div>
+          <div class="shortcut-row"><kbd>Wheel</kbd><span>Zoom the cell</span></div>
+          <div class="shortcut-row"><kbd>C</kbd><span>Recenter hovered image</span></div>
+          <div class="shortcut-row"><kbd>H</kbd><span>Recenter every image</span></div>
+          <div class="shortcut-row"><kbd>Right-click</kbd><span>Hide / categorize</span></div>
+
+          <div class="shortcuts-group-title">Floating viewer</div>
+          <div class="shortcut-row"><kbd>Wheel</kbd><span>Zoom at cursor</span></div>
+          <div class="shortcut-row"><kbd>C</kbd><span>Recenter</span></div>
+          <div class="shortcut-row"><kbd>Ctrl</kbd><kbd>C</kbd><span>Copy image</span></div>
+          <div class="shortcut-row"><kbd>Esc</kbd><span>Close viewer</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script src="api.js"></script>
   <script src="renderer.js"></script>
 </body>

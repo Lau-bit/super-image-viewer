@@ -4,6 +4,7 @@
 // Constants
 // ==============================
 const HISTORY_MAX   = 50;
+const UNDO_MAX      = 20;
 const COUNT_PRESETS = [4, 6, 8, 9, 12, 16, 20, 25, 32, 40, 49, 64, 81, 99];
 const ZOOM_BIAS_REPEAT_MS = 1000 / 24;
 const ZOOM_BIAS_HOLD_DELAY_MS = 180;
@@ -60,6 +61,7 @@ const state = {
 
   uiHidden:     false,
   settingsOpen: false,
+  shortcutsOpen: false,
 };
 
 // Per-image manual pan/zoom override (grid only) — keyed by <img> so it's
@@ -116,6 +118,10 @@ function clearImageManualZoom(img, animate = false) {
 
 // Session history — array of {slots, chronoOffset}
 const hist = { stack: [], pos: -1 };
+
+// Reversible hide/categorize actions, most recent last. Scoped to the current
+// image pool: entries restore by pool index, so loadImagePool() clears them.
+const undoStack = [];
 
 // Blocks persistSettings() during the startup load
 let startupDone = false;
@@ -188,6 +194,9 @@ const btnNavPrev         = document.getElementById('btn-nav-prev');
 const btnNavNext         = document.getElementById('btn-nav-next');
 const btnSettings        = document.getElementById('btn-settings');
 const settingsPanel      = document.getElementById('settings-panel');
+const shortcutsOverlay   = document.getElementById('shortcuts-overlay');
+const shortcutsPanel     = document.getElementById('shortcuts-panel');
+const shortcutsClose     = document.getElementById('shortcuts-close');
 const settingSaveFirstWindow       = document.getElementById('setting-save-first-window');
 const settingResetFirstWindow      = document.getElementById('setting-reset-first-window');
 const settingSaveSecondaryWindow   = document.getElementById('setting-save-secondary-window');
@@ -392,6 +401,7 @@ function applyImageSlot(img, slot) {
   clearImageManualZoom(img);
   img.setAttribute('data-src', slot);
   img.removeAttribute('data-pending-src');
+  img.title = baseName(slot);
   img.classList.remove('loaded');
   img.onload  = () => {
     img.classList.add('loaded');
@@ -502,6 +512,7 @@ function attachCellInteractions(cell) {
       lastManualZoomCell = cell;
       cell.classList.add('panning');
     }
+    deferSlideshowTick();
 
     const rect = cell.getBoundingClientRect();
     const totalScale = zoomFillScale(appSettings.zoomFillAmount) * drag.baseline.scale;
@@ -547,6 +558,7 @@ function attachCellInteractions(cell) {
     });
     lastManualZoomCell = cell;
     applyZoomFillToCell(cell);
+    deferSlideshowTick();
   }, { passive: false });
 
   cell.addEventListener('pointerenter', () => { hoveredCell = cell; });
@@ -770,14 +782,23 @@ function toggleSlideshow() {
   else startSlideshow();
 }
 
-function rescheduleSlideshowTick() {
+// Restart the auto-advance countdown without disturbing the preload. Hand
+// interaction with a cell calls this so inspecting an image buys a full fresh
+// interval instead of getting swapped out mid-gesture; the warmed next set
+// stays valid either way, and arriving early just means it waits, ready.
+function deferSlideshowTick() {
   clearTimeout(state.slideshowTimer);
-  clearSlideshowPreload();
+  state.slideshowTimer = null;
   if (!state.slideshow) return;
   state.slideshowTimer = setTimeout(() => {
     if (!state.slideshow) return;
     navigateForward();
   }, state.slideshowDuration);
+}
+
+function rescheduleSlideshowTick() {
+  clearSlideshowPreload();
+  deferSlideshowTick();
   scheduleSlideshowPreload();
 }
 
@@ -910,6 +931,9 @@ function loadImagePool(images, label, mode, folder = null) {
   state.chronoOffset = 0;
   hist.stack = [];
   hist.pos = -1;
+  // Undo entries splice back into this pool by index — they mean nothing once
+  // it's replaced, so they retire with the history that shares their scope.
+  undoStack.length = 0;
   folderNameEl.textContent = label;
   document.body.classList.toggle('no-folder', !state.allImages.length);
   renderFolderButton();
@@ -1212,36 +1236,111 @@ function pickReplacementImage(shownPaths) {
 
 // Drop `path` from the session pool and swap its on-screen slot for a new
 // image (or an empty slot if the pool is exhausted). Shared by hide + instant
-// filter; never touches categorization on disk.
+// filter; never touches categorization on disk. Returns what it took so undo
+// can put it back.
 function removeDisplayedImage(path) {
-  const index = state.displayedSlots.indexOf(path);
+  const slotIndex = state.displayedSlots.indexOf(path);
+  // Chrono mode reads the pool positionally, so record where the image sat —
+  // restoring it at the end would silently reorder the timeline.
+  const poolIndex = state.allImages.findIndex(image => image.path === path);
+  const removal = {
+    path,
+    slotIndex,
+    poolIndex,
+    image: poolIndex === -1 ? null : state.allImages[poolIndex],
+  };
   state.allImages = state.allImages.filter(image => image.path !== path);
   clearSlideshowPreload();
-  if (index === -1) return;
+  if (slotIndex === -1) return removal;
   const shown = new Set(state.displayedSlots.filter(Boolean));
-  state.displayedSlots[index] = pickReplacementImage(shown);
+  state.displayedSlots[slotIndex] = pickReplacementImage(shown);
   renderGrid(state.displayedSlots);
   syncHistoryHead();
   if (state.slideshow) rescheduleSlideshowTick();
+  return removal;
+}
+
+// Reverse of removeDisplayedImage: pool entry back at its original index, and
+// the image back into the slot it vacated.
+function restoreRemovedImage(removal) {
+  if (removal.image && !state.allImages.some(image => image.path === removal.path)) {
+    state.allImages.splice(Math.min(removal.poolIndex, state.allImages.length), 0, removal.image);
+  }
+  clearSlideshowPreload();
+  // The pool restore above is the part that matters; putting it back in its old
+  // slot is a nicety. Skip that if the grid has since shrunk past the slot —
+  // writing past the end would extend displayedSlots and resize the layout.
+  if (removal.slotIndex !== -1 && removal.slotIndex < state.displayedSlots.length) {
+    state.displayedSlots[removal.slotIndex] = removal.path;
+    renderGrid(state.displayedSlots);
+    syncHistoryHead();
+  }
+  if (state.slideshow) rescheduleSlideshowTick();
+}
+
+// ==============================
+// Undo (Ctrl+Z)
+// ==============================
+// Hide and categorize both fire straight off a right-click menu and can pull
+// an image off the grid on the spot — a slip is otherwise unwalkable-back,
+// since the image leaves the pool and, in categorized mode, the filter too.
+function pushUndo(entry) {
+  undoStack.push(entry);
+  if (undoStack.length > UNDO_MAX) undoStack.shift();
 }
 
 function hideImage(path) {
-  removeDisplayedImage(path);
+  pushUndo({ type: 'hide', path, removal: removeDisplayedImage(path) });
+}
+
+async function undoLastAction() {
+  const entry = undoStack.pop();
+  if (!entry) {
+    showToast('Nothing to undo');
+    return;
+  }
+
+  if (entry.type === 'hide') {
+    restoreRemovedImage(entry.removal);
+    showToast(`Unhid ${baseName(entry.path)}`);
+    return;
+  }
+
+  try {
+    await window.viewerAPI.setImageCategory(entry.root, entry.path, entry.previousCategory);
+    applyLocalCategoryChange(entry.path, entry.previousCategory);
+    if (entry.removal) restoreRemovedImage(entry.removal);
+    showToast(`Moved back to ${entry.previousCategory}`);
+  } catch (error) {
+    console.error('Failed to undo categorize:', error);
+    // The sidecar write never landed, so the move still stands — put the entry
+    // back rather than swallowing the only way to reverse it.
+    pushUndo(entry);
+    showToast('Failed to undo');
+  }
 }
 
 async function categorizeImage(path, category) {
   if (!state.categorizedRoot) return;
+  const root = state.categorizedRoot;
+  const previousCategory = categoryForPath(path);
   try {
-    await window.viewerAPI.setImageCategory(state.categorizedRoot, path, category);
+    await window.viewerAPI.setImageCategory(root, path, category);
     applyLocalCategoryChange(path, category);
 
     const filteredOut = state.browseMode === 'categorized'
       && !state.categorizedCategoryFilter.has(category);
+    let removal = null;
     if (appSettings.instantFilterCategorized && filteredOut) {
-      removeDisplayedImage(path);
+      removal = removeDisplayedImage(path);
       showToast(`Moved to ${category} — hidden`);
     } else {
       showToast(`Moved to ${category}`);
+    }
+    // Records skipped by the scan (no category on disk) never reach the grid,
+    // so a displayed image always has one to go back to.
+    if (previousCategory) {
+      pushUndo({ type: 'categorize', path, root, previousCategory, removal });
     }
   } catch (error) {
     console.error('Failed to categorize image:', error);
@@ -1829,6 +1928,14 @@ function setSettingsOpen(open) {
 }
 
 // ==============================
+// Shortcuts overlay (?)
+// ==============================
+function setShortcutsOpen(open) {
+  state.shortcutsOpen = open;
+  shortcutsOverlay.classList.toggle('open', open);
+}
+
+// ==============================
 // Persist settings
 // ==============================
 async function persistSettings() {
@@ -2134,6 +2241,11 @@ settingSlideshowDur.addEventListener('change', () => {
 
 settingsPanel.addEventListener('click', e => e.stopPropagation());
 folderPanel.addEventListener('click', e => e.stopPropagation());
+
+shortcutsClose.addEventListener('click', () => setShortcutsOpen(false));
+shortcutsPanel.addEventListener('click', e => e.stopPropagation());
+// Backdrop click dismisses; the panel above stops its own clicks reaching here.
+shortcutsOverlay.addEventListener('click', () => setShortcutsOpen(false));
 document.addEventListener('click', () => {
   setSettingsOpen(false);
   setFolderPanelOpen(false);
@@ -2173,6 +2285,27 @@ document.addEventListener('keydown', e => {
   const focused = document.activeElement;
   if (focused && (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA')) return;
 
+  // ? — toggle the shortcut reference. Every layout that has a '?' reports it
+  // as e.key regardless of which chord produces it, so no need to spell those out.
+  const isHelpKey = e.key === '?';
+
+  if (isHelpKey) {
+    e.preventDefault();
+    setShortcutsOpen(!state.shortcutsOpen);
+    return;
+  }
+
+  // The reference is a modal: don't let the shortcuts it documents fire behind
+  // it. Escape (below) still backs out.
+  if (state.shortcutsOpen && e.key !== 'Escape') return;
+
+  // Ctrl+Z — undo the last hide / categorize
+  if ((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
+    e.preventDefault();
+    undoLastAction();
+    return;
+  }
+
   // Shift+Q — toggle title bar + toolbar
   if ((e.key === 'Q' || e.key === 'q') && e.shiftKey && !e.ctrlKey && !e.metaKey) {
     e.preventDefault();
@@ -2207,6 +2340,7 @@ document.addEventListener('keydown', e => {
   // Escape — unwind modals one level at a time
   if (e.key === 'Escape') {
     e.preventDefault();
+    if (state.shortcutsOpen) { setShortcutsOpen(false); return; }
     if (gridContextMenu.classList.contains('open')) { closeGridContextMenu(); return; }
     if (state.settingsOpen) { setSettingsOpen(false); return; }
     if (state.uiHidden)     { setUiHidden(false);     return; }

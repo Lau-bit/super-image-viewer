@@ -934,22 +934,43 @@ async fn open_image_window(
     let target_y_phys = target_y_phys.min(clamp_bottom - height_phys).max(clamp_top);
 
     let state = app.state::<AppState>();
-    let window_id = state.image_window_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    let label = format!("image-{window_id}");
+    let owner_label = window.label().to_string();
+
+    // One viewer per image per owner window. A double-click on a grid cell
+    // fires two opens, which would otherwise stack an identical second viewer
+    // exactly on top of the first; re-opening an image the owner is already
+    // showing raises that viewer instead. The lookup and the reservation share
+    // one lock, so two concurrent opens can't both pass the check.
+    let label = {
+        let mut paths = state.image_paths.lock().unwrap();
+        let mut owners = state.image_owners.lock().unwrap();
+        let existing = paths
+            .iter()
+            .find(|&(label, existing_path)| {
+                existing_path == &path
+                    && owners.get(label).map(String::as_str) == Some(owner_label.as_str())
+            })
+            .map(|(label, _)| label.clone());
+        if let Some(existing_label) = existing {
+            drop(owners);
+            drop(paths);
+            // A reservation with no window yet means a concurrent open is
+            // still building it — it focuses itself when it finishes.
+            if let Some(existing_window) = app.get_webview_window(&existing_label) {
+                let _ = existing_window.unminimize();
+                let _ = existing_window.set_focus();
+            }
+            return Ok(());
+        }
+        let window_id = state.image_window_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let label = format!("image-{window_id}");
+        paths.insert(label.clone(), path);
+        owners.insert(label.clone(), owner_label);
+        label
+    };
     let settings = load_settings_inner(&app);
 
-    state
-        .image_paths
-        .lock()
-        .unwrap()
-        .insert(label.clone(), path);
-    state
-        .image_owners
-        .lock()
-        .unwrap()
-        .insert(label.clone(), window.label().to_string());
-
-    let image_window = WebviewWindowBuilder::new(
+    let image_window = match WebviewWindowBuilder::new(
         &app,
         label.clone(),
         WebviewUrl::App("image-view.html".into()),
@@ -961,7 +982,16 @@ async fn open_image_window(
     .shadow(true)
     .background_color(Color(17, 17, 17, 255))
     .build()
-    .map_err(|error| format!("Failed to build image window: {error}"))?;
+    {
+        Ok(image_window) => image_window,
+        Err(error) => {
+            // Release the reservation, or this image stays unopenable for the
+            // rest of the session.
+            state.image_paths.lock().unwrap().remove(&label);
+            state.image_owners.lock().unwrap().remove(&label);
+            return Err(format!("Failed to build image window: {error}"));
+        }
+    };
 
     set_app_window_icon(&image_window);
     let _ = set_square_window_corners(&image_window, settings.square_app_corners);
