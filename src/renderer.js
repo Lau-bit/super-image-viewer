@@ -413,7 +413,7 @@ function applyImageSlot(img, slot) {
   clearImageManualZoom(img);
   img.setAttribute('data-src', slot);
   img.removeAttribute('data-pending-src');
-  img.title = baseName(slot);
+  img.removeAttribute('title');
   img.classList.remove('loaded');
   img.onload  = () => {
     img.classList.add('loaded');
@@ -425,6 +425,9 @@ function applyImageSlot(img, slot) {
 }
 
 function renderGrid(slots, options = {}) {
+  // Menu actions capture the image path present when the menu opens. Any grid
+  // render can replace that image, so dismiss the menu before changing cells.
+  closeGridContextMenu();
   const stagger = !!options.stagger;
   const renderToken = ++state.gridRenderToken;
   applyGridLayout(slots.length || state.imageCount);
@@ -1271,7 +1274,7 @@ function setAllCategorizedCategories(checked) {
 }
 
 // ==============================
-// Right-click categorize menu (categorized mode only)
+// Right-click image menu
 // ==============================
 function categoryForPath(path) {
   const entry = state.categorizedImages.find(image => image.path === path);
@@ -1292,6 +1295,21 @@ function openGridContextMenu(x, y) {
 
 function openImageContextMenu(path, x, y) {
   gridContextMenu.textContent = '';
+
+  const fileInfo = document.createElement('div');
+  fileInfo.className = 'context-menu-file-info';
+  const fileLabel = document.createElement('div');
+  fileLabel.className = 'context-menu-title';
+  fileLabel.textContent = 'Image file';
+  const fileName = document.createElement('div');
+  fileName.className = 'context-menu-file-name';
+  fileName.textContent = baseName(path);
+  fileInfo.append(fileLabel, fileName);
+  gridContextMenu.append(fileInfo);
+
+  const actionSeparator = document.createElement('div');
+  actionSeparator.className = 'context-menu-separator';
+  gridContextMenu.append(actionSeparator);
 
   // Hide — available in every browse mode; view-only, no categorization change.
   const hideBtn = document.createElement('button');
@@ -2447,8 +2465,8 @@ document.addEventListener('click', () => {
 });
 
 // Suppress the native webview context menu everywhere (removes "More tools"
-// and "Inspect"). Right-clicking an image opens a custom menu: Hide in any
-// mode, plus move-to-category when browsing a categorized root.
+// and "Inspect"). Right-clicking an image opens a custom menu with its file
+// name, Hide in any mode, and move-to-category when browsing a categorized root.
 document.addEventListener('contextmenu', e => {
   e.preventDefault();
 
