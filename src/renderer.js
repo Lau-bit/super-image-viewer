@@ -123,6 +123,9 @@ const hist = { stack: [], pos: -1 };
 // image pool: entries restore by pool index, so loadImagePool() clears them.
 const undoStack = [];
 
+// Serializes undoLastAction() — see the comment there.
+let undoChain = Promise.resolve();
+
 // Blocks persistSettings() during the startup load
 let startupDone = false;
 let windowLabel = 'main';
@@ -588,7 +591,14 @@ function openFloatingImage(cell) {
 function nextChronoOffset() {
   if (state.displayMode !== 'chrono') return state.chronoOffset;
   const step = Math.max(1, state.imageCount - state.emptyCount);
-  return Math.min(state.allImages.length - 1, state.chronoOffset + step);
+  const next = state.chronoOffset + step;
+  // `next` is a page start, not an image index. Clamping it to the last index
+  // (as this used to) let it settle mid-page, where the page degraded to a
+  // single image and then never moved again — every later advance re-pushed
+  // that same set until it had evicted all real history. Past the last page,
+  // wrap to the newest instead: chrono is the only mode that can run out, and
+  // a slideshow that loops beats one that freezes.
+  return next >= state.allImages.length ? 0 : next;
 }
 
 function buildNextSlideshowPlan() {
@@ -827,6 +837,9 @@ function clearDisplayFolder() {
   state.chronoOffset = 0;
   hist.stack = [];
   hist.pos = -1;
+  // Same reason as in loadImagePool: undo entries restore by pool index, and
+  // this drops the pool they refer to.
+  undoStack.length = 0;
   imageGrid.textContent = '';
   folderNameEl.textContent = '';
   document.body.classList.add('no-folder');
@@ -1227,6 +1240,33 @@ function syncHistoryHead() {
   }
 }
 
+// syncHistoryHead only covers the entry being viewed; the other ≤49 sets still
+// list the image. Blank it out of all of them, or navigating back re-renders a
+// set holding an image that is no longer in the pool — on screen, yet invisible
+// to every replacement path. Returns where it was, so undo can put it back.
+//
+// Entries are held by reference, not index: pushHistory shifts the stack once
+// it hits HISTORY_MAX, which would leave indices pointing at the wrong sets.
+function purgeFromHistory(path) {
+  const hits = [];
+  for (const entry of hist.stack) {
+    entry.slots.forEach((slot, slotIndex) => {
+      if (slot !== path) return;
+      hits.push({ entry, slotIndex });
+      entry.slots[slotIndex] = null;
+    });
+  }
+  return hits;
+}
+
+// Only refill slots still blank: the viewed entry gets rewritten wholesale by
+// syncHistoryHead, and that copy is authoritative over anything recorded here.
+function restoreToHistory(hits, path) {
+  for (const { entry, slotIndex } of hits) {
+    if (entry.slots[slotIndex] === null) entry.slots[slotIndex] = path;
+  }
+}
+
 // Pick a fresh image from the current pool that isn't already on screen.
 function pickReplacementImage(shownPaths) {
   const candidates = state.allImages.filter(image => !shownPaths.has(image.path));
@@ -1248,6 +1288,7 @@ function removeDisplayedImage(path) {
     slotIndex,
     poolIndex,
     image: poolIndex === -1 ? null : state.allImages[poolIndex],
+    historyHits: purgeFromHistory(path),
   };
   state.allImages = state.allImages.filter(image => image.path !== path);
   clearSlideshowPreload();
@@ -1260,17 +1301,23 @@ function removeDisplayedImage(path) {
   return removal;
 }
 
-// Reverse of removeDisplayedImage: pool entry back at its original index, and
-// the image back into the slot it vacated.
+// Reverse of removeDisplayedImage: pool entry back at its original index, the
+// blanked history slots refilled, and the image back into the slot it vacated.
 function restoreRemovedImage(removal) {
   if (removal.image && !state.allImages.some(image => image.path === removal.path)) {
     state.allImages.splice(Math.min(removal.poolIndex, state.allImages.length), 0, removal.image);
   }
+  restoreToHistory(removal.historyHits, removal.path);
   clearSlideshowPreload();
   // The pool restore above is the part that matters; putting it back in its old
-  // slot is a nicety. Skip that if the grid has since shrunk past the slot —
-  // writing past the end would extend displayedSlots and resize the layout.
-  if (removal.slotIndex !== -1 && removal.slotIndex < state.displayedSlots.length) {
+  // slot is a nicety, and two cases make it the wrong move. The grid may have
+  // shrunk past the slot, where writing would extend displayedSlots and resize
+  // the layout. Or the image may somehow already be on screen, where writing
+  // would show it twice — purgeFromHistory should rule that out, but undo
+  // shouldn't be the thing that proves it wrong.
+  if (removal.slotIndex !== -1
+    && removal.slotIndex < state.displayedSlots.length
+    && !state.displayedSlots.includes(removal.path)) {
     state.displayedSlots[removal.slotIndex] = removal.path;
     renderGrid(state.displayedSlots);
     syncHistoryHead();
@@ -1293,7 +1340,18 @@ function hideImage(path) {
   pushUndo({ type: 'hide', path, removal: removeDisplayedImage(path) });
 }
 
-async function undoLastAction() {
+// Ctrl+Z auto-repeats while held, and a categorize undo is an async sidecar
+// round-trip. Run them strictly one at a time: entries unwind by pool index and
+// only hold that meaning in stack order, and overlapping sidecar writes would
+// read-modify-write the same file on top of each other.
+function undoLastAction() {
+  undoChain = undoChain
+    .then(runNextUndo)
+    .catch(error => console.error('Undo failed:', error));
+  return undoChain;
+}
+
+async function runNextUndo() {
   const entry = undoStack.pop();
   if (!entry) {
     showToast('Nothing to undo');
@@ -2287,9 +2345,7 @@ document.addEventListener('keydown', e => {
 
   // ? — toggle the shortcut reference. Every layout that has a '?' reports it
   // as e.key regardless of which chord produces it, so no need to spell those out.
-  const isHelpKey = e.key === '?';
-
-  if (isHelpKey) {
+  if (e.key === '?') {
     e.preventDefault();
     setShortcutsOpen(!state.shortcutsOpen);
     return;

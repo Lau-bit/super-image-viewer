@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     fs::File,
     hash::{Hash, Hasher},
@@ -97,6 +97,13 @@ struct Settings {
     zoom_fill_enabled: bool,
     #[serde(default = "default_zoom_fill_level")]
     zoom_fill_level: u32,
+    /// The continuous 0-100 slider position. `None` means "never saved" and
+    /// must stay distinguishable from `Some(0)`, which means zoom fill off:
+    /// the frontend only falls back to deriving the amount from
+    /// `zoom_fill_level` while this is absent, so defaulting it to 0 would read
+    /// as a real "off" and silently disable zoom fill for existing settings.
+    #[serde(default)]
+    zoom_fill_amount: Option<u32>,
     #[serde(default)]
     zoom_fill_version: u32,
     #[serde(default)]
@@ -178,6 +185,7 @@ impl Default for Settings {
             slideshow_duration: 5000,
             zoom_fill_enabled: true,
             zoom_fill_level: 2,
+            zoom_fill_amount: None,
             zoom_fill_version: 2,
             zoom_fill_bias_direction: String::new(),
             zoom_fill_bias_amount: 0,
@@ -203,6 +211,25 @@ struct AppState {
     image_paths: Mutex<HashMap<String, String>>,
     /// Floating image window label -> the app window that opened it.
     image_owners: Mutex<HashMap<String, String>>,
+    /// (owner label, image path) pairs with a viewer mid-build. Distinct from
+    /// `image_paths`, which holds *built* viewers: a registered label whose
+    /// window has vanished is stale, but one of these is simply not ready yet.
+    opening_images: Mutex<HashSet<(String, String)>>,
+}
+
+/// Releases an `opening_images` claim on drop, so an early return, an error, or
+/// a panic can't strand an image as permanently "already opening".
+struct OpenClaim<'a> {
+    claims: &'a Mutex<HashSet<(String, String)>>,
+    key: (String, String),
+}
+
+impl Drop for OpenClaim<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut claims) = self.claims.lock() {
+            claims.remove(&self.key);
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -728,6 +755,7 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.slideshow_duration = settings.slideshow_duration.max(1000);
     current.zoom_fill_enabled = settings.zoom_fill_enabled;
     current.zoom_fill_level = settings.zoom_fill_level.clamp(1, 3);
+    current.zoom_fill_amount = settings.zoom_fill_amount.map(|amount| amount.min(100));
     current.zoom_fill_version = settings.zoom_fill_version.max(2);
     current.zoom_fill_bias_direction = match settings.zoom_fill_bias_direction.as_str() {
         "L" | "R" | "U" | "D" => settings.zoom_fill_bias_direction,
@@ -937,37 +965,64 @@ async fn open_image_window(
     let owner_label = window.label().to_string();
 
     // One viewer per image per owner window. A double-click on a grid cell
-    // fires two opens, which would otherwise stack an identical second viewer
-    // exactly on top of the first; re-opening an image the owner is already
-    // showing raises that viewer instead. The lookup and the reservation share
-    // one lock, so two concurrent opens can't both pass the check.
-    let label = {
-        let mut paths = state.image_paths.lock().unwrap();
-        let mut owners = state.image_owners.lock().unwrap();
-        let existing = paths
-            .iter()
-            .find(|&(label, existing_path)| {
-                existing_path == &path
-                    && owners.get(label).map(String::as_str) == Some(owner_label.as_str())
-            })
-            .map(|(label, _)| label.clone());
-        if let Some(existing_label) = existing {
-            drop(owners);
-            drop(paths);
-            // A reservation with no window yet means a concurrent open is
-            // still building it — it focuses itself when it finishes.
-            if let Some(existing_window) = app.get_webview_window(&existing_label) {
-                let _ = existing_window.unminimize();
-                let _ = existing_window.set_focus();
-            }
+    // fires two opens; claiming the pair for the length of the build makes the
+    // second bow out instead of stacking an identical viewer on top of the
+    // first. Held until this returns, by `_claim`'s Drop.
+    let _claim = {
+        let key = (owner_label.clone(), path.clone());
+        let mut claims = state.opening_images.lock().unwrap();
+        if !claims.insert(key.clone()) {
             return Ok(());
         }
-        let window_id = state.image_window_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let label = format!("image-{window_id}");
-        paths.insert(label.clone(), path);
-        owners.insert(label.clone(), owner_label);
-        label
+        OpenClaim {
+            claims: &state.opening_images,
+            key,
+        }
     };
+
+    // Raise the viewer this window already has for the image rather than
+    // duplicating it. Nothing is mid-build past the claim above, so a label
+    // registered with no live window is the residue of a viewer closed moments
+    // ago whose Destroyed cleanup hasn't run: drop it and open fresh, or that
+    // image could never be opened again this session.
+    let existing_label = {
+        let candidates: Vec<String> = {
+            let paths = state.image_paths.lock().unwrap();
+            paths
+                .iter()
+                .filter(|&(_, existing_path)| existing_path == &path)
+                .map(|(label, _)| label.clone())
+                .collect()
+        };
+        let owners = state.image_owners.lock().unwrap();
+        candidates
+            .into_iter()
+            .find(|label| owners.get(label).map(String::as_str) == Some(owner_label.as_str()))
+    };
+    if let Some(existing_label) = existing_label {
+        if let Some(existing_window) = app.get_webview_window(&existing_label) {
+            let _ = existing_window.unminimize();
+            let _ = existing_window.set_focus();
+            return Ok(());
+        }
+        state.image_paths.lock().unwrap().remove(&existing_label);
+        state.image_owners.lock().unwrap().remove(&existing_label);
+    }
+
+    let window_id = state.image_window_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    let label = format!("image-{window_id}");
+    // Registered before the build, not after: the new window's script calls
+    // get_assigned_image_path as soon as its page loads.
+    state
+        .image_paths
+        .lock()
+        .unwrap()
+        .insert(label.clone(), path);
+    state
+        .image_owners
+        .lock()
+        .unwrap()
+        .insert(label.clone(), owner_label);
     let settings = load_settings_inner(&app);
 
     let image_window = match WebviewWindowBuilder::new(
