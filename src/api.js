@@ -2,11 +2,12 @@
 
 const tauri = window.__TAURI__;
 const invoke = tauri?.core?.invoke;
+const listen = tauri?.event?.listen;
 const dialog = tauri?.dialog;
 const opener = tauri?.opener;
 const convertFileSrc = tauri?.core?.convertFileSrc;
 
-if (!invoke || !dialog || !convertFileSrc) {
+if (!invoke || !listen || !dialog || !convertFileSrc) {
   console.error('Tauri API is not available.');
 }
 
@@ -21,7 +22,9 @@ window.viewerAPI = {
   },
 
   listMultiFolderImages: (folders) => invoke('list_multi_folder_images', { folders }),
-  scanCategorizedRoot: (root) => invoke('scan_categorized_root', { root }),
+  scanCategorizedRoot: (root, scanId) => invoke('scan_categorized_root', { root, scanId }),
+  onCategorizedScanProgress: (callback) =>
+    listen('categorized-scan-progress', event => callback(event.payload)),
   setImageCategory: (root, path, category) => invoke('set_image_category', { root, path, category }),
   loadSettings: () => invoke('load_settings'),
   saveSettings: (settings) => invoke('save_settings', { settings }),

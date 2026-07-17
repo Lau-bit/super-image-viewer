@@ -10,10 +10,10 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Mutex,
     },
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 use tauri::{
-    image::Image, utils::config::Color, AppHandle, LogicalPosition, LogicalSize, Manager,
+    image::Image, utils::config::Color, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager,
     PhysicalPosition, PhysicalSize, Position, Size, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, WindowEvent,
 };
@@ -35,6 +35,10 @@ const RESTORED_WINDOW_PHYSICAL_X_OFFSET: f64 = -1.0;
 const CATEGORIZER_SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
 const CATEGORIZER_MAX_SCAN_DEPTH: usize = 4;
 const CATEGORIZER_HASH_SAMPLE_BYTES: usize = 65536;
+const CATEGORIZED_HASH_CACHE_FILE_NAME: &str = "categorized-hash-cache.json";
+const CATEGORIZED_HASH_MAX_THREADS: usize = 8;
+const CATEGORIZED_SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const CATEGORIZED_SCAN_PROGRESS_EVENT: &str = "categorized-scan-progress";
 
 fn set_app_window_icon(window: &WebviewWindow) {
     let icon = Image::new_owned(include_bytes!("../icons/icon.rgba").to_vec(), 1024, 1024);
@@ -215,6 +219,9 @@ struct AppState {
     /// `image_paths`, which holds *built* viewers: a registered label whose
     /// window has vanished is stale, but one of these is simply not ready yet.
     opening_images: Mutex<HashSet<(String, String)>>,
+    /// Serializes read/modify/write access to the derived on-disk hash cache
+    /// when several viewer windows scan at the same time.
+    categorized_hash_cache_io: Mutex<()>,
 }
 
 /// Releases an `opening_images` claim on drop, so an early return, an error, or
@@ -239,14 +246,14 @@ struct ImageInfo {
     modified: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CategorizedCategoryView {
     name: String,
     count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CategorizedImageView {
     path: String,
@@ -254,7 +261,7 @@ struct CategorizedImageView {
     modified: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CategorizedRootView {
     root: String,
@@ -276,6 +283,47 @@ struct CategorizerSidecar {
     categories: Vec<String>,
     #[serde(default)]
     images: HashMap<String, CategorizerImageRecord>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedScanProgress {
+    scan_id: String,
+    root: String,
+    scanned: usize,
+    total: usize,
+    images: Vec<CategorizedImageView>,
+    categories: Vec<CategorizedCategoryView>,
+    done: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedHashEntry {
+    size: u64,
+    modified: u64,
+    hash: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedHashCache {
+    #[serde(default)]
+    roots: HashMap<String, HashMap<String, CategorizedHashEntry>>,
+}
+
+struct CategorizedCandidate {
+    path: PathBuf,
+    size: u64,
+    modified: u64,
+}
+
+struct HashedCandidate {
+    path: String,
+    size: u64,
+    modified: u64,
+    hash: Option<String>,
+    category: Option<String>,
 }
 
 fn is_image_path(path: &Path) -> bool {
@@ -312,12 +360,75 @@ fn categorizer_hash_file(path: &Path, size: u64) -> Result<String, String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-fn collect_categorized_images(
+fn categorized_hash_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?
+        .join(CATEGORIZED_HASH_CACHE_FILE_NAME))
+}
+
+fn load_categorized_hashes(app: &AppHandle, root: &str) -> HashMap<String, CategorizedHashEntry> {
+    let state = app.state::<AppState>();
+    let Ok(_guard) = state.categorized_hash_cache_io.lock() else {
+        return HashMap::new();
+    };
+    categorized_hash_cache_path(app)
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|data| serde_json::from_str::<CategorizedHashCache>(&data).ok())
+        .and_then(|mut cache| cache.roots.remove(root))
+        .unwrap_or_default()
+}
+
+// This cache is purely derived: a read/write failure only makes the next scan
+// hash more files, so it must never make the image scan itself fail.
+fn save_categorized_hashes(
+    app: &AppHandle,
+    root: &str,
+    entries: HashMap<String, CategorizedHashEntry>,
+) {
+    let state = app.state::<AppState>();
+    let Ok(_guard) = state.categorized_hash_cache_io.lock() else {
+        return;
+    };
+    let Ok(path) = categorized_hash_cache_path(app) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut cache = fs::read_to_string(&path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<CategorizedHashCache>(&data).ok())
+        .unwrap_or_default();
+    cache.roots.insert(root.to_string(), entries);
+    if let Ok(data) = serde_json::to_string(&cache) {
+        let _ = fs::write(path, data);
+    }
+}
+
+fn build_categorized_categories(
     sidecar: &CategorizerSidecar,
+    category_counts: &HashMap<String, usize>,
+) -> Vec<CategorizedCategoryView> {
+    sidecar
+        .categories
+        .iter()
+        .filter_map(|name| {
+            let count = *category_counts.get(name).unwrap_or(&0);
+            (count > 0).then(|| CategorizedCategoryView {
+                name: name.clone(),
+                count,
+            })
+        })
+        .collect()
+}
+
+fn collect_categorized_candidates(
     folder: &Path,
     depth: usize,
-    images: &mut Vec<CategorizedImageView>,
-    category_counts: &mut HashMap<String, usize>,
+    candidates: &mut Vec<CategorizedCandidate>,
 ) -> Result<(), String> {
     let entries = fs::read_dir(folder)
         .map_err(|error| format!("Failed to read folder {}: {error}", folder.display()))?;
@@ -331,41 +442,54 @@ fn collect_categorized_images(
             continue;
         }
 
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let (is_dir, metadata) = if file_type.is_symlink() {
+            match fs::metadata(&path) {
+                Ok(metadata) => (metadata.is_dir(), Some(metadata)),
+                Err(_) => continue,
+            }
+        } else {
+            (file_type.is_dir(), entry.metadata().ok())
+        };
+
+        if is_dir {
             if depth < CATEGORIZER_MAX_SCAN_DEPTH {
-                collect_categorized_images(sidecar, &path, depth + 1, images, category_counts)?;
+                collect_categorized_candidates(&path, depth + 1, candidates)?;
             }
             continue;
         }
 
-        if !path.is_file() || !is_image_path(&path) {
+        if !is_image_path(&path) {
             continue;
         }
-
-        let Ok(metadata) = fs::metadata(&path) else {
+        let Some(metadata) = metadata else {
             continue;
         };
-        let Ok(hash) = categorizer_hash_file(&path, metadata.len()) else {
+        if !metadata.is_file() {
             continue;
-        };
-        let Some(record) = sidecar.images.get(&hash) else {
-            continue;
-        };
-        let Some(category) = record.category.clone() else {
-            continue;
-        };
-
-        *category_counts.entry(category.clone()).or_insert(0) += 1;
-        images.push(CategorizedImageView {
-            path: path.to_string_lossy().to_string(),
-            category,
-            modified: modified_ms(&path),
+        }
+        candidates.push(CategorizedCandidate {
+            path,
+            size: metadata.len(),
+            modified: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_default(),
         });
     }
     Ok(())
 }
 
-fn scan_categorized_root_blocking(root: String) -> Result<CategorizedRootView, String> {
+fn scan_categorized_root_blocking(
+    app: AppHandle,
+    window_label: String,
+    root: String,
+    scan_id: String,
+) -> Result<CategorizedRootView, String> {
     let root_path = PathBuf::from(&root);
     let sidecar_path = root_path.join(CATEGORIZER_SIDECAR_FILE_NAME);
     let sidecar_raw = fs::read_to_string(&sidecar_path)
@@ -373,21 +497,128 @@ fn scan_categorized_root_blocking(root: String) -> Result<CategorizedRootView, S
     let sidecar: CategorizerSidecar = serde_json::from_str(&sidecar_raw)
         .map_err(|error| format!("Failed to parse .image-categorizer.json: {error}"))?;
 
+    let mut candidates = Vec::new();
+    collect_categorized_candidates(&root_path, 0, &mut candidates)?;
+    let total = candidates.len();
+    let cached_hashes = load_categorized_hashes(&app, &root);
+
     let mut images = Vec::new();
     let mut category_counts: HashMap<String, usize> = HashMap::new();
-    collect_categorized_images(&sidecar, &root_path, 0, &mut images, &mut category_counts)?;
+    let mut fresh_hashes = HashMap::with_capacity(total);
 
-    let categories = sidecar
-        .categories
-        .iter()
-        .filter_map(|name| {
-            let count = *category_counts.get(name).unwrap_or(&0);
-            (count > 0).then(|| CategorizedCategoryView {
-                name: name.clone(),
-                count,
-            })
-        })
-        .collect();
+    let emit_progress = |scanned: usize,
+                         batch: Vec<CategorizedImageView>,
+                         counts: &HashMap<String, usize>,
+                         done: bool| {
+        let _ = app.emit_to(
+            &window_label,
+            CATEGORIZED_SCAN_PROGRESS_EVENT,
+            CategorizedScanProgress {
+                scan_id: scan_id.clone(),
+                root: root.clone(),
+                scanned,
+                total,
+                images: batch,
+                categories: build_categorized_categories(&sidecar, counts),
+                done,
+            },
+        );
+    };
+
+    if total == 0 {
+        emit_progress(0, Vec::new(), &category_counts, true);
+        save_categorized_hashes(&app, &root, fresh_hashes);
+        return Ok(CategorizedRootView {
+            root,
+            categories: Vec::new(),
+            images,
+        });
+    }
+
+    let thread_count = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .clamp(1, CATEGORIZED_HASH_MAX_THREADS)
+        .min(total);
+    let chunk_size = total.div_ceil(thread_count);
+    let (sender, receiver) = std::sync::mpsc::channel::<HashedCandidate>();
+
+    std::thread::scope(|scope| {
+        for chunk in candidates.chunks(chunk_size) {
+            let sender = sender.clone();
+            let sidecar = &sidecar;
+            let cached_hashes = &cached_hashes;
+            scope.spawn(move || {
+                for candidate in chunk {
+                    let path = candidate.path.to_string_lossy().to_string();
+                    let hash = cached_hashes
+                        .get(&path)
+                        .filter(|entry| {
+                            entry.size == candidate.size && entry.modified == candidate.modified
+                        })
+                        .map(|entry| entry.hash.clone())
+                        .or_else(|| categorizer_hash_file(&candidate.path, candidate.size).ok());
+                    let category = hash
+                        .as_ref()
+                        .and_then(|hash| sidecar.images.get(hash))
+                        .and_then(|record| record.category.clone());
+                    if sender
+                        .send(HashedCandidate {
+                            path,
+                            size: candidate.size,
+                            modified: candidate.modified,
+                            hash,
+                            category,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        let mut scanned = 0usize;
+        let mut batch = Vec::new();
+        let mut last_emit = Instant::now();
+        let mut emitted_images = false;
+        for hashed in receiver {
+            scanned += 1;
+            if let Some(hash) = hashed.hash {
+                fresh_hashes.insert(
+                    hashed.path.clone(),
+                    CategorizedHashEntry {
+                        size: hashed.size,
+                        modified: hashed.modified,
+                        hash,
+                    },
+                );
+            }
+            if let Some(category) = hashed.category {
+                *category_counts.entry(category.clone()).or_insert(0) += 1;
+                let image = CategorizedImageView {
+                    path: hashed.path,
+                    category,
+                    modified: hashed.modified,
+                };
+                batch.push(image.clone());
+                images.push(image);
+            }
+
+            if (!emitted_images && !batch.is_empty())
+                || last_emit.elapsed() >= CATEGORIZED_SCAN_PROGRESS_INTERVAL
+            {
+                emitted_images |= !batch.is_empty();
+                emit_progress(scanned, std::mem::take(&mut batch), &category_counts, false);
+                last_emit = Instant::now();
+            }
+        }
+        emit_progress(scanned, std::mem::take(&mut batch), &category_counts, true);
+    });
+
+    save_categorized_hashes(&app, &root, fresh_hashes);
+    let categories = build_categorized_categories(&sidecar, &category_counts);
 
     Ok(CategorizedRootView {
         root,
@@ -704,10 +935,18 @@ async fn list_multi_folder_images(folders: Vec<String>) -> Result<Vec<ImageInfo>
 }
 
 #[tauri::command]
-async fn scan_categorized_root(root: String) -> Result<CategorizedRootView, String> {
-    tauri::async_runtime::spawn_blocking(move || scan_categorized_root_blocking(root))
-        .await
-        .map_err(|error| format!("Categorized folder scan failed: {error}"))?
+async fn scan_categorized_root(
+    app: AppHandle,
+    window: WebviewWindow,
+    root: String,
+    scan_id: String,
+) -> Result<CategorizedRootView, String> {
+    let window_label = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_categorized_root_blocking(app, window_label, root, scan_id)
+    })
+    .await
+    .map_err(|error| format!("Categorized folder scan failed: {error}"))?
 }
 
 #[tauri::command]

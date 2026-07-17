@@ -151,6 +151,14 @@ body.app-starting #startup-loading-overlay {
   display: flex;
 }
 
+#startup-loading-hint {
+  max-width: 340px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.4;
+  opacity: 0.72;
+}
+
 body.app-starting #empty-state {
   opacity: 0;
   pointer-events: none;

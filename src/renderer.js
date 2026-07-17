@@ -24,6 +24,10 @@ const PORTRAIT_AUTO_BIAS_MIN_ASPECT = 1.02;
 const PORTRAIT_FILL_MAX_EXTRA_SCALE = 1.08;
 const PORTRAIT_FACE_SAFE_PAN = 0.78;
 const PORTRAIT_BIAS_STEP_CELL_RATIO = 0.0015;
+const STARTUP_WATCHDOG_INIT_MS = 15000;
+const STARTUP_WATCHDOG_SCAN_MS = 20000;
+const STARTUP_WATCHDOG_IMAGE_MS = 15000;
+const CATEGORIZED_LARGE_LIBRARY_THRESHOLD = 2000;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -129,6 +133,9 @@ let undoChain = Promise.resolve();
 // Blocks persistSettings() during the startup load
 let startupDone = false;
 let windowLabel = 'main';
+let startupWatchdogTimer = null;
+let categorizedScanSequence = 0;
+let categorizedScanProgress = null;
 let zoomBiasRepeatTimer = null;
 let zoomBiasHoldTimer = null;
 let zoomBiasRepeatPointerId = null;
@@ -162,6 +169,8 @@ const folderPanel        = document.getElementById('folder-panel');
 const folderModeTabs     = document.querySelectorAll('.folder-mode-tab');
 const folderLoading      = document.getElementById('folder-loading');
 const folderLoadingText  = document.getElementById('folder-loading-text');
+const startupLoadingText = document.getElementById('startup-loading-text');
+const startupLoadingHint = document.getElementById('startup-loading-hint');
 const folderSectionMulti = document.getElementById('folder-section-multi');
 const folderSectionCategorized = document.getElementById('folder-section-categorized');
 const folderMultiAdd     = document.getElementById('folder-multi-add');
@@ -350,7 +359,7 @@ async function loadAutoSlideshowCategorizedSource() {
   state.viewedBrowseMode = 'categorized';
   renderCategorizedRootRow();
   renderFolderPanelSections();
-  await enterCategorizedMode(root);
+  await enterCategorizedMode(root, { eager: true });
   if (state.browseMode !== 'categorized') {
     loadImagePool([], root ? baseName(root) : 'No categorized root', 'categorized');
   }
@@ -378,7 +387,7 @@ async function loadConfiguredStartupSource() {
   state.viewedBrowseMode = 'categorized';
   renderCategorizedRootRow();
   renderFolderPanelSections();
-  await enterCategorizedMode();
+  await enterCategorizedMode(undefined, { eager: true });
 }
 
 async function loadAutoSlideshowSource() {
@@ -898,10 +907,55 @@ function enabledMultiFolders() {
   return state.multiFolders.filter(folder => state.multiFolderFilter.has(fileKey(folder)));
 }
 
-function setFolderLoading(loading, message = 'Loading...') {
+function setFolderLoading(loading, message = 'Loading...', mode = '') {
   folderPanel.classList.toggle('loading', loading);
   folderLoading.hidden = !loading;
   folderLoadingText.textContent = message;
+  if (loading) {
+    folderPanel.dataset.loadingMode = mode;
+    folderPanel.dataset.loadingLabel = message;
+  } else {
+    delete folderPanel.dataset.loadingMode;
+    delete folderPanel.dataset.loadingLabel;
+  }
+}
+
+function formatCount(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function categorizedScanLabel(fallback) {
+  if (!categorizedScanProgress?.total) return fallback;
+  const label = fallback.replace(/(?:\.\.\.|…)$/, '');
+  return `${label} ${formatCount(categorizedScanProgress.scanned)} / ${formatCount(categorizedScanProgress.total)}...`;
+}
+
+function renderStartupScanProgress() {
+  if (!document.body.classList.contains('app-starting')) return;
+  startupLoadingText.textContent = categorizedScanProgress?.total
+    ? categorizedScanLabel('Loading images...')
+    : 'Loading...';
+  const isLarge = (categorizedScanProgress?.total || 0) > CATEGORIZED_LARGE_LIBRARY_THRESHOLD;
+  startupLoadingHint.textContent = isLarge
+    ? 'Large library - the first images will appear while the rest continue loading.'
+    : '';
+  startupLoadingHint.hidden = !isLarge;
+}
+
+function noteCategorizedScanProgress(payload) {
+  categorizedScanProgress = payload?.done
+    ? null
+    : { scanned: payload?.scanned || 0, total: payload?.total || 0 };
+  if (document.body.classList.contains('app-starting')) {
+    armStartupWatchdog(STARTUP_WATCHDOG_SCAN_MS);
+    renderStartupScanProgress();
+  }
+  if (folderPanel.classList.contains('loading')
+      && folderPanel.dataset.loadingMode === 'categorized') {
+    folderLoadingText.textContent = categorizedScanLabel(
+      folderPanel.dataset.loadingLabel || 'Scanning categories...'
+    );
+  }
 }
 
 function setFolderPanelOpen(open) {
@@ -1002,7 +1056,7 @@ async function enterMultiMode() {
     loadImagePool([], 'No multi-folders enabled', 'multi');
     return;
   }
-  setFolderLoading(true, 'Scanning folders...');
+  setFolderLoading(true, 'Scanning folders...', 'multi');
   try {
     const images = await window.viewerAPI.listMultiFolderImages(folders);
     loadImagePool(images, `${folders.length} folder${folders.length === 1 ? '' : 's'}`, 'multi');
@@ -1083,31 +1137,113 @@ function categorizedFilteredImages() {
   return state.categorizedImages.filter(image => state.categorizedCategoryFilter.has(image.category));
 }
 
-async function enterCategorizedMode(root = state.categorizedRoot) {
+function finalizeCategorizedImagePool(images, label) {
+  clearSlideshowPreload();
+  state.allImages = [...images].sort((a, b) => b.modified - a.modified);
+  state.folder = null;
+  state.browseMode = 'categorized';
+  state.viewedBrowseMode = 'categorized';
+  folderNameEl.textContent = label;
+  document.body.classList.toggle('no-folder', !state.allImages.length);
+  renderFolderButton();
+  renderFolderPanelSections();
+
+  const available = new Set(state.allImages.map(image => image.path));
+  const displayed = state.displayedSlots.filter(Boolean);
+  if (!displayed.length || displayed.some(path => !available.has(path))) {
+    if (state.allImages.length) refresh();
+    else {
+      state.displayedSlots = [];
+      imageGrid.textContent = '';
+      syncNavButtons();
+    }
+  }
+  persistSettings();
+}
+
+async function enterCategorizedMode(root = state.categorizedRoot, { eager = false } = {}) {
   if (!root) {
     loadImagePool([], 'No categorized root', 'categorized');
     renderCategorizedRootRow();
     renderCategoriesPanel();
     return;
   }
-  setFolderLoading(true, 'Scanning categories...');
-  try {
-    const scan = await window.viewerAPI.scanCategorizedRoot(root);
-    state.categorizedRoot = scan.root;
-    state.categorizedImages = scan.images;
-    state.categorizedCategories = scan.categories;
-    const available = new Set(scan.categories.map(category => category.name));
-    const kept = [...state.categorizedCategoryFilter].filter(name => available.has(name));
-    state.categorizedCategoryFilter = new Set(kept.length ? kept : [...available]);
-    renderCategorizedRootRow();
-    renderCategoriesPanel();
-    loadImagePool(categorizedFilteredImages(), baseName(scan.root), 'categorized');
-  } catch (error) {
-    showToast('Failed to load categorized root');
-    console.error(error);
-  } finally {
-    setFolderLoading(false);
-  }
+  const scanNumber = ++categorizedScanSequence;
+  const scanId = `${windowLabel}-${scanNumber}-${Date.now()}`;
+  const partialImages = [];
+  let partialPoolShown = false;
+  let settleEager = () => {};
+  const eagerFirstImages = new Promise(resolve => {
+    let settled = false;
+    settleEager = value => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+  });
+
+  setFolderLoading(true, 'Scanning categories...', 'categorized');
+  const unlisten = await window.viewerAPI.onCategorizedScanProgress(payload => {
+    if (scanNumber !== categorizedScanSequence) return;
+    if (payload?.scanId !== scanId || payload?.root !== root) return;
+    noteCategorizedScanProgress(payload);
+    if (!eager || !payload.images?.length) return;
+
+    partialImages.push(...payload.images);
+    state.categorizedImages = [...partialImages];
+    state.categorizedCategories = payload.categories || state.categorizedCategories;
+    if (partialPoolShown) return;
+    const filtered = state.categorizedCategoryFilter.size
+      ? partialImages.filter(image => state.categorizedCategoryFilter.has(image.category))
+      : partialImages;
+    // Super Image Viewer fills a grid, so wait only until that first grid can
+    // be populated (normally the next 100 ms batch), not for the whole library.
+    const initialImageTarget = Math.max(1, state.imageCount - state.emptyCount);
+    if (filtered.length < initialImageTarget && !payload.done) return;
+    if (!filtered.length) return;
+
+    state.categorizedRoot = root;
+    loadImagePool(filtered, baseName(root), 'categorized');
+    partialPoolShown = true;
+    settleEager(true);
+  }).catch(() => null);
+
+  const finalize = (async () => {
+    try {
+      const scan = await window.viewerAPI.scanCategorizedRoot(root, scanId);
+      if (scanNumber !== categorizedScanSequence) return false;
+      state.categorizedRoot = scan.root;
+      state.categorizedImages = scan.images;
+      state.categorizedCategories = scan.categories;
+      const available = new Set(scan.categories.map(category => category.name));
+      const kept = [...state.categorizedCategoryFilter].filter(name => available.has(name));
+      state.categorizedCategoryFilter = new Set(kept.length ? kept : [...available]);
+      renderCategorizedRootRow();
+      renderCategoriesPanel();
+      const filtered = categorizedFilteredImages();
+      if (partialPoolShown) {
+        finalizeCategorizedImagePool(filtered, baseName(scan.root));
+      } else {
+        loadImagePool(filtered, baseName(scan.root), 'categorized');
+      }
+      return true;
+    } catch (error) {
+      if (scanNumber === categorizedScanSequence) {
+        showToast('Failed to load categorized root');
+        console.error(error);
+      }
+      return false;
+    } finally {
+      unlisten?.();
+      settleEager(false);
+      if (scanNumber === categorizedScanSequence) {
+        categorizedScanProgress = null;
+        setFolderLoading(false);
+      }
+    }
+  })();
+
+  return eager ? Promise.race([eagerFirstImages, finalize]) : finalize;
 }
 
 async function chooseCategorizedRoot() {
@@ -2433,8 +2569,77 @@ document.addEventListener('keydown', e => {
 // ==============================
 // Startup
 // ==============================
+function armStartupWatchdog(ms = STARTUP_WATCHDOG_INIT_MS) {
+  clearTimeout(startupWatchdogTimer);
+  startupWatchdogTimer = setTimeout(() => {
+    if (document.body.classList.contains('app-starting')) {
+      document.body.classList.remove('app-starting');
+    }
+  }, ms);
+}
+
+function clearStartupOverlay() {
+  clearTimeout(startupWatchdogTimer);
+  document.body.classList.remove('app-starting');
+}
+
+function finishStartupLoadingAfterFirstImage() {
+  if (!document.body.classList.contains('app-starting')) return;
+  const images = [...imageGrid.querySelectorAll('img[data-src]')];
+  if (!images.length) {
+    clearStartupOverlay();
+    return;
+  }
+
+  armStartupWatchdog(STARTUP_WATCHDOG_IMAGE_MS);
+  startupLoadingText.textContent = 'Loading images...';
+  startupLoadingHint.hidden = true;
+  let pending = images.length;
+  let settled = false;
+  const cleanup = () => {
+    images.forEach(img => {
+      img.removeEventListener('load', loaded);
+      img.removeEventListener('error', failed);
+    });
+  };
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    clearStartupOverlay();
+  };
+  const loaded = () => finish();
+  const failed = () => {
+    pending--;
+    if (pending <= 0) finish();
+  };
+
+  images.forEach(img => {
+    img.addEventListener('load', loaded);
+    img.addEventListener('error', failed);
+  });
+  setTimeout(() => {
+    if (images.some(img => img.complete && img.naturalWidth > 0)) finish();
+    else if (images.every(img => img.complete)) finish();
+  }, 0);
+}
+
+armStartupWatchdog();
+
 (async () => {
   try {
+    // Let the overlay paint before the first native calls. The timer keeps
+    // startup moving when an occluded Windows webview suspends animation frames.
+    await new Promise(resolve => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      requestAnimationFrame(finish);
+      setTimeout(finish, 200);
+    });
     windowLabel = await window.viewerAPI.getWindowLabel().catch(() => 'main');
     const s = await window.viewerAPI.loadSettings();
 
@@ -2524,6 +2729,7 @@ document.addEventListener('keydown', e => {
     }
     await window.viewerAPI.setWindowSquareCorners(appSettings.squareAppCorners).catch(() => {});
 
+    armStartupWatchdog(STARTUP_WATCHDOG_SCAN_MS);
     if (shouldAutoStartSlideshow() && (windowLabel === 'main' || isSecondWindow())) {
       await loadAutoSlideshowSource();
     } else if ((windowLabel === 'main' || isSecondWindow()) && hasConfiguredStartupSource()) {
@@ -2533,7 +2739,7 @@ document.addEventListener('keydown', e => {
         if (state.browseMode === 'multi' && state.multiFolders.length) {
           await enterMultiMode();
         } else if (state.browseMode === 'categorized' && state.categorizedRoot) {
-          await enterCategorizedMode();
+          await enterCategorizedMode(undefined, { eager: true });
         } else {
           clearDisplayFolder();
         }
@@ -2541,7 +2747,8 @@ document.addEventListener('keydown', e => {
         clearDisplayFolder();
       }
     }
-  } catch {
+  } catch (error) {
+    console.error('Startup loading failed:', error);
     renderMultiFolderList();
     renderCategorizedRootRow();
     renderCategoriesPanel();
@@ -2552,9 +2759,10 @@ document.addEventListener('keydown', e => {
     syncModeButtons();
     syncZoomFillControls();
     syncNavButtons();
-  } finally {
-    document.body.classList.remove('app-starting');
   }
+
+  if (state.allImages.length) finishStartupLoadingAfterFirstImage();
+  else clearStartupOverlay();
 
   startupDone = true;
   if (shouldAutoStartSlideshow() && state.allImages.length) {
