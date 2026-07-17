@@ -686,6 +686,23 @@ body.zoom-fill-cover .grid-cell img {
   opacity: 1;
 }
 
+/* Keyboard-only image control. It never intercepts pointer input or renders
+   content, while :focus-within gives keyboard navigation a visible location. */
+.grid-cell-accessibility {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border: 0;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.grid-cell:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 /* Sub-fill bias — a black curtain slides in from the biased edge instead of
    panning the (uncropped) image, since there's no overflow to pan into. */
 .zoom-curtain {

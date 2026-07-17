@@ -229,6 +229,7 @@ const settingSlideshowDur = document.getElementById('setting-slideshow-duration'
 const btnMinimize        = document.getElementById('btn-minimize');
 const btnClose           = document.getElementById('btn-close');
 const gridContextMenu    = document.getElementById('grid-context-menu');
+let gridContextMenuReturnFocus = null;
 
 // ==============================
 // Grid layout
@@ -414,11 +415,13 @@ function applyImageSlot(img, slot) {
   img.setAttribute('data-src', slot);
   img.removeAttribute('data-pending-src');
   img.removeAttribute('title');
+  const cell = img.closest('.grid-cell');
+  setCellAccessibility(cell, slot);
   img.classList.remove('loaded');
   img.onload  = () => {
     img.classList.add('loaded');
-    const cell = img.closest('.grid-cell');
-    if (cell) applyZoomFillToCell(cell);
+    const loadedCell = img.closest('.grid-cell');
+    if (loadedCell) applyZoomFillToCell(loadedCell);
   };
   img.onerror = () => {};
   img.src = window.viewerAPI.getFileUrl(slot);
@@ -427,7 +430,7 @@ function applyImageSlot(img, slot) {
 function renderGrid(slots, options = {}) {
   // Menu actions capture the image path present when the menu opens. Any grid
   // render can replace that image, so dismiss the menu before changing cells.
-  closeGridContextMenu();
+  closeGridContextMenu({ restoreFocus: true });
   const stagger = !!options.stagger;
   const renderToken = ++state.gridRenderToken;
   applyGridLayout(slots.length || state.imageCount);
@@ -453,6 +456,7 @@ function renderGrid(slots, options = {}) {
 
     if (slot === null) {
       cell.classList.add('empty-slot');
+      setCellAccessibility(cell, null);
       const img = cell.querySelector('img');
       if (img) {
         clearImageManualZoom(img);
@@ -464,6 +468,7 @@ function renderGrid(slots, options = {}) {
       if (!img) {
         img = document.createElement('img');
         img.draggable = false;
+        img.alt = '';
         cell.appendChild(img);
       }
       if (img.getAttribute('data-src') !== slot) {
@@ -474,6 +479,7 @@ function renderGrid(slots, options = {}) {
         else applyImageSlot(img, slot);
       } else {
         img.removeAttribute('data-pending-src');
+        setCellAccessibility(cell, slot);
       }
     }
   });
@@ -490,11 +496,68 @@ function renderGrid(slots, options = {}) {
   });
 }
 
+function setCellAccessibility(cell, path) {
+  if (!cell) return;
+  const button = cell.querySelector('.grid-cell-accessibility');
+  if (!button) return;
+  if (path) {
+    button.setAttribute('aria-label', `Open image: ${baseName(path)}`);
+    button.disabled = false;
+    button.hidden = false;
+  } else {
+    button.hidden = true;
+    button.disabled = true;
+    button.removeAttribute('aria-label');
+  }
+}
+
 // Wires per-cell drag-to-pan / wheel-to-zoom / click-to-open-floating-view.
 // Attached once per .grid-cell element (cells are reused across renders), so
 // it always looks up the current <img> inside the cell at interaction time.
 function attachCellInteractions(cell) {
   let drag = null;
+
+  // This transparent, keyboard-only button leaves all pointer interaction on
+  // the cell unchanged while giving each occupied image a proper accessible
+  // name and standard Enter/Space activation behavior.
+  const accessibilityButton = document.createElement('button');
+  accessibilityButton.type = 'button';
+  accessibilityButton.className = 'grid-cell-accessibility';
+  accessibilityButton.hidden = true;
+  accessibilityButton.disabled = true;
+  cell.appendChild(accessibilityButton);
+
+  function openKeyboardContextMenu() {
+    const img = cell.querySelector('img');
+    const path = img && img.getAttribute('data-src');
+    if (!path) return;
+    const rect = cell.getBoundingClientRect();
+    openImageContextMenu(path, rect.left + 16, rect.top + 16, {
+      focusMenu: true,
+      returnFocus: accessibilityButton,
+    });
+  }
+
+  accessibilityButton.addEventListener('click', () => openFloatingImage(cell));
+  accessibilityButton.addEventListener('keydown', e => {
+    // Stop the app-wide Space shortcut; native button behavior will activate
+    // this image on Space or Enter.
+    if (e.key === ' ' || e.key === 'Enter') {
+      e.stopPropagation();
+      return;
+    }
+    if (e.key !== 'ContextMenu' && !(e.shiftKey && e.key === 'F10')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openKeyboardContextMenu();
+  });
+  accessibilityButton.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Some webviews dispatch both the key event and a synthetic contextmenu
+    // event for Shift+F10. Do not let the second event toggle the menu closed.
+    if (!gridContextMenu.classList.contains('open')) openKeyboardContextMenu();
+  });
 
   cell.addEventListener('pointerdown', e => {
     if (e.button !== 0) return;
@@ -1281,8 +1344,13 @@ function categoryForPath(path) {
   return entry ? entry.category : null;
 }
 
-function closeGridContextMenu() {
+function closeGridContextMenu({ restoreFocus = false } = {}) {
   gridContextMenu.classList.remove('open');
+  const returnFocus = gridContextMenuReturnFocus;
+  gridContextMenuReturnFocus = null;
+  if (restoreFocus && returnFocus?.isConnected && !returnFocus.hidden && !returnFocus.disabled) {
+    returnFocus.focus({ preventScroll: true });
+  }
 }
 
 function openGridContextMenu(x, y) {
@@ -1293,11 +1361,14 @@ function openGridContextMenu(x, y) {
   gridContextMenu.style.top = `${Math.max(4, Math.min(y, maxY))}px`;
 }
 
-function openImageContextMenu(path, x, y) {
+function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = null } = {}) {
   gridContextMenu.textContent = '';
+  gridContextMenuReturnFocus = returnFocus;
+  gridContextMenu.setAttribute('aria-label', `Image actions for ${baseName(path)}`);
 
   const fileInfo = document.createElement('div');
   fileInfo.className = 'context-menu-file-info';
+  fileInfo.setAttribute('aria-hidden', 'true');
   const fileLabel = document.createElement('div');
   fileLabel.className = 'context-menu-title';
   fileLabel.textContent = 'Image file';
@@ -1309,16 +1380,18 @@ function openImageContextMenu(path, x, y) {
 
   const actionSeparator = document.createElement('div');
   actionSeparator.className = 'context-menu-separator';
+  actionSeparator.setAttribute('role', 'separator');
   gridContextMenu.append(actionSeparator);
 
   // Hide — available in every browse mode; view-only, no categorization change.
   const hideBtn = document.createElement('button');
   hideBtn.type = 'button';
+  hideBtn.setAttribute('role', 'menuitem');
   const hideLabel = document.createElement('span');
   hideLabel.textContent = 'Hide image';
   hideBtn.append(hideLabel);
   hideBtn.addEventListener('click', () => {
-    closeGridContextMenu();
+    closeGridContextMenu({ restoreFocus: true });
     hideImage(path);
   });
   gridContextMenu.append(hideBtn);
@@ -1327,6 +1400,7 @@ function openImageContextMenu(path, x, y) {
   if (state.browseMode === 'categorized') {
     const separator = document.createElement('div');
     separator.className = 'context-menu-separator';
+    separator.setAttribute('role', 'separator');
     gridContextMenu.append(separator);
 
     const title = document.createElement('div');
@@ -1345,6 +1419,7 @@ function openImageContextMenu(path, x, y) {
         const isCurrent = category.name === current;
         const btn = document.createElement('button');
         btn.type = 'button';
+        btn.setAttribute('role', 'menuitem');
         btn.classList.toggle('current', isCurrent);
         const name = document.createElement('span');
         name.textContent = category.name;
@@ -1352,7 +1427,7 @@ function openImageContextMenu(path, x, y) {
         mark.textContent = isCurrent ? '✓' : '';
         btn.append(name, mark);
         btn.addEventListener('click', () => {
-          closeGridContextMenu();
+          closeGridContextMenu({ restoreFocus: true });
           if (!isCurrent) categorizeImage(path, category.name);
         });
         gridContextMenu.append(btn);
@@ -1361,6 +1436,7 @@ function openImageContextMenu(path, x, y) {
   }
 
   openGridContextMenu(x, y);
+  if (focusMenu) hideBtn.focus({ preventScroll: true });
 }
 
 // Reflect a category change locally so counts and the filter panel update
@@ -2485,6 +2561,40 @@ document.addEventListener('contextmenu', e => {
   openImageContextMenu(path, e.clientX, e.clientY);
 });
 
+gridContextMenu.addEventListener('keydown', e => {
+  const items = [...gridContextMenu.querySelectorAll('[role="menuitem"]')];
+  const index = items.indexOf(document.activeElement);
+
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation();
+    closeGridContextMenu({ restoreFocus: true });
+    return;
+  }
+
+  if (e.key === 'Tab') {
+    closeGridContextMenu({ restoreFocus: true });
+    return;
+  }
+
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End') {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!items.length) return;
+    let next = index;
+    if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = items.length - 1;
+    else if (e.key === 'ArrowDown') next = (index + 1 + items.length) % items.length;
+    else next = (index - 1 + items.length) % items.length;
+    items[next].focus({ preventScroll: true });
+    return;
+  }
+
+  // Keep menu-item activation and other keystrokes from triggering the app's
+  // global image-grid shortcuts behind the open menu.
+  e.stopPropagation();
+});
+
 // Keep the menu glued to where it was opened rather than letting it drift on
 // scroll/resize; simplest is to just dismiss it.
 window.addEventListener('resize', closeGridContextMenu);
@@ -2551,7 +2661,10 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     e.preventDefault();
     if (state.shortcutsOpen) { setShortcutsOpen(false); return; }
-    if (gridContextMenu.classList.contains('open')) { closeGridContextMenu(); return; }
+    if (gridContextMenu.classList.contains('open')) {
+      closeGridContextMenu({ restoreFocus: true });
+      return;
+    }
     if (state.settingsOpen) { setSettingsOpen(false); return; }
     if (state.uiHidden)     { setUiHidden(false);     return; }
     return;
