@@ -28,6 +28,11 @@ const STARTUP_WATCHDOG_INIT_MS = 15000;
 const STARTUP_WATCHDOG_SCAN_MS = 20000;
 const STARTUP_WATCHDOG_IMAGE_MS = 15000;
 const CATEGORIZED_LARGE_LIBRARY_THRESHOLD = 2000;
+// Locked cells: the image stays put while the rest of the board refreshes, and
+// the image is filed into this category so it can be found later in the
+// image-categorizer app (the user created this exact category name there).
+const PREVIOUSLY_PINNED_CATEGORY = 'Previously pinned';
+const LOCKED_IMAGES_STORAGE_KEY = 'superImageViewer.lockedImages';
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -54,6 +59,12 @@ const state = {
   chronoOffset: 0,        // index into allImages for chrono mode
 
   displayedSlots: [],     // (string|null)[] — null = intentional empty slot
+
+  // Locked cells — Map<path, {path, index}>. A locked image keeps its slot
+  // across every board refresh/shuffle/slideshow advance, persists across
+  // sessions and windows (localStorage), and is filed into the "Previously
+  // pinned" categorizer category. `index` is its preferred grid position.
+  lockedImages: new Map(),
 
   slideshow:         false,
   slideshowDuration: 5000,
@@ -244,9 +255,11 @@ function applyGridLayout(count) {
 // ==============================
 // Image selection
 // ==============================
-function pickRandom(n) {
+function pickRandom(n, exclude = null) {
   if (!state.allImages.length) return [];
-  const pool   = state.allImages.slice();
+  const pool   = exclude
+    ? state.allImages.filter(img => !exclude.has(img.path))
+    : state.allImages.slice();
   const result = [];
   while (result.length < n && pool.length) {
     const idx = Math.floor(Math.random() * pool.length);
@@ -255,33 +268,52 @@ function pickRandom(n) {
   return result;
 }
 
-function pickChrono(n, offset) {
-  return state.allImages
-    .slice(Math.max(0, offset), offset + n)
-    .map(img => img.path);
+// `exclude` (locked images already placed) is filtered out after slicing from
+// `offset`, so the chrono page start still indexes into the full timeline.
+function pickChrono(n, offset, exclude = null) {
+  let list = state.allImages.slice(Math.max(0, offset));
+  if (exclude) list = list.filter(img => !exclude.has(img.path));
+  return list.slice(0, n).map(img => img.path);
 }
 
-// Build a slot array: image paths + null empty slots, all shuffled together
+// Build a slot array: image paths + null empty slots, all shuffled together.
+// Locked images are reserved at their saved positions first, kept out of the
+// random/chrono pick so they never appear twice, and everything else fills in
+// around them — so a refresh reshuffles the board but never a locked cell.
 function generateSlots(chronoOffset = state.chronoOffset) {
-  const total   = state.imageCount;
-  const empties = Math.min(state.emptyCount, total - 1);
-  const imgN    = total - empties;
+  const total    = state.imageCount;
+  const reserved = lockedReservations(total);     // Map<index, path>
+  const lockedPaths  = new Set(reserved.values());
+  const lockedCount  = reserved.size;
+
+  let empties = Math.min(state.emptyCount, total - 1);
+  empties     = Math.min(empties, Math.max(0, total - lockedCount));
+  const imgN      = total - empties;
+  const freshImgN = Math.max(0, imgN - lockedCount);
 
   const paths = state.displayMode === 'random'
-    ? pickRandom(imgN)
-    : pickChrono(imgN, chronoOffset);
+    ? pickRandom(freshImgN, lockedPaths)
+    : pickChrono(freshImgN, chronoOffset, lockedPaths);
 
-  // Pad with nulls if fewer images than requested (e.g. small folder)
-  const imagePart = [
+  // Non-locked slot contents: fresh images, padding nulls, and empty slots,
+  // shuffled together — then poured into the positions locks didn't claim.
+  const nonLocked = [
     ...paths,
-    ...Array(Math.max(0, imgN - paths.length)).fill(null),
+    ...Array(Math.max(0, freshImgN - paths.length)).fill(null),
+    ...Array(empties).fill(null),
   ];
-  const slots = [...imagePart, ...Array(empties).fill(null)];
-
-  // Fisher-Yates shuffle
-  for (let i = slots.length - 1; i > 0; i--) {
+  for (let i = nonLocked.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [slots[i], slots[j]] = [slots[j], slots[i]];
+    [nonLocked[i], nonLocked[j]] = [nonLocked[j], nonLocked[i]];
+  }
+
+  const slots = new Array(total).fill(undefined);
+  for (const [index, path] of reserved) {
+    if (index >= 0 && index < total) slots[index] = path;
+  }
+  let k = 0;
+  for (let i = 0; i < total; i++) {
+    if (slots[i] === undefined) slots[i] = k < nonLocked.length ? nonLocked[k++] : null;
   }
   return slots;
 }
@@ -298,7 +330,9 @@ function pushHistory(slots, chronoOffset) {
 }
 
 function restoreEntry(entry, options = {}) {
-  state.displayedSlots = [...entry.slots];
+  // Overlay locks onto a copy so a locked cell never changes even when an older
+  // set is replayed; the stored history entry itself is left untouched.
+  state.displayedSlots = overlayLocks([...entry.slots]);
   state.chronoOffset   = entry.chronoOffset;
   renderGrid(state.displayedSlots, options);
 }
@@ -407,6 +441,154 @@ async function loadAutoSlideshowSource() {
 }
 
 // ==============================
+// Locked cells
+// ==============================
+function isLocked(path) {
+  return !!path && state.lockedImages.has(path);
+}
+
+function loadLockedImages() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LOCKED_IMAGES_STORAGE_KEY) || '[]');
+    state.lockedImages = new Map();
+    if (Array.isArray(raw)) {
+      for (const entry of raw) {
+        if (entry && typeof entry.path === 'string') {
+          const index = Number.isInteger(entry.index) ? entry.index : null;
+          state.lockedImages.set(entry.path, { path: entry.path, index });
+        }
+      }
+    }
+  } catch {
+    state.lockedImages = new Map();
+  }
+}
+
+function persistLockedImages() {
+  try {
+    const list = [...state.lockedImages.values()].map(lock => ({ path: lock.path, index: lock.index }));
+    localStorage.setItem(LOCKED_IMAGES_STORAGE_KEY, JSON.stringify(list));
+  } catch { /* ignore */ }
+}
+
+// Which grid positions locked images should occupy for a `total`-slot board.
+// Only locks whose image is in the current pool are placed; each keeps its
+// saved slot when free, and any that collide (or have no saved slot) drop into
+// the next open position. Returns Map<index, path>.
+function lockedReservations(total) {
+  const byIndex = new Map();
+  if (!state.lockedImages.size || total <= 0) return byIndex;
+  const poolPaths = new Set(state.allImages.map(img => img.path));
+  const used = new Set();
+  const pending = [];
+  for (const lock of state.lockedImages.values()) {
+    if (!poolPaths.has(lock.path)) continue;
+    const idx = lock.index;
+    if (Number.isInteger(idx) && idx >= 0 && idx < total && !used.has(idx)) {
+      byIndex.set(idx, lock.path);
+      used.add(idx);
+    } else {
+      pending.push(lock.path);
+    }
+  }
+  let free = 0;
+  for (const path of pending) {
+    while (free < total && used.has(free)) free++;
+    if (free >= total) break;
+    byIndex.set(free, path);
+    used.add(free);
+  }
+  return byIndex;
+}
+
+// Force locked images onto an already-built slot array (history replay), so a
+// locked cell shows its pinned image no matter which past set is restored.
+// Mutates and returns the passed array.
+function overlayLocks(slots) {
+  if (!state.lockedImages.size || !slots.length) return slots;
+  const reserved = lockedReservations(slots.length);
+  if (!reserved.size) return slots;
+  const lockedPaths = new Set(reserved.values());
+  for (let i = 0; i < slots.length; i++) {
+    if (lockedPaths.has(slots[i]) && reserved.get(i) !== slots[i]) slots[i] = null;
+  }
+  for (const [index, path] of reserved) {
+    if (index >= 0 && index < slots.length) slots[index] = path;
+  }
+  return slots;
+}
+
+// Toggle the `.locked` decoration on every occupied cell to match current
+// lock state — used after a lock/unlock that doesn't rebuild the grid.
+function refreshLockedCellDecorations() {
+  imageGrid.querySelectorAll('.grid-cell').forEach(cell => {
+    if (cell.classList.contains('empty-slot')) {
+      cell.classList.remove('locked');
+      return;
+    }
+    const img = cell.querySelector('img');
+    const path = img && img.getAttribute('data-src');
+    cell.classList.toggle('locked', isLocked(path));
+  });
+}
+
+// File a pinned image into the "Previously pinned" category so it can be found
+// later in the image-categorizer app. Uses the active categorized root when
+// browsing one; otherwise locates the nearest categorizer sidecar above the
+// file. Silently no-ops when the image isn't inside any categorizer library.
+async function filePreviouslyPinned(path) {
+  try {
+    let root = null;
+    if (state.browseMode === 'categorized' && state.categorizedRoot) {
+      root = state.categorizedRoot;
+    } else if (window.viewerAPI.findCategorizerRoot) {
+      root = await window.viewerAPI.findCategorizerRoot(path).catch(() => null);
+    }
+    if (!root) return false;
+    await window.viewerAPI.setImageCategory(root, path, PREVIOUSLY_PINNED_CATEGORY);
+    // Keep the category panel/counts current when it's the root we're browsing.
+    if (state.browseMode === 'categorized' && state.categorizedRoot === root) {
+      applyLocalCategoryChange(path, PREVIOUSLY_PINNED_CATEGORY);
+    }
+    return true;
+  } catch (error) {
+    console.error('Failed to file image into Previously pinned:', error);
+    return false;
+  }
+}
+
+function lockImage(path) {
+  if (!path || isLocked(path)) return;
+  const index = state.displayedSlots.indexOf(path);
+  state.lockedImages.set(path, { path, index: index >= 0 ? index : null });
+  persistLockedImages();
+  refreshLockedCellDecorations();
+  // The warmed-up next slideshow set was planned without this lock.
+  clearSlideshowPreload();
+  if (state.slideshow) scheduleSlideshowPreload();
+  filePreviouslyPinned(path).then(filed => {
+    showToast(filed ? `Locked · filed under “${PREVIOUSLY_PINNED_CATEGORY}”` : 'Locked');
+  });
+}
+
+// Unlocking only lifts the pin — the image stays in the "Previously pinned"
+// category on disk (that's the point: find it there after unlocking).
+function unlockImage(path) {
+  if (!isLocked(path)) return;
+  state.lockedImages.delete(path);
+  persistLockedImages();
+  refreshLockedCellDecorations();
+  clearSlideshowPreload();
+  if (state.slideshow) scheduleSlideshowPreload();
+  showToast('Unlocked');
+}
+
+function toggleLock(path) {
+  if (isLocked(path)) unlockImage(path);
+  else lockImage(path);
+}
+
+// ==============================
 // Render grid
 // ==============================
 function applyImageSlot(img, slot) {
@@ -456,6 +638,7 @@ function renderGrid(slots, options = {}) {
 
     if (slot === null) {
       cell.classList.add('empty-slot');
+      cell.classList.remove('locked');
       setCellAccessibility(cell, null);
       const img = cell.querySelector('img');
       if (img) {
@@ -464,6 +647,7 @@ function renderGrid(slots, options = {}) {
       }
     } else {
       cell.classList.remove('empty-slot');
+      cell.classList.toggle('locked', isLocked(slot));
       let img = cell.querySelector('img');
       if (!img) {
         img = document.createElement('img');
@@ -511,11 +695,100 @@ function setCellAccessibility(cell, path) {
   }
 }
 
+// ==============================
+// Tile reordering (Ctrl-drag)
+// ==============================
+// Ctrl/Cmd + drag picks up a tile and drops it on another to swap their grid
+// positions; plain drag still pans within the cell. A locked tile reorders like
+// any other — when it lands, its lock remembers the new slot, so the new
+// position also sticks through later refreshes.
+let reorderGhostEl = null;
+let reorderTargetCell = null;
+
+function cellUnderPoint(x, y) {
+  const el = document.elementFromPoint(x, y);
+  const cell = el && el.closest ? el.closest('.grid-cell') : null;
+  return cell && imageGrid.contains(cell) ? cell : null;
+}
+
+function cellIndex(cell) {
+  return cell ? [...imageGrid.querySelectorAll('.grid-cell')].indexOf(cell) : -1;
+}
+
+function setReorderTargetCell(cell) {
+  if (reorderTargetCell === cell) return;
+  if (reorderTargetCell) reorderTargetCell.classList.remove('reorder-target');
+  reorderTargetCell = cell || null;
+  if (reorderTargetCell) reorderTargetCell.classList.add('reorder-target');
+}
+
+function createReorderGhost(sourceCell) {
+  removeReorderGhost();
+  const img = sourceCell.querySelector('img');
+  if (!img) return;
+  const ghost = document.createElement('div');
+  ghost.className = 'reorder-ghost';
+  const clone = document.createElement('img');
+  clone.src = img.currentSrc || img.src;
+  clone.alt = '';
+  clone.draggable = false;
+  ghost.appendChild(clone);
+  document.body.appendChild(ghost);
+  reorderGhostEl = ghost;
+}
+
+function moveReorderGhost(x, y) {
+  if (!reorderGhostEl) return;
+  reorderGhostEl.style.left = `${x}px`;
+  reorderGhostEl.style.top = `${y}px`;
+}
+
+function removeReorderGhost() {
+  if (reorderGhostEl) {
+    reorderGhostEl.remove();
+    reorderGhostEl = null;
+  }
+}
+
+function endReorderVisuals(sourceCell) {
+  if (sourceCell) sourceCell.classList.remove('reorder-source');
+  setReorderTargetCell(null);
+  removeReorderGhost();
+}
+
+// If the image now sitting at `index` is locked, repin the lock to it so the
+// hand-placed position survives future board refreshes. Returns whether it
+// changed anything.
+function restickLockAt(index) {
+  const path = state.displayedSlots[index];
+  if (path && state.lockedImages.has(path)) {
+    state.lockedImages.set(path, { path, index });
+    return true;
+  }
+  return false;
+}
+
+function commitReorder(sourceCell, targetCell) {
+  const from = cellIndex(sourceCell);
+  const to = cellIndex(targetCell);
+  const slots = state.displayedSlots;
+  if (from === -1 || to === -1 || from === to) return;
+  if (from >= slots.length || to >= slots.length) return;
+  [slots[from], slots[to]] = [slots[to], slots[from]];
+  let lockChanged = restickLockAt(from);
+  lockChanged = restickLockAt(to) || lockChanged;
+  if (lockChanged) persistLockedImages();
+  renderGrid(slots);
+  syncHistoryHead();               // keep the current set's history entry in sync
+  if (state.slideshow) rescheduleSlideshowTick();
+}
+
 // Wires per-cell drag-to-pan / wheel-to-zoom / click-to-open-floating-view.
 // Attached once per .grid-cell element (cells are reused across renders), so
 // it always looks up the current <img> inside the cell at interaction time.
 function attachCellInteractions(cell) {
   let drag = null;
+  let reorder = null;
 
   // This transparent, keyboard-only button leaves all pointer interaction on
   // the cell unchanged while giving each occupied image a proper accessible
@@ -568,6 +841,17 @@ function attachCellInteractions(cell) {
       return;
     }
     const img = cell.querySelector('img');
+
+    // Ctrl/Cmd + drag reorders tiles (swap positions) instead of panning the
+    // image within its cell.
+    if (e.ctrlKey || e.metaKey) {
+      if (!img || !img.getAttribute('data-src') || cell.classList.contains('empty-slot')) return;
+      reorder = { pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, active: false };
+      try { cell.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+      e.preventDefault();
+      return;
+    }
+
     if (!img || !img.naturalWidth) return;
     drag = {
       pointerId: e.pointerId,
@@ -581,6 +865,21 @@ function attachCellInteractions(cell) {
   });
 
   cell.addEventListener('pointermove', e => {
+    if (reorder && e.pointerId === reorder.pointerId) {
+      const rdx = e.clientX - reorder.startX;
+      const rdy = e.clientY - reorder.startY;
+      if (!reorder.active) {
+        if (Math.hypot(rdx, rdy) < MANUAL_DRAG_THRESHOLD_PX) return;
+        reorder.active = true;
+        cell.classList.add('reorder-source');
+        createReorderGhost(cell);
+      }
+      deferSlideshowTick();
+      moveReorderGhost(e.clientX, e.clientY);
+      const over = cellUnderPoint(e.clientX, e.clientY);
+      setReorderTargetCell(over && over !== cell ? over : null);
+      return;
+    }
     if (!drag || e.pointerId !== drag.pointerId) return;
     const dx = e.clientX - drag.startX;
     const dy = e.clientY - drag.startY;
@@ -604,6 +903,15 @@ function attachCellInteractions(cell) {
   });
 
   function endDrag(e) {
+    if (reorder && e.pointerId === reorder.pointerId) {
+      try { cell.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+      const wasActive = reorder.active;
+      const dropCell = cellUnderPoint(e.clientX, e.clientY);
+      endReorderVisuals(cell);
+      reorder = null;
+      if (wasActive && dropCell && dropCell !== cell) commitReorder(cell, dropCell);
+      return;
+    }
     if (!drag || e.pointerId !== drag.pointerId) return;
     const wasDragging = drag.dragging;
     try { cell.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
@@ -612,7 +920,11 @@ function attachCellInteractions(cell) {
     if (!wasDragging) openFloatingImage(cell);
   }
   cell.addEventListener('pointerup', endDrag);
-  cell.addEventListener('pointercancel', () => {
+  cell.addEventListener('pointercancel', e => {
+    if (reorder && e.pointerId === reorder.pointerId) {
+      endReorderVisuals(cell);
+      reorder = null;
+    }
     cell.classList.remove('panning');
     drag = null;
   });
@@ -680,7 +992,7 @@ function buildNextSlideshowPlan() {
   if (hist.pos < hist.stack.length - 1) {
     const entry = hist.stack[hist.pos + 1];
     return {
-      slots: [...entry.slots],
+      slots: overlayLocks([...entry.slots]),
       chronoOffset: entry.chronoOffset,
       fromHistory: true,
     };
@@ -826,8 +1138,16 @@ function navigateForward() {
 function shuffleCurrent() {
   if (!state.displayedSlots.length) return;
   const slots = [...state.displayedSlots];
-  for (let i = slots.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+  // Shuffle only the positions that aren't locked, so pinned cells hold both
+  // their image and their place while everything else rearranges around them.
+  const movable = [];
+  for (let i = 0; i < slots.length; i++) {
+    if (!isLocked(slots[i])) movable.push(i);
+  }
+  for (let a = movable.length - 1; a > 0; a--) {
+    const b = Math.floor(Math.random() * (a + 1));
+    const i = movable[a];
+    const j = movable[b];
     [slots[i], slots[j]] = [slots[j], slots[i]];
   }
   state.displayedSlots = slots;
@@ -1383,14 +1703,34 @@ function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = nul
   actionSeparator.setAttribute('role', 'separator');
   gridContextMenu.append(actionSeparator);
 
+  // Lock — pins this cell so board refreshes never swap its image, and files
+  // the image into the "Previously pinned" category. Available in every mode.
+  const locked = isLocked(path);
+  const lockBtn = document.createElement('button');
+  lockBtn.type = 'button';
+  lockBtn.setAttribute('role', 'menuitem');
+  lockBtn.classList.toggle('current', locked);
+  const lockLabel = document.createElement('span');
+  lockLabel.textContent = locked ? 'Unlock image' : 'Lock image';
+  lockBtn.append(lockLabel);
+  lockBtn.addEventListener('click', () => {
+    closeGridContextMenu({ restoreFocus: true });
+    toggleLock(path);
+  });
+  gridContextMenu.append(lockBtn);
+
   // Hide — available in every browse mode; view-only, no categorization change.
+  // Disabled while locked: a pinned cell shouldn't be pulled off the board.
   const hideBtn = document.createElement('button');
   hideBtn.type = 'button';
   hideBtn.setAttribute('role', 'menuitem');
+  hideBtn.disabled = locked;
+  if (locked) hideBtn.title = 'Unlock to hide';
   const hideLabel = document.createElement('span');
   hideLabel.textContent = 'Hide image';
   hideBtn.append(hideLabel);
   hideBtn.addEventListener('click', () => {
+    if (isLocked(path)) return;
     closeGridContextMenu({ restoreFocus: true });
     hideImage(path);
   });
@@ -1436,7 +1776,7 @@ function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = nul
   }
 
   openGridContextMenu(x, y);
-  if (focusMenu) hideBtn.focus({ preventScroll: true });
+  if (focusMenu) lockBtn.focus({ preventScroll: true });
 }
 
 // Reflect a category change locally so counts and the filter panel update
@@ -2562,7 +2902,7 @@ document.addEventListener('contextmenu', e => {
 });
 
 gridContextMenu.addEventListener('keydown', e => {
-  const items = [...gridContextMenu.querySelectorAll('[role="menuitem"]')];
+  const items = [...gridContextMenu.querySelectorAll('[role="menuitem"]:not(:disabled)')];
   const index = items.indexOf(document.activeElement);
 
   if (e.key === 'Escape') {
@@ -2772,6 +3112,9 @@ armStartupWatchdog();
       setTimeout(finish, 200);
     });
     windowLabel = await window.viewerAPI.getWindowLabel().catch(() => 'main');
+    // Restore locked cells before any pool loads so the first board rebuilds
+    // with pinned images already in place.
+    loadLockedImages();
     const s = await window.viewerAPI.loadSettings();
 
     state.imageCount       = Math.max(4, Math.min(99, s.imageCount || 9));

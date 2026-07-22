@@ -19,6 +19,7 @@
   --btn-hover:   #272727;
   --btn-active:  #333;
   --cell-bg:     #0a0a0a;
+  --lock-border: #ffb02e;
   --gap:         2px;
 }
 
@@ -713,6 +714,55 @@ body.zoom-fill-cover .grid-cell img {
     width 0.12s ease, height 0.12s ease;
 }
 
+/* Locked cell — pinned image the board won't swap on refresh. Marked only by a
+   distinct amber inset frame (kept clear of the blue :focus-within outline).
+   The overlay is non-interactive so panning/clicking still work. Locked cells
+   are never empty, so ::after is free here. */
+.grid-cell.locked::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 2px solid var(--lock-border);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* Ctrl-drag tile reordering — the picked-up tile dims, the drop target gets an
+   accent outline (outline, not ::after, so it composes with a locked cell's
+   amber frame), and a floating thumbnail follows the cursor. */
+.grid-cell.reorder-source {
+  opacity: 0.35;
+}
+
+.grid-cell.reorder-target {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.reorder-ghost {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 108px;
+  height: 108px;
+  transform: translate(-50%, -50%);
+  border-radius: 6px;
+  overflow: hidden;
+  border: 2px solid var(--accent);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+  opacity: 0.9;
+  z-index: 500;
+}
+
+.reorder-ghost img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
 /* Empty slot — intentionally blank, subtle visual cue */
 .grid-cell.empty-slot {
   background: #0d0d0d;
@@ -1000,9 +1050,14 @@ body.ui-hidden #settings-panel {
   gap: 10px;
 }
 
-.context-menu button:hover {
+.context-menu button:hover:not(:disabled) {
   background: var(--btn-hover);
   color: #fff;
+}
+
+.context-menu button:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .context-menu button.current {

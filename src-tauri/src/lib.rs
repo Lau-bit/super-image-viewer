@@ -956,6 +956,24 @@ async fn set_image_category(root: String, path: String, category: String) -> Res
         .map_err(|error| format!("Failed to set image category: {error}"))?
 }
 
+// Walk up from an image's folder to the nearest ancestor holding a categorizer
+// sidecar, so a locked image can be filed into "Previously pinned" even when
+// browsing plain folders (not a categorized root). None if it's outside any
+// categorizer library.
+#[tauri::command]
+fn find_categorizer_root(path: String) -> Option<String> {
+    let file = PathBuf::from(&path);
+    let mut dir = file.parent()?.to_path_buf();
+    loop {
+        if dir.join(CATEGORIZER_SIDECAR_FILE_NAME).is_file() {
+            return Some(dir.to_string_lossy().into_owned());
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 #[tauri::command]
 fn load_settings(app: AppHandle) -> Settings {
     load_settings_inner(&app)
@@ -1372,6 +1390,7 @@ pub fn run() {
             list_multi_folder_images,
             scan_categorized_root,
             set_image_category,
+            find_categorizer_root,
             load_settings,
             get_window_label,
             reset_window_position_preset,

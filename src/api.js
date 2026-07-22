@@ -26,6 +26,7 @@ window.viewerAPI = {
   onCategorizedScanProgress: (callback) =>
     listen('categorized-scan-progress', event => callback(event.payload)),
   setImageCategory: (root, path, category) => invoke('set_image_category', { root, path, category }),
+  findCategorizerRoot: (path) => invoke('find_categorizer_root', { path }),
   loadSettings: () => invoke('load_settings'),
   saveSettings: (settings) => invoke('save_settings', { settings }),
   getWindowLabel: () => invoke('get_window_label'),
