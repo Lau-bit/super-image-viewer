@@ -19,16 +19,16 @@
       <span id="titlebar-title">Super Image Viewer</span>
     </div>
     <div id="titlebar-controls">
-      <button id="btn-settings" title="Settings">&#x2699;</button>
-      <button id="btn-minimize" title="Minimize">&#x2212;</button>
-      <button id="btn-close" title="Close">&#x2715;</button>
+      <button id="btn-settings" aria-label="Settings">&#x2699;</button>
+      <button id="btn-minimize" aria-label="Minimize window">&#x2212;</button>
+      <button id="btn-close" aria-label="Close window">&#x2715;</button>
     </div>
   </div>
 
   <!-- Toolbar -->
   <div id="toolbar">
     <div id="folder-wrapper">
-      <button id="btn-folder" title="Open / manage image sources" aria-label="Open / manage image sources">
+      <button id="btn-folder" aria-label="Open / manage image sources">
         <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M3.75 6.75h6.1l1.8 2.1h8.6v8.4a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2V6.75Z"></path>
           <path d="M3.75 9.25h16.5"></path>
@@ -79,7 +79,7 @@
           <div id="categories-panel-bulk">
             <button type="button" id="categories-select-all">All</button>
             <button type="button" id="categories-select-none">None</button>
-            <button type="button" id="categories-rescan" title="Rescan categorized root">&#x21BB;</button>
+            <button type="button" id="categories-rescan" aria-label="Rescan categorized root">&#x21BB;</button>
           </div>
           <div id="categories-list"></div>
         </div>
@@ -88,57 +88,57 @@
     <span id="folder-name" class="folder-name"></span>
 
     <!-- Image count -->
-    <div class="stepper-control" title="Images per set (4&#x2013;99)">
-      <button id="btn-count-dec" title="Fewer images">&#x2212;</button>
+    <div class="stepper-control" role="group" aria-label="Images per set (4 to 99)">
+      <button id="btn-count-dec" aria-label="Fewer images per set">&#x2212;</button>
       <span id="count-display">9</span>
-      <button id="btn-count-inc" title="More images">+</button>
+      <button id="btn-count-inc" aria-label="More images per set">+</button>
     </div>
 
     <!-- Empty slots -->
-    <div class="stepper-control" title="Empty slots for breathing room">
-      <span class="stepper-label">&#x25A2;</span>
-      <button id="btn-empty-dec" title="Fewer empty slots">&#x2212;</button>
+    <div class="stepper-control" role="group" aria-label="Empty slots for breathing room">
+      <span class="stepper-label" aria-hidden="true">&#x25A2;</span>
+      <button id="btn-empty-dec" aria-label="Fewer empty slots">&#x2212;</button>
       <span id="empty-display">0</span>
-      <button id="btn-empty-inc" title="More empty slots">+</button>
+      <button id="btn-empty-inc" aria-label="More empty slots">+</button>
     </div>
 
     <!-- Display mode -->
-    <div id="mode-buttons">
-      <button id="btn-mode-random" class="mode-btn active" title="Random images">Random</button>
-      <button id="btn-mode-chrono" class="mode-btn"        title="Recent images by date">Recent</button>
+    <div id="mode-buttons" role="group" aria-label="Display mode">
+      <button id="btn-mode-random" class="mode-btn active" aria-label="Random images" aria-pressed="true">Random</button>
+      <button id="btn-mode-chrono" class="mode-btn"        aria-label="Recent images by date" aria-pressed="false">Recent</button>
     </div>
 
     <!-- Fill/crop controls -->
-    <div id="zoom-fill-controls">
-      <button id="btn-zoom-fill" class="toggle-btn" title="Toggle zoom to fill">Fill</button>
-      <button id="btn-zoom-level-1" class="zoom-level-btn active" title="Zoom to fill level 1">Z1</button>
-      <button id="btn-zoom-level-2" class="zoom-level-btn" title="Zoom to fill level 2">Z2</button>
-      <button id="btn-zoom-level-3" class="zoom-level-btn" title="Zoom to fill level 3">Z3</button>
-      <input id="zoom-fill-slider" type="range" min="0" max="100" step="1" value="30" title="Zoom to fill amount">
-      <div id="zoom-bias-control" title="Nudge zoom-to-fill centering">
-        <button id="btn-bias-left" data-bias-direction="L" title="Bias left">L</button>
+    <div id="zoom-fill-controls" role="group" aria-label="Zoom to fill">
+      <button id="btn-zoom-fill" class="toggle-btn" aria-label="Toggle zoom to fill" aria-pressed="true">Fill</button>
+      <button id="btn-zoom-level-1" class="zoom-level-btn active" aria-label="Zoom to fill level 1" aria-pressed="false">Z1</button>
+      <button id="btn-zoom-level-2" class="zoom-level-btn" aria-label="Zoom to fill level 2" aria-pressed="true">Z2</button>
+      <button id="btn-zoom-level-3" class="zoom-level-btn" aria-label="Zoom to fill level 3" aria-pressed="false">Z3</button>
+      <input id="zoom-fill-slider" type="range" min="0" max="100" step="1" value="30" aria-label="Zoom to fill amount">
+      <div id="zoom-bias-control" role="group" aria-label="Nudge zoom-to-fill centering">
+        <button id="btn-bias-left" data-bias-direction="L" aria-label="Bias left">L</button>
         <div class="zoom-bias-middle">
-          <button id="btn-bias-up" data-bias-direction="U" title="Bias up">U</button>
-          <span id="zoom-bias-display" title="Reset bias"><span id="zoom-bias-letter"></span><span id="zoom-bias-value">0</span></span>
-          <button id="btn-bias-down" data-bias-direction="D" title="Bias down">D</button>
+          <button id="btn-bias-up" data-bias-direction="U" aria-label="Bias up">U</button>
+          <span id="zoom-bias-display" role="button" tabindex="0" aria-label="Reset zoom bias"><span id="zoom-bias-letter" aria-hidden="true"></span><span id="zoom-bias-value" aria-hidden="true">0</span></span>
+          <button id="btn-bias-down" data-bias-direction="D" aria-label="Bias down">D</button>
         </div>
-        <button id="btn-bias-right" data-bias-direction="R" title="Bias right">R</button>
+        <button id="btn-bias-right" data-bias-direction="R" aria-label="Bias right">R</button>
       </div>
     </div>
 
     <!-- Slideshow -->
-    <button id="btn-slideshow" class="toggle-btn" title="Slideshow &#x2014; auto-advance sets">&#x23F5;</button>
+    <button id="btn-slideshow" class="toggle-btn" aria-label="Slideshow — auto-advance sets" aria-pressed="false">&#x23F5;</button>
 
     <!-- Shuffle current set -->
-    <button id="btn-shuffle" title="Shuffle current set">&#x21C4;</button>
+    <button id="btn-shuffle" aria-label="Shuffle current set">&#x21C4;</button>
 
     <!-- New random set -->
-    <button id="btn-refresh" title="New set (Space)">&#x21BA;</button>
+    <button id="btn-refresh" aria-label="New set">&#x21BA;</button>
 
     <!-- History navigation -->
-    <div id="nav-buttons">
-      <button id="btn-nav-prev" title="Previous set (&#x2190;)" disabled>&#x25C4;</button>
-      <button id="btn-nav-next" title="Next set (&#x2192;)">&#x25BA;</button>
+    <div id="nav-buttons" role="group" aria-label="Set history">
+      <button id="btn-nav-prev" aria-label="Previous set" disabled>&#x25C4;</button>
+      <button id="btn-nav-next" aria-label="Next set">&#x25BA;</button>
     </div>
   </div>
 
@@ -149,8 +149,11 @@
     <span id="startup-loading-hint" hidden></span>
   </div>
 
+  <!-- Screen-reader / agent announcements (visually hidden, politely announced) -->
+  <div id="a11y-status" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+
   <!-- Image grid (populated by JS) -->
-  <div id="image-grid"></div>
+  <div id="image-grid" role="group" aria-label="Image grid"></div>
 
   <!-- Empty state shown until a folder is selected -->
   <div id="empty-state">
@@ -160,8 +163,8 @@
   </div>
 
   <!-- Settings panel -->
-  <div id="settings-panel">
-    <div class="settings-title">Settings</div>
+  <div id="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" aria-hidden="true">
+    <div class="settings-title" id="settings-title">Settings</div>
 
     <div class="settings-section-title">Window</div>
     <button type="button" class="settings-btn" id="setting-save-first-window">Save as 1st window default</button>
@@ -173,6 +176,12 @@
       <span>Square app outer corners</span>
     </label>
 
+    <div class="settings-section-title">Accessibility</div>
+    <label class="settings-option">
+      <input type="checkbox" id="setting-focus-indicators" checked>
+      <span>Keyboard focus outline</span>
+    </label>
+
     <div class="settings-section-title">Images (4&#x2013;99)</div>
     <label class="settings-option">
       <span class="settings-label">Count</span>
@@ -181,9 +190,10 @@
     </label>
 
     <div class="settings-section-title">Categorized</div>
-    <label class="settings-option" title="When you categorize an image into a category that isn't currently shown, hide it immediately and pull in a replacement">
-      <input type="checkbox" id="setting-instant-filter">
+    <label class="settings-option">
+      <input type="checkbox" id="setting-instant-filter" aria-describedby="setting-instant-filter-help">
       <span>Instant filter on categorize</span>
+      <span id="setting-instant-filter-help" class="settings-option-help">When you categorize an image into a category that isn't currently shown, hide it immediately and pull in a replacement.</span>
     </label>
 
     <div class="settings-section-title">Slideshow</div>
@@ -211,10 +221,10 @@
   <!-- Shortcut reference (?); deliberately outside the ui-hidden chrome so it
        still answers "how do I get the UI back?" while the UI is hidden. -->
   <div id="shortcuts-overlay">
-    <div id="shortcuts-panel">
+    <div id="shortcuts-panel" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
       <div class="shortcuts-header">
-        <span class="shortcuts-title">Keyboard shortcuts</span>
-        <button type="button" id="shortcuts-close" title="Close">&#10005;</button>
+        <span class="shortcuts-title" id="shortcuts-title">Keyboard shortcuts</span>
+        <button type="button" id="shortcuts-close" aria-label="Close keyboard shortcuts">&#10005;</button>
       </div>
 
       <div class="shortcuts-columns">

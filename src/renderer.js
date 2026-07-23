@@ -77,7 +77,20 @@ const state = {
   uiHidden:     false,
   settingsOpen: false,
   shortcutsOpen: false,
+
+  // Agent-safe mode: when on, categories in AGENT_BLOCKED_CATEGORIES can never
+  // enter the shown set (see window.SIV). Off for normal human use.
+  agentSafe:    false,
 };
+
+// Categories an automated agent must never be able to surface. Enforced both at
+// the display layer (categorizedFilteredImages) and in the window.SIV mutators,
+// so "Explicit is one flip away" is no longer true once agent-safe mode is on —
+// and the SIV API refuses these regardless of the mode.
+const AGENT_BLOCKED_CATEGORIES = new Set(['Explicit']);
+function isAgentBlocked(name) {
+  return AGENT_BLOCKED_CATEGORIES.has(name);
+}
 
 // Per-image manual pan/zoom override (grid only) — keyed by <img> so it's
 // automatically dropped once that element is discarded (new image in slot).
@@ -152,6 +165,7 @@ let zoomBiasHoldTimer = null;
 let zoomBiasRepeatPointerId = null;
 const appSettings = {
   squareAppCorners: false,
+  focusIndicators: true,
   zoomFillEnabled: true,
   zoomFillLevel: 2,
   zoomFillAmount: ZOOM_FILL_PRESETS.fill,
@@ -174,6 +188,7 @@ const appSettings = {
 // DOM references
 // ==============================
 const imageGrid          = document.getElementById('image-grid');
+const a11yStatus         = document.getElementById('a11y-status');
 const folderNameEl       = document.getElementById('folder-name');
 const folderButtonLabel  = document.getElementById('folder-button-label');
 const folderPanel        = document.getElementById('folder-panel');
@@ -225,6 +240,7 @@ const settingResetFirstWindow      = document.getElementById('setting-reset-firs
 const settingSaveSecondaryWindow   = document.getElementById('setting-save-secondary-window');
 const settingResetSecondaryWindow  = document.getElementById('setting-reset-secondary-window');
 const settingSquareAppCorners      = document.getElementById('setting-square-app-corners');
+const settingFocusIndicators       = document.getElementById('setting-focus-indicators');
 const settingAutoHideUi            = document.getElementById('setting-auto-hide-ui');
 const settingInstantFilter         = document.getElementById('setting-instant-filter');
 const settingFirstAutoOpenSlideshow = document.getElementById('setting-first-auto-open-slideshow');
@@ -356,7 +372,6 @@ function startupSourceLabel() {
 function syncStartupSourceSettings() {
   settingStartupBrowseMode.value = appSettings.startupBrowseMode;
   settingStartupSourceName.textContent = startupSourceLabel();
-  settingStartupSourceName.title = startupSourceLabel();
   syncAutoSlideshowSourceSettings();
 }
 
@@ -613,7 +628,7 @@ function renderGrid(slots, options = {}) {
   // Menu actions capture the image path present when the menu opens. Any grid
   // render can replace that image, so dismiss the menu before changing cells.
   closeGridContextMenu({ restoreFocus: true });
-  const stagger = !!options.stagger;
+  const stagger = !!options.stagger && !prefersReducedMotion();
   const renderToken = ++state.gridRenderToken;
   applyGridLayout(slots.length || state.imageCount);
 
@@ -668,6 +683,7 @@ function renderGrid(slots, options = {}) {
     }
   });
   applyZoomFillToImages();
+  enrichAccessibleOcr();
 
   if (!pendingImageUpdates.length) return;
 
@@ -685,7 +701,7 @@ function setCellAccessibility(cell, path) {
   const button = cell.querySelector('.grid-cell-accessibility');
   if (!button) return;
   if (path) {
-    button.setAttribute('aria-label', `Open image: ${baseName(path)}`);
+    button.setAttribute('aria-label', accessibleImageName(cell, path));
     button.disabled = false;
     button.hidden = false;
   } else {
@@ -693,6 +709,79 @@ function setCellAccessibility(cell, path) {
     button.disabled = true;
     button.removeAttribute('aria-label');
   }
+}
+
+// The accessible name for an image tile. This is the ONLY text a screen reader
+// (or an agent reading the DOM / an aria snapshot) gets for the image, so make
+// it describe the picture, not just its filename: grid position, its category,
+// its OCR text snippet when known, then the filename as a stable handle. OCR is
+// filled in asynchronously by enrichAccessibleOcr(); until it arrives the name
+// still carries position + category + filename.
+function accessibleImageName(cell, path) {
+  const cells = [...imageGrid.querySelectorAll('.grid-cell')];
+  const index = cells.indexOf(cell);
+  const total = cells.length;
+  const parts = [];
+  if (index >= 0 && total) parts.push(`Image ${index + 1} of ${total}`);
+  const category = state.browseMode === 'categorized' ? categoryForPath(path) : null;
+  if (category) parts.push(category);
+  const ocr = ocrTextCache.get(path);
+  if (ocr) parts.push(`“${ocr}”`);
+  parts.push(baseName(path));
+  return parts.join(' — ');
+}
+
+// OCR snippet per image path. '' is a real cached value meaning "fetched, none",
+// so we never re-request it. Keyed by the same path strings the grid uses.
+const ocrTextCache = new Map();
+let ocrFetchToken = 0;
+
+// Re-apply accessible names to every occupied cell (e.g. after OCR arrives).
+function refreshAccessibleNames() {
+  for (const cell of imageGrid.querySelectorAll('.grid-cell')) {
+    if (cell.classList.contains('empty-slot')) continue;
+    const img = cell.querySelector('img');
+    const path = img && img.getAttribute('data-src');
+    if (path) setCellAccessibility(cell, path);
+  }
+}
+
+// 2D roving focus between grid tiles. Columns mirror applyGridLayout's
+// ceil(sqrt(n)); focus lands on the next occupied cell's keyboard button.
+function moveGridFocus(fromCell, key) {
+  const cells = [...imageGrid.querySelectorAll('.grid-cell')];
+  const from = cells.indexOf(fromCell);
+  if (from < 0) return;
+  const cols = Math.max(1, Math.ceil(Math.sqrt(cells.length)));
+  const delta = key === 'ArrowRight' ? 1
+    : key === 'ArrowLeft' ? -1
+    : key === 'ArrowDown' ? cols
+    : -cols;
+  // Step in that direction to the first cell with a usable keyboard button,
+  // so empty slots are skipped rather than trapping focus.
+  for (let target = from + delta; target >= 0 && target < cells.length; target += delta) {
+    const btn = cells[target].querySelector('.grid-cell-accessibility');
+    if (btn && !btn.hidden && !btn.disabled) { btn.focus(); return; }
+  }
+}
+
+// Fetch OCR text for the currently displayed categorized images and refresh
+// their names. Cheap: only the ~16 shown tiles, only the ones not already
+// cached. No-op outside categorized mode.
+async function enrichAccessibleOcr() {
+  if (state.browseMode !== 'categorized' || !state.categorizedRoot) return;
+  if (!window.viewerAPI || !window.viewerAPI.getCategorizedOcr) return;
+  const missing = state.displayedSlots.filter(p => p && !ocrTextCache.has(p));
+  if (!missing.length) return;
+  const token = ++ocrFetchToken;
+  let results;
+  try {
+    results = await window.viewerAPI.getCategorizedOcr(state.categorizedRoot, missing) || [];
+  } catch { return; }
+  for (const r of results) ocrTextCache.set(r.path, r.text);
+  for (const p of missing) if (!ocrTextCache.has(p)) ocrTextCache.set(p, ''); // negative cache
+  if (token !== ocrFetchToken) return; // superseded by a newer fetch
+  refreshAccessibleNames();
 }
 
 // ==============================
@@ -817,6 +906,14 @@ function attachCellInteractions(cell) {
     // this image on Space or Enter.
     if (e.key === ' ' || e.key === 'Enter') {
       e.stopPropagation();
+      return;
+    }
+    // Arrow keys move focus tile-to-tile (2D). Stop propagation so the global
+    // ←/→ "previous/next set" shortcut doesn't also fire while a tile is focused.
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      e.stopPropagation();
+      moveGridFocus(cell, e.key);
       return;
     }
     if (e.key !== 'ContextMenu' && !(e.shiftKey && e.key === 'F10')) return;
@@ -1093,6 +1190,8 @@ function refresh(options = {}) {
   renderGrid(slots, options);
   pushHistory(slots, state.chronoOffset);
   rescheduleSlideshowTick();
+  // Slideshow advances silently; an explicit new set is announced.
+  if (!state.slideshow) announce(`New set — ${slots.filter(Boolean).length} images`);
 }
 
 // ==============================
@@ -1104,6 +1203,7 @@ function navigateBack() {
   restoreEntry(hist.stack[hist.pos], { stagger: state.slideshow });
   syncNavButtons();
   rescheduleSlideshowTick();
+  if (!state.slideshow) announce('Previous set');
 }
 
 function navigateForward() {
@@ -1112,6 +1212,7 @@ function navigateForward() {
     hist.pos++;
     restoreEntry(hist.stack[hist.pos], { stagger: state.slideshow });
     syncNavButtons();
+    if (!state.slideshow) announce('Next set');
   } else {
     const preloadedPlan = state.slideshow ? takeSlideshowPreloadPlan() : null;
     if (preloadedPlan) {
@@ -1153,6 +1254,7 @@ function shuffleCurrent() {
   state.displayedSlots = slots;
   renderGrid(slots);
   pushHistory(slots, state.chronoOffset); // shuffled order becomes a new history entry
+  announce('Shuffled the current set');
 }
 
 // ==============================
@@ -1160,11 +1262,12 @@ function shuffleCurrent() {
 // ==============================
 function syncSlideshowButton() {
   btnSlideshow.classList.toggle('active', state.slideshow);
+  btnSlideshow.setAttribute('aria-pressed', state.slideshow ? 'true' : 'false');
   document.body.classList.toggle('slideshow-active', state.slideshow);
   btnSlideshow.textContent = state.slideshow ? 'ON' : '\u23F5';
-  btnSlideshow.title = state.slideshow
-    ? 'Slideshow is on - click to stop'
-    : 'Slideshow - auto-advance sets';
+  btnSlideshow.setAttribute('aria-label', state.slideshow
+    ? 'Slideshow is on \u2014 click to stop'
+    : 'Slideshow \u2014 auto-advance sets');
 }
 
 function startSlideshow() {
@@ -1416,16 +1519,19 @@ function renderMultiFolderList() {
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.checked = state.multiFolderFilter.has(fileKey(folder));
+    // No <label> wraps this row, so name the checkbox directly. The full path
+    // goes in the accessible name (the visible span is truncated to baseName),
+    // which replaces the old hover tooltip — informative, no mouse tooltip.
+    checkbox.setAttribute('aria-label', `Show images from ${folder}`);
     checkbox.addEventListener('change', () => toggleMultiFolder(folder));
     const name = document.createElement('span');
     name.className = 'multi-folder-name';
     name.textContent = baseName(folder);
-    name.title = folder;
     const remove = document.createElement('button');
     remove.type = 'button';
     remove.className = 'multi-folder-remove';
     remove.textContent = 'x';
-    remove.title = `Remove ${folder}`;
+    remove.setAttribute('aria-label', `Remove ${folder}`);
     remove.addEventListener('click', e => {
       e.stopPropagation();
       removeMultiFolder(folder);
@@ -1489,7 +1595,9 @@ async function toggleMultiFolder(folder) {
 
 function renderCategorizedRootRow() {
   categorizedRootNameEl.textContent = state.categorizedRoot ? baseName(state.categorizedRoot) : 'No root chosen';
-  categorizedRootNameEl.title = state.categorizedRoot || '';
+  // Full path as accessible name (visible text is just the folder name); no tooltip.
+  if (state.categorizedRoot) categorizedRootNameEl.setAttribute('aria-label', state.categorizedRoot);
+  else categorizedRootNameEl.removeAttribute('aria-label');
 }
 
 function renderCategoriesPanel() {
@@ -1502,15 +1610,19 @@ function renderCategoriesPanel() {
     return;
   }
   for (const category of state.categorizedCategories) {
+    const blocked = state.agentSafe && isAgentBlocked(category.name);
     const row = document.createElement('label');
     row.className = 'category-checkbox-row';
+    if (blocked) row.classList.add('category-blocked');
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
-    checkbox.checked = state.categorizedCategoryFilter.has(category.name);
+    checkbox.checked = state.categorizedCategoryFilter.has(category.name) && !blocked;
+    checkbox.disabled = blocked;
     checkbox.addEventListener('change', () => toggleCategorizedCategory(category.name));
     const name = document.createElement('span');
     name.className = 'category-checkbox-name';
     name.textContent = category.name;
+    if (blocked) name.textContent += ' (blocked — agent-safe)';
     const count = document.createElement('span');
     count.className = 'category-checkbox-count';
     count.textContent = category.count;
@@ -1520,7 +1632,9 @@ function renderCategoriesPanel() {
 }
 
 function categorizedFilteredImages() {
-  return state.categorizedImages.filter(image => state.categorizedCategoryFilter.has(image.category));
+  return state.categorizedImages.filter(image =>
+    state.categorizedCategoryFilter.has(image.category)
+    && !(state.agentSafe && isAgentBlocked(image.category)));
 }
 
 function finalizeCategorizedImagePool(images, label) {
@@ -1639,8 +1753,20 @@ async function chooseCategorizedRoot() {
 }
 
 function applyCategorizedFilter() {
+  // In agent-safe mode, blocked categories can't even sit in the filter set, so
+  // the category panel and persisted filter reflect what's actually shown.
+  if (state.agentSafe) {
+    for (const name of [...state.categorizedCategoryFilter]) {
+      if (isAgentBlocked(name)) state.categorizedCategoryFilter.delete(name);
+    }
+  }
   renderCategoriesPanel();
-  loadImagePool(categorizedFilteredImages(), state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized', 'categorized');
+  const filtered = categorizedFilteredImages();
+  loadImagePool(filtered, state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized', 'categorized');
+  const selected = [...state.categorizedCategoryFilter];
+  announce(selected.length
+    ? `Showing ${selected.join(', ')} — ${filtered.length} images`
+    : 'No categories selected');
 }
 
 function toggleCategorizedCategory(name) {
@@ -1653,7 +1779,22 @@ function setAllCategorizedCategories(checked) {
   state.categorizedCategoryFilter = checked
     ? new Set(state.categorizedCategories.map(category => category.name))
     : new Set();
-  applyCategorizedFilter();
+  applyCategorizedFilter(); // sanitizes out blocked categories when agent-safe
+}
+
+// Turn agent-safe mode on/off. On => blocked categories are stripped from the
+// filter, hidden from display, and disabled in the panel; the board is rebuilt
+// so anything currently shown from a blocked category is dropped immediately.
+function setAgentSafe(on) {
+  state.agentSafe = !!on;
+  document.body.classList.toggle('agent-safe', state.agentSafe);
+  if (state.browseMode === 'categorized' && state.categorizedRoot) {
+    applyCategorizedFilter();
+  } else {
+    renderCategoriesPanel();
+  }
+  announce(state.agentSafe ? 'Agent-safe mode on' : 'Agent-safe mode off');
+  return state.agentSafe;
 }
 
 // ==============================
@@ -1725,7 +1866,7 @@ function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = nul
   hideBtn.type = 'button';
   hideBtn.setAttribute('role', 'menuitem');
   hideBtn.disabled = locked;
-  if (locked) hideBtn.title = 'Unlock to hide';
+  if (locked) hideBtn.setAttribute('aria-label', 'Hide — unlock first');
   const hideLabel = document.createElement('span');
   hideLabel.textContent = 'Hide image';
   hideBtn.append(hideLabel);
@@ -1908,6 +2049,7 @@ function pushUndo(entry) {
 
 function hideImage(path) {
   pushUndo({ type: 'hide', path, removal: removeDisplayedImage(path) });
+  announce(`Hid ${baseName(path)}`);
 }
 
 // Ctrl+Z auto-repeats while held, and a categorize undo is an async sidecar
@@ -2068,8 +2210,11 @@ function setDisplayMode(mode) {
 }
 
 function syncModeButtons() {
-  btnModeRandom.classList.toggle('active', state.displayMode === 'random');
-  btnModeChrono.classList.toggle('active', state.displayMode === 'chrono');
+  const random = state.displayMode === 'random';
+  btnModeRandom.classList.toggle('active', random);
+  btnModeChrono.classList.toggle('active', !random);
+  btnModeRandom.setAttribute('aria-pressed', random ? 'true' : 'false');
+  btnModeChrono.setAttribute('aria-pressed', random ? 'false' : 'true');
 }
 
 function normalizeZoomFillLevel(level) {
@@ -2443,19 +2588,26 @@ function syncZoomFillControls() {
   applyZoomFillToImages();
 
   btnZoomFill.classList.toggle('active', fillEnabled);
+  btnZoomFill.setAttribute('aria-pressed', fillEnabled ? 'true' : 'false');
   btnZoomFill.textContent = fillEnabled ? 'Fill' : 'Fit';
-  btnZoomFill.title = coverEnabled
+  btnZoomFill.setAttribute('aria-label', coverEnabled
     ? 'Zoom to fill is on'
     : fillEnabled
       ? 'Partial zoom is on'
-      : 'Zoom to fill is off';
-  btnZoomLevel1.classList.toggle('active', fillEnabled && fillAmount === ZOOM_FILL_PRESETS[1]);
-  btnZoomLevel2.classList.toggle('active', fillEnabled && fillAmount === ZOOM_FILL_PRESETS[2]);
-  btnZoomLevel3.classList.toggle('active', fillEnabled && fillAmount === ZOOM_FILL_PRESETS[3]);
+      : 'Zoom to fill is off');
+  const atLevel1 = fillEnabled && fillAmount === ZOOM_FILL_PRESETS[1];
+  const atLevel2 = fillEnabled && fillAmount === ZOOM_FILL_PRESETS[2];
+  const atLevel3 = fillEnabled && fillAmount === ZOOM_FILL_PRESETS[3];
+  btnZoomLevel1.classList.toggle('active', atLevel1);
+  btnZoomLevel2.classList.toggle('active', atLevel2);
+  btnZoomLevel3.classList.toggle('active', atLevel3);
+  btnZoomLevel1.setAttribute('aria-pressed', atLevel1 ? 'true' : 'false');
+  btnZoomLevel2.setAttribute('aria-pressed', atLevel2 ? 'true' : 'false');
+  btnZoomLevel3.setAttribute('aria-pressed', atLevel3 ? 'true' : 'false');
   zoomFillSlider.value = String(fillAmount);
-  zoomFillSlider.title = fillEnabled
+  zoomFillSlider.setAttribute('aria-label', fillEnabled
     ? `Zoom to fill amount ${fillAmount}`
-    : 'No zoom to fill';
+    : 'No zoom to fill');
   zoomBiasLetter.textContent = direction;
   zoomBiasValue.textContent = String(amount);
 }
@@ -2549,18 +2701,36 @@ function setUiHidden(hidden) {
 // ==============================
 // Settings panel
 // ==============================
+let settingsReturnFocus = null;
 function setSettingsOpen(open) {
   state.settingsOpen = open;
   settingsPanel.classList.toggle('open', open);
   btnSettings.classList.toggle('active', open);
+  settingsPanel.setAttribute('aria-hidden', open ? 'false' : 'true');
+  if (open) {
+    settingsReturnFocus = document.activeElement;
+    const first = settingsPanel.querySelector('button, input, select, [tabindex]');
+    if (first) first.focus();
+  } else if (settingsReturnFocus) {
+    if (typeof settingsReturnFocus.focus === 'function') settingsReturnFocus.focus();
+    settingsReturnFocus = null;
+  }
 }
 
 // ==============================
 // Shortcuts overlay (?)
 // ==============================
+let shortcutsReturnFocus = null;
 function setShortcutsOpen(open) {
   state.shortcutsOpen = open;
   shortcutsOverlay.classList.toggle('open', open);
+  if (open) {
+    shortcutsReturnFocus = document.activeElement;
+    shortcutsClose.focus();
+  } else if (shortcutsReturnFocus) {
+    if (typeof shortcutsReturnFocus.focus === 'function') shortcutsReturnFocus.focus();
+    shortcutsReturnFocus = null;
+  }
 }
 
 // ==============================
@@ -2593,6 +2763,7 @@ async function persistSettings() {
       zoomFillBiasDirection: appSettings.zoomFillBiasDirection,
       zoomFillBiasAmount: appSettings.zoomFillBiasAmount,
       squareAppCorners:  appSettings.squareAppCorners,
+      focusIndicators:   appSettings.focusIndicators,
       firstAutoOpenSlideshow: appSettings.firstAutoOpenSlideshow,
       secondaryAutoOpenSlideshow: appSettings.secondaryAutoOpenSlideshow,
       autoSlideshowSource: appSettings.autoSlideshowSource,
@@ -2667,6 +2838,38 @@ function showToast(msg) {
   t.textContent = msg;
   document.body.appendChild(t);
   t.addEventListener('animationend', () => t.remove());
+  // A visual toast is invisible to a screen reader — mirror it to the live
+  // region so transient status/errors are announced too.
+  announce(msg);
+}
+
+// ==============================
+// Accessibility helpers
+// ==============================
+let announceTimer = null;
+
+// Politely announce a message to screen readers (and any agent reading the DOM)
+// via the #a11y-status live region. Clearing first, then setting on a later
+// tick, guarantees repeated identical messages ("New set") re-announce instead
+// of being coalesced away.
+function announce(msg) {
+  if (!a11yStatus || !msg) return;
+  a11yStatus.textContent = '';
+  clearTimeout(announceTimer);
+  announceTimer = window.setTimeout(() => { a11yStatus.textContent = msg; }, 60);
+}
+
+// Keyboard focus outline is on by default; the toggle only adds the suppressing
+// body class. Mouse focus never shows a ring anyway (see the :focus-visible CSS).
+function applyFocusIndicators() {
+  document.body.classList.toggle('no-focus-indicators', !appSettings.focusIndicators);
+}
+
+// Whether the OS asks for reduced motion. CSS handles transitions/animations;
+// this lets the JS side skip the slideshow stagger too (staggered swaps are
+// motion the media query can't reach).
+function prefersReducedMotion() {
+  return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
 // ==============================
@@ -2679,7 +2882,10 @@ document.addEventListener('pointerdown', e => {
 
 document.addEventListener('click', e => {
   const button = e.target.closest('button');
-  if (button) button.blur();
+  // Blur pointer-driven clicks only (detail > 0) so the mouse never leaves a
+  // lingering focus. Keyboard activation (Enter/Space) reports detail === 0 and
+  // must keep focus, so the ring stays and the user doesn't lose their place.
+  if (button && e.detail !== 0) button.blur();
 });
 
 document.getElementById('titlebar-drag').addEventListener('mousedown', e => {
@@ -2760,12 +2966,20 @@ zoomBiasControl.addEventListener('lostpointercapture', e => {
 
 window.addEventListener('blur', stopZoomBiasRepeat);
 
-document.getElementById('zoom-bias-display').addEventListener('click', e => {
+const zoomBiasDisplay = document.getElementById('zoom-bias-display');
+zoomBiasDisplay.addEventListener('click', e => {
   e.stopPropagation();
   appSettings.zoomFillBiasDirection = '';
   appSettings.zoomFillBiasAmount = 0;
   syncZoomFillControls();
   persistSettings();
+});
+// It's a role="button" (reset), so activate it with Enter/Space too.
+zoomBiasDisplay.addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    zoomBiasDisplay.click();
+  }
 });
 
 btnSlideshow.addEventListener('click', toggleSlideshow);
@@ -2804,6 +3018,12 @@ settingSquareAppCorners.addEventListener('change', async () => {
   appSettings.squareAppCorners = settingSquareAppCorners.checked;
   await persistSettings();
   await window.viewerAPI.setWindowSquareCorners(appSettings.squareAppCorners).catch(() => {});
+});
+
+settingFocusIndicators.addEventListener('change', async () => {
+  appSettings.focusIndicators = settingFocusIndicators.checked;
+  applyFocusIndicators();
+  await persistSettings();
 });
 
 settingFirstAutoOpenSlideshow.addEventListener('change', async () => {
@@ -3095,6 +3315,85 @@ function finishStartupLoadingAfterFirstImage() {
   }, 0);
 }
 
+// ==============================
+// Agent / LLM control surface (window.SIV)
+// ==============================
+// A deliberate, stable API for a coding agent or LLM driving this window (e.g.
+// over CDP: `await window.SIV.getShown()`) so it can use the grid as image
+// context the way a person browses it. Everything a screen reader can perceive,
+// this exposes as data — the accessible-name string and the manifest are one and
+// the same. Category safety is enforced here: SIV can never surface a blocked
+// category (Explicit), and setAgentSafe(true) extends that guarantee to the
+// whole window (human UI included) for the session.
+window.SIV = {
+  version: '1.1',
+
+  // --- introspection ---
+  blockedCategories: () => [...AGENT_BLOCKED_CATEGORIES],
+  isAgentSafe: () => state.agentSafe,
+  getState() {
+    return {
+      browseMode: state.browseMode,
+      categorizedRoot: state.categorizedRoot,
+      agentSafe: state.agentSafe,
+      imageCount: state.imageCount,
+      shown: state.displayedSlots.filter(Boolean).length,
+      categories: state.categorizedCategories.map(c => ({
+        name: c.name, count: c.count, blocked: isAgentBlocked(c.name),
+      })),
+      filter: [...state.categorizedCategoryFilter],
+    };
+  },
+
+  // Currently displayed tiles, each with the same description a screen reader
+  // hears plus a viewport rect (so an agent can crop a screenshot to one tile).
+  // Awaits OCR so `ocr`/`name` are populated.
+  async getShown() {
+    await enrichAccessibleOcr();
+    const cells = [...imageGrid.querySelectorAll('.grid-cell')];
+    const total = cells.length;
+    return cells.map((cell, i) => {
+      const img = cell.querySelector('img');
+      const path = img && img.getAttribute('data-src');
+      if (!path || cell.classList.contains('empty-slot')) return null;
+      const r = cell.getBoundingClientRect();
+      return {
+        index: i,
+        of: total,
+        path,
+        filename: baseName(path),
+        category: state.browseMode === 'categorized' ? categoryForPath(path) : null,
+        ocr: ocrTextCache.get(path) || '',
+        name: accessibleImageName(cell, path),
+        rect: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) },
+      };
+    }).filter(Boolean);
+  },
+
+  // --- browsing (mirror the human actions) ---
+  async newSet() { refresh(); return this.getShown(); },
+  async next()   { navigateForward(); return this.getShown(); },
+  async prev()   { navigateBack(); return this.getShown(); },
+  async shuffle() { shuffleCurrent(); return this.getShown(); },
+
+  // --- category control (always allowlist-enforced) ---
+  setAgentSafe,
+  setCategories(names) {
+    const wanted = (Array.isArray(names) ? names : [])
+      .filter(n => state.categorizedCategories.some(c => c.name === n) && !isAgentBlocked(n));
+    state.categorizedCategoryFilter = new Set(wanted);
+    applyCategorizedFilter();
+    return [...state.categorizedCategoryFilter];
+  },
+  // Select every category except the blocked ones — the safe "show me everything".
+  selectAllSafe() {
+    const names = state.categorizedCategories.map(c => c.name).filter(n => !isAgentBlocked(n));
+    state.categorizedCategoryFilter = new Set(names);
+    applyCategorizedFilter();
+    return [...state.categorizedCategoryFilter];
+  },
+};
+
 armStartupWatchdog();
 
 (async () => {
@@ -3136,6 +3435,7 @@ armStartupWatchdog();
     state.categorizedCategoryFilter = new Set(Array.isArray(s.categorizedCategoryFilter) ? s.categorizedCategoryFilter : []);
     state.slideshowDuration = Math.max(1000, s.slideshowDuration || 5000);
     appSettings.squareAppCorners = !!s.squareAppCorners;
+    appSettings.focusIndicators = s.focusIndicators !== false;
     appSettings.zoomFillVersion = 6;
     appSettings.zoomFillAmount = loadZoomFillAmount(s);
     appSettings.zoomFillEnabled = appSettings.zoomFillAmount > 0;
@@ -3183,6 +3483,8 @@ armStartupWatchdog();
     settingCountVal.textContent  = state.imageCount;
     settingSlideshowDur.value    = Math.round(state.slideshowDuration / 1000);
     settingSquareAppCorners.checked = appSettings.squareAppCorners;
+    settingFocusIndicators.checked = appSettings.focusIndicators;
+    applyFocusIndicators();
     settingFirstAutoOpenSlideshow.checked = appSettings.firstAutoOpenSlideshow;
     settingSecondaryAutoOpenSlideshow.checked = appSettings.secondaryAutoOpenSlideshow;
     settingAutoSlideshowSource.value = appSettings.autoSlideshowSource;

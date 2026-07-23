@@ -33,6 +33,8 @@ const IMAGE_EXTS: &[&str] = &[
 ];
 const RESTORED_WINDOW_PHYSICAL_X_OFFSET: f64 = -1.0;
 const CATEGORIZER_SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
+const CATEGORIZER_OCR_TEXT_DIR_NAME: &str = ".image-categorizer-ocr-text";
+const CATEGORIZED_OCR_SNIPPET_MAX_CHARS: usize = 160;
 const CATEGORIZER_MAX_SCAN_DEPTH: usize = 4;
 const CATEGORIZER_HASH_SAMPLE_BYTES: usize = 65536;
 const CATEGORIZED_HASH_CACHE_FILE_NAME: &str = "categorized-hash-cache.json";
@@ -128,6 +130,8 @@ struct Settings {
     auto_hide_ui_on_startup: bool,
     #[serde(default = "default_instant_filter_categorized")]
     instant_filter_categorized: bool,
+    #[serde(default = "default_focus_indicators")]
+    focus_indicators: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window: Option<WindowState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +161,10 @@ fn default_zoom_fill_level() -> u32 {
 }
 
 fn default_instant_filter_categorized() -> bool {
+    true
+}
+
+fn default_focus_indicators() -> bool {
     true
 }
 
@@ -200,6 +208,7 @@ impl Default for Settings {
             auto_slideshow_source: String::new(),
             auto_hide_ui_on_startup: false,
             instant_filter_categorized: true,
+            focus_indicators: true,
             window: None,
             first_window: None,
             secondary_window: None,
@@ -406,6 +415,104 @@ fn save_categorized_hashes(
     if let Ok(data) = serde_json::to_string(&cache) {
         let _ = fs::write(path, data);
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedOcrView {
+    path: String,
+    text: String,
+}
+
+/// Browser/window chrome markers the screenshot OCR almost always captures. A
+/// tab reads "<page title> - YouTube", so the text BEFORE the marker is the
+/// useful description — we cut there. Lowercase; matched case-insensitively.
+const OCR_CHROME_MARKERS: &[&str] = &[
+    " - youtube",
+    " \u{2014} youtube",
+    " - google chrome",
+    " \u{2014} google chrome",
+    " - mozilla firefox",
+    " \u{2014} mozilla firefox",
+    " - microsoft edge",
+    " \u{2014} microsoft edge",
+    " - google search",
+    " - brave",
+    " - opera",
+];
+
+/// Standalone one-off tokens (close-button "x", bullets, separators) that add
+/// noise at the ends of an OCR line. Only whole-token matches are dropped, so a
+/// real word ending in one of these characters is never truncated.
+fn is_ocr_noise_token(token: &str) -> bool {
+    matches!(token, "x" | "X" | "\u{2022}" | "\u{00B7}" | "|" | "-" | "\u{2014}" | "o" | "O")
+}
+
+/// Collapse an OCR text dump into a short, cleaned, single-line snippet for use
+/// as an accessible name / agent-readable description. Empty in, empty out; also
+/// empty if nothing but chrome/noise remains.
+fn ocr_snippet(text: &str) -> String {
+    // 1. Collapse all whitespace runs to single spaces.
+    let mut s = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // 2. Cut at the earliest browser/window chrome marker, keeping the title
+    //    before it. Byte positions in the lowercased copy line up with `s` for
+    //    this data (ASCII + bullets + em dashes preserve length); the
+    //    char-boundary guard keeps any pathological case from panicking.
+    let lower = s.to_lowercase();
+    if let Some(pos) = OCR_CHROME_MARKERS.iter().filter_map(|m| lower.find(*m)).min() {
+        if s.is_char_boundary(pos) {
+            s.truncate(pos);
+            s = s.trim().to_string();
+        }
+    }
+
+    // 3. Drop standalone noise tokens (close-button "x", bullets, separators)
+    //    at either end.
+    let mut tokens: Vec<&str> = s.split(' ').filter(|t| !t.is_empty()).collect();
+    while tokens.last().is_some_and(|t| is_ocr_noise_token(t)) {
+        tokens.pop();
+    }
+    while tokens.first().is_some_and(|t| is_ocr_noise_token(t)) {
+        tokens.remove(0);
+    }
+    s = tokens.join(" ");
+
+    // 4. Truncate at a word boundary near the limit.
+    if s.chars().count() > CATEGORIZED_OCR_SNIPPET_MAX_CHARS {
+        let truncated: String = s.chars().take(CATEGORIZED_OCR_SNIPPET_MAX_CHARS).collect();
+        let cut = truncated.rfind(' ').unwrap_or(truncated.len());
+        let mut out = truncated[..cut].trim_end().to_string();
+        out.push('\u{2026}');
+        out
+    } else {
+        s
+    }
+}
+
+/// Look up the categorizer's OCR text for the given images. OCR lives in a
+/// per-image `<hash>.txt` under the root's `.image-categorizer-ocr-text` dir;
+/// path -> hash comes from the same derived hash cache the scan writes. Called
+/// on demand for the ~16 displayed tiles, never over the whole library, so it
+/// stays cheap. Images with no OCR text are simply omitted from the result.
+#[tauri::command]
+fn get_categorized_ocr(app: AppHandle, root: String, paths: Vec<String>) -> Vec<CategorizedOcrView> {
+    let hashes = load_categorized_hashes(&app, &root);
+    let ocr_dir = PathBuf::from(&root).join(CATEGORIZER_OCR_TEXT_DIR_NAME);
+    let mut out = Vec::new();
+    for path in paths {
+        let Some(entry) = hashes.get(&path) else {
+            continue;
+        };
+        let file = ocr_dir.join(format!("{}.txt", entry.hash));
+        if let Ok(text) = fs::read_to_string(&file) {
+            let snippet = ocr_snippet(&text);
+            if !snippet.is_empty() {
+                out.push(CategorizedOcrView { path, text: snippet });
+            }
+        }
+    }
+    out
 }
 
 fn build_categorized_categories(
@@ -1389,6 +1496,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_multi_folder_images,
             scan_categorized_root,
+            get_categorized_ocr,
             set_image_category,
             find_categorizer_root,
             load_settings,

@@ -23,6 +23,7 @@ window.viewerAPI = {
 
   listMultiFolderImages: (folders) => invoke('list_multi_folder_images', { folders }),
   scanCategorizedRoot: (root, scanId) => invoke('scan_categorized_root', { root, scanId }),
+  getCategorizedOcr: (root, paths) => invoke('get_categorized_ocr', { root, paths }),
   onCategorizedScanProgress: (callback) =>
     listen('categorized-scan-progress', event => callback(event.payload)),
   setImageCategory: (root, path, category) => invoke('set_image_category', { root, path, category }),
