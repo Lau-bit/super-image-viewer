@@ -24,6 +24,12 @@ window.viewerAPI = {
   listMultiFolderImages: (folders) => invoke('list_multi_folder_images', { folders }),
   scanCategorizedRoot: (root, scanId) => invoke('scan_categorized_root', { root, scanId }),
   getCategorizedOcr: (root, paths) => invoke('get_categorized_ocr', { root, paths }),
+  // Curated sets written beside the library by image-categorizer's geo layer, with member hashes
+  // already resolved to paths.
+  getCategorizedSets: (root) => invoke('get_categorized_sets', { root }),
+  // Veto images as geo-set members. Does not recategorize them — see the Rust doc comment.
+  excludeFromGeoSets: (root, paths) => invoke('exclude_from_geo_sets', { root, paths }),
+  getGeoExcludedPaths: (root) => invoke('get_geo_excluded_paths', { root }),
   onCategorizedScanProgress: (callback) =>
     listen('categorized-scan-progress', event => callback(event.payload)),
   setImageCategory: (root, path, category) => invoke('set_image_category', { root, path, category }),

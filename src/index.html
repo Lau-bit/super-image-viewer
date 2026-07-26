@@ -76,12 +76,25 @@
             <span id="categorized-root-name">No root chosen</span>
             <button type="button" class="folder-panel-btn" id="categorized-root-choose">Choose</button>
           </div>
-          <div id="categories-panel-bulk">
-            <button type="button" id="categories-select-all">All</button>
-            <button type="button" id="categories-select-none">None</button>
-            <button type="button" id="categories-rescan" aria-label="Rescan categorized root">&#x21BB;</button>
+          <div id="categorized-source-tabs" role="group" aria-label="Categorized source type">
+            <button type="button" class="categorized-source-tab active" data-categorized-source="categories" aria-pressed="true">Categories</button>
+            <button type="button" class="categorized-source-tab" data-categorized-source="sets" aria-pressed="false">Sets</button>
           </div>
-          <div id="categories-list"></div>
+          <div id="categorized-source-categories" class="categorized-source-section visible">
+            <div id="categories-panel-bulk">
+              <button type="button" id="categories-select-all">All</button>
+              <button type="button" id="categories-select-none">None</button>
+              <button type="button" id="categories-rescan" aria-label="Rescan categorized root">&#x21BB;</button>
+            </div>
+            <div id="categories-list"></div>
+          </div>
+          <div id="categorized-source-sets" class="categorized-source-section">
+            <div id="sets-panel-bulk">
+              <button type="button" id="sets-clear">Use categories</button>
+              <button type="button" id="sets-reload" aria-label="Reload image sets">&#x21BB;</button>
+            </div>
+            <div id="sets-list"></div>
+          </div>
         </div>
       </div>
     </div>

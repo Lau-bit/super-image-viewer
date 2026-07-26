@@ -53,6 +53,24 @@ const state = {
   categorizedCategoryFilter: new Set(),
   categorizedImages: [],
 
+  // Curated sets from the categorized root (image-categorizer's geo layer writes them).
+  // A set is an alternative POOL SOURCE, not another filter: while a set drives the pool it IS the
+  // pool, and the category checkboxes stop driving anything. Mixing a curated sixteen into a
+  // 17k-image category would simply dissolve it.
+  //
+  // Selection is by COUNTRY, not by individual set: `setMode` is 'off' | 'any' | 'country', and
+  // each new board re-rolls which of the eligible sets is showing. `categorizedSetId` is therefore
+  // a transient — the current draw — and is never persisted; the selection is.
+  categorizedSets: [],
+  categorizedSetId: null,
+  setMode: 'off',
+  setCountry: null,
+  setBag: [],                       // shuffled ids not yet drawn this cycle
+  // Paths vetoed as geo-set members this session. Mirrors the on-disk exclusion file so the
+  // context menu can show the action as already done without re-reading it per right-click.
+  geoExcludedPaths: new Set(),
+  categorizedSource: 'categories',  // which panel tab is showing: 'categories' | 'sets'
+
   imageCount: 9,
   emptyCount: 0,
   displayMode: 'random',  // 'random' | 'chrono'
@@ -207,6 +225,12 @@ const categoriesList     = document.getElementById('categories-list');
 const categoriesSelectAll = document.getElementById('categories-select-all');
 const categoriesSelectNone = document.getElementById('categories-select-none');
 const categoriesRescan   = document.getElementById('categories-rescan');
+const categorizedSourceTabs = [...document.querySelectorAll('.categorized-source-tab')];
+const categorizedSourceSectionCategories = document.getElementById('categorized-source-categories');
+const categorizedSourceSectionSets = document.getElementById('categorized-source-sets');
+const setsList           = document.getElementById('sets-list');
+const setsClear          = document.getElementById('sets-clear');
+const setsReload         = document.getElementById('sets-reload');
 const countDisplayEl     = document.getElementById('count-display');
 const emptyDisplayEl     = document.getElementById('empty-display');
 const btnFolder          = document.getElementById('btn-folder');
@@ -1143,6 +1167,11 @@ function clearSlideshowPreload() {
 function startSlideshowPreload() {
   if (!state.slideshow || document.hidden || !state.allImages.length) return;
 
+  // Rotate before planning, not when the plan is applied: the plan preloads the images it picked,
+  // so the swap has to happen while there is still time to fetch the next country's tiles. Skipped
+  // when the next step replays an existing history entry, which has its own images already.
+  if (hist.pos >= hist.stack.length - 1) rotateSetIfActive();
+
   const token = ++state.slideshowPreloadToken;
   const plan = buildNextSlideshowPlan();
   const keepAlive = [];
@@ -1184,6 +1213,9 @@ function takeSlideshowPreloadPlan() {
 // Refresh — generate a new set
 // ==============================
 function refresh(options = {}) {
+  // Only an explicit "new board" rotates the country — a refresh caused by changing the image
+  // count or the zoom must not teleport you somewhere else.
+  if (options.rotate) rotateSetIfActive();
   if (!state.allImages.length) return;
   const slots = generateSlots();
   state.displayedSlots = slots;
@@ -1228,7 +1260,7 @@ function navigateForward() {
     if (state.displayMode === 'chrono') {
       state.chronoOffset = nextChronoOffset();
     }
-    refresh({ stagger: state.slideshow });
+    refresh({ stagger: state.slideshow, rotate: true });
   }
   rescheduleSlideshowTick();
 }
@@ -1476,6 +1508,8 @@ function renderFolderPanelSections() {
   });
   folderSectionMulti.classList.toggle('visible', state.viewedBrowseMode === 'multi');
   folderSectionCategorized.classList.toggle('visible', state.viewedBrowseMode === 'categorized');
+  renderCategorizedSourceTabs();
+  renderSetsPanel();
 }
 
 function loadImagePool(images, label, mode, folder = null) {
@@ -1631,7 +1665,284 @@ function renderCategoriesPanel() {
   }
 }
 
+function renderCategorizedSourceTabs() {
+  for (const tab of categorizedSourceTabs) {
+    const active = tab.dataset.categorizedSource === state.categorizedSource;
+    tab.classList.toggle('active', active);
+    tab.setAttribute('aria-pressed', String(active));
+    // A set driving the pool while the Categories tab is open would otherwise be invisible.
+    tab.classList.toggle(
+      'source-live',
+      tab.dataset.categorizedSource === (state.setMode !== 'off' ? 'sets' : 'categories')
+    );
+  }
+  categorizedSourceSectionCategories.classList.toggle('visible', state.categorizedSource === 'categories');
+  categorizedSourceSectionSets.classList.toggle('visible', state.categorizedSource === 'sets');
+}
+
+function selectCategorizedSource(source) {
+  state.categorizedSource = source;
+  renderCategorizedSourceTabs();
+}
+
+// Sets grouped by the country they belong to, alphabetically. Selection happens at this level:
+// twelve numbered Brazils are one row you can hit, not twelve rows to scroll past.
+function setsByCountry() {
+  const byCountry = new Map();
+  for (const set of state.categorizedSets) {
+    const key = set.country || set.title;
+    if (!byCountry.has(key)) byCountry.set(key, []);
+    byCountry.get(key).push(set);
+  }
+  return [...byCountry.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+// The sets the current selection is allowed to draw from.
+function eligibleSets() {
+  if (state.setMode === 'any') return state.categorizedSets;
+  if (state.setMode === 'country') {
+    return state.categorizedSets.filter(set => (set.country || set.title) === state.setCountry);
+  }
+  return [];
+}
+
+// A shuffled bag rather than an independent random draw each time: pure random repeats itself
+// often enough to look broken over a slideshow, and a bag guarantees every country is seen once
+// before any repeats. The refill also avoids handing back the set already on screen.
+function refillSetBag(eligible) {
+  const ids = eligible.map(set => set.id);
+  for (let i = ids.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+  }
+  // Drawn from the end, so the last entry is the next one out.
+  if (ids.length > 1 && ids[ids.length - 1] === state.categorizedSetId) {
+    [ids[0], ids[ids.length - 1]] = [ids[ids.length - 1], ids[0]];
+  }
+  state.setBag = ids;
+}
+
+// Swap the pool to the next set in the bag. Deliberately does NOT go through `loadImagePool`:
+// that resets history, and being able to arrow back to the country you just saw is most of the
+// value of rotating in the first place.
+function rotateSetIfActive() {
+  if (state.setMode === 'off') return false;
+  const eligible = eligibleSets();
+  if (!eligible.length) return false;
+  if (!state.setBag.length) refillSetBag(eligible);
+  const nextId = state.setBag.pop();
+  const set = state.categorizedSets.find(candidate => candidate.id === nextId);
+  if (!set) return false;
+
+  state.categorizedSetId = nextId;
+  const images = categorizedSetImages(set);
+  state.allImages = [...images].sort((a, b) => b.modified - a.modified);
+  folderNameEl.textContent = categorizedPoolLabel();
+  document.body.classList.toggle('no-folder', !state.allImages.length);
+  renderSetsPanel();
+  return true;
+}
+
+function categorizedPoolLabel() {
+  const root = state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized';
+  const set = activeCategorizedSet();
+  return set ? `${root} · ${set.title}` : root;
+}
+
+function renderSetsPanel() {
+  setsClear.disabled = state.setMode === 'off';
+  setsList.textContent = '';
+
+  if (!state.categorizedRoot) {
+    const empty = document.createElement('div');
+    empty.className = 'categories-empty';
+    empty.textContent = 'Choose a categorized root first.';
+    setsList.append(empty);
+    return;
+  }
+  if (!state.categorizedSets.length) {
+    const empty = document.createElement('div');
+    empty.className = 'categories-empty';
+    empty.textContent = 'No image sets found. Build country sets in Image Categorizer, then reload.';
+    setsList.append(empty);
+    return;
+  }
+
+  const grouped = setsByCountry();
+  const current = activeCategorizedSet();
+
+  const addRow = ({ label, meta, active, onClick, ariaLabel, extraClass }) => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = `set-row${extraClass ? ` ${extraClass}` : ''}`;
+    row.classList.toggle('active', active);
+    row.setAttribute('aria-pressed', String(active));
+    const name = document.createElement('span');
+    name.className = 'set-row-name';
+    name.textContent = label;
+    const metaEl = document.createElement('span');
+    metaEl.className = 'set-row-meta';
+    metaEl.textContent = meta;
+    row.append(name, metaEl);
+    row.setAttribute('aria-label', ariaLabel);
+    row.addEventListener('click', onClick);
+    setsList.append(row);
+    return row;
+  };
+
+  const totalVideos = state.categorizedSets.reduce((sum, set) => sum + set.sources, 0);
+  addRow({
+    label: 'Any country',
+    meta: `${state.categorizedSets.length} sets`,
+    active: state.setMode === 'any',
+    extraClass: 'set-row-any',
+    ariaLabel: `Any country — rotate pseudorandomly across all ${state.categorizedSets.length} sets, ${totalVideos} videos`,
+    onClick: () => selectSetScope('any', null),
+  });
+
+  for (const [country, sets] of grouped) {
+    const videos = sets.reduce((sum, set) => sum + set.sources, 0);
+    const limited = sets.every(set => set.quality !== 'diverse');
+    const active = state.setMode === 'country' && state.setCountry === country;
+    const row = addRow({
+      label: country,
+      meta: sets.length > 1 ? `${sets.length} sets · ${videos}v` : `${videos}v`,
+      active,
+      ariaLabel: `${country} — ${sets.length} set${sets.length === 1 ? '' : 's'}, ${videos} videos${
+        limited ? ', limited variety' : ''
+      }`,
+      onClick: () => selectSetScope('country', country),
+    });
+    if (limited) {
+      const badge = document.createElement('span');
+      badge.className = 'set-row-badge limited';
+      badge.textContent = 'limited';
+      row.append(badge);
+    }
+    // Mark which country the board on screen is currently drawn from, so "Any country" still tells
+    // you where you are.
+    if (!active && current && (current.country || current.title) === country) {
+      row.classList.add('set-row-showing');
+    }
+  }
+}
+
+// Entering a scope draws its first set immediately and snaps the grid to that set's size —
+// a curated sixteen displayed nine at a time is no longer the thing that was curated. Later
+// rotations leave the count alone so the board does not resize under you every few seconds.
+function selectSetScope(mode, country) {
+  state.setMode = mode;
+  state.setCountry = country;
+  state.setBag = [];
+  state.categorizedSetId = null;
+  if (!rotateSetIfActive()) {
+    state.setMode = 'off';
+    state.setCountry = null;
+    applyCategorizedFilter();
+    return;
+  }
+  const set = activeCategorizedSet();
+  applyCategorizedFilter();
+  if (set && set.paths.length !== state.imageCount) setImageCount(set.paths.length);
+  else persistSettings();
+}
+
+// Veto this image as a geo-set member. It keeps its category and still appears everywhere else —
+// this only stops it being served as geography. Persistent and honoured by image-categorizer too,
+// so unlike Hide it is NOT on the undo stack: reversing it means deleting that line from
+// `.image-categorizer-geo-excluded.json` (the file says so in its own note).
+async function removeFromGeoSets(path) {
+  const root = state.categorizedRoot;
+  if (!root || state.geoExcludedPaths.has(path)) return;
+  state.geoExcludedPaths.add(path);
+
+  // Prune from every loaded set so no later rotation can hand it back this session.
+  for (const set of state.categorizedSets) {
+    const index = set.paths.indexOf(path);
+    if (index >= 0) set.paths.splice(index, 1);
+  }
+  // And off the board + out of the live pool immediately.
+  if (state.displayedSlots.includes(path)) removeDisplayedImage(path);
+  else state.allImages = state.allImages.filter(image => image.path !== path);
+  renderSetsPanel();
+
+  try {
+    const total = await window.viewerAPI.excludeFromGeoSets(root, [path]);
+    showToast(`Removed from geo sets — ${total} excluded`);
+    announce(`${baseName(path)} removed from geo sets`);
+  } catch (error) {
+    state.geoExcludedPaths.delete(path);
+    showToast('Could not save the geo-set exclusion');
+    console.error('Failed to exclude from geo sets:', error);
+  }
+}
+
+function clearSetSelection() {
+  if (state.setMode === 'off') return;
+  state.setMode = 'off';
+  state.setCountry = null;
+  state.setBag = [];
+  state.categorizedSetId = null;
+  applyCategorizedFilter();
+  persistSettings();
+}
+
+// Sets resolve through the hash cache the categorized scan writes, so this must run after a scan
+// has populated it — an unscanned root simply yields nothing rather than failing.
+async function loadCategorizedSets() {
+  if (!state.categorizedRoot) {
+    state.categorizedSets = [];
+    renderSetsPanel();
+    return;
+  }
+  try {
+    const [sets, excluded] = await Promise.all([
+      window.viewerAPI.getCategorizedSets(state.categorizedRoot),
+      window.viewerAPI.getGeoExcludedPaths(state.categorizedRoot),
+    ]);
+    state.categorizedSets = sets || [];
+    state.geoExcludedPaths = new Set(excluded || []);
+  } catch {
+    state.categorizedSets = [];
+  }
+  // A remembered selection whose sets no longer exist must not silently keep driving the pool.
+  state.setBag = [];
+  state.categorizedSetId = null;
+  if (state.setMode !== 'off' && !eligibleSets().length) {
+    state.setMode = 'off';
+    state.setCountry = null;
+  }
+  if (state.setMode !== 'off') rotateSetIfActive();
+  renderSetsPanel();
+  renderCategorizedSourceTabs();
+}
+
+function activeCategorizedSet() {
+  if (!state.categorizedSetId) return null;
+  return state.categorizedSets.find(set => set.id === state.categorizedSetId) || null;
+}
+
+// The pool when a set is selected: its members, resolved back to the scanned image records so they
+// carry the same category/modified data every other code path expects.
+//
+// The agent-safe check is repeated here on purpose. Everywhere else that guard rides on the
+// CATEGORY filter, and a set is a straight member list that bypasses category filtering entirely —
+// so without this, selecting a set would be a way around the one rule that must not have one.
+function categorizedSetImages(set) {
+  const byPath = new Map(state.categorizedImages.map(image => [image.path, image]));
+  const out = [];
+  for (const path of set.paths) {
+    const image = byPath.get(path);
+    if (!image) continue;
+    if (state.agentSafe && isAgentBlocked(image.category)) continue;
+    out.push(image);
+  }
+  return out;
+}
+
 function categorizedFilteredImages() {
+  const set = activeCategorizedSet();
+  if (set) return categorizedSetImages(set);
   return state.categorizedImages.filter(image =>
     state.categorizedCategoryFilter.has(image.category)
     && !(state.agentSafe && isAgentBlocked(image.category)));
@@ -1720,11 +2031,15 @@ async function enterCategorizedMode(root = state.categorizedRoot, { eager = fals
       state.categorizedCategoryFilter = new Set(kept.length ? kept : [...available]);
       renderCategorizedRootRow();
       renderCategoriesPanel();
+      // Only now: sets resolve member hashes through the cache this scan just wrote, so loading
+      // them any earlier would resolve nothing and drop every set as empty.
+      await loadCategorizedSets();
       const filtered = categorizedFilteredImages();
+      const poolLabel = categorizedPoolLabel();
       if (partialPoolShown) {
-        finalizeCategorizedImagePool(filtered, baseName(scan.root));
+        finalizeCategorizedImagePool(filtered, poolLabel);
       } else {
-        loadImagePool(filtered, baseName(scan.root), 'categorized');
+        loadImagePool(filtered, poolLabel, 'categorized');
       }
       return true;
     } catch (error) {
@@ -1761,8 +2076,15 @@ function applyCategorizedFilter() {
     }
   }
   renderCategoriesPanel();
+  renderSetsPanel();
+  const set = activeCategorizedSet();
   const filtered = categorizedFilteredImages();
-  loadImagePool(filtered, state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized', 'categorized');
+  loadImagePool(filtered, categorizedPoolLabel(), 'categorized');
+  if (set) {
+    const scope = state.setMode === 'any' ? 'Any country' : state.setCountry;
+    announce(`${scope} — showing ${set.title}, ${filtered.length} images from ${set.sources} videos`);
+    return;
+  }
   const selected = [...state.categorizedCategoryFilter];
   announce(selected.length
     ? `Showing ${selected.join(', ')} — ${filtered.length} images`
@@ -1876,6 +2198,32 @@ function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = nul
     hideImage(path);
   });
   gridContextMenu.append(hideBtn);
+
+  // Remove from geo sets — a set-building veto, not a recategorization. Offered whenever a
+  // categorized root is active, not only while a set is on screen: the point is to be able to
+  // knock out a bad member the moment you notice it, including before it ever lands in a set.
+  if (state.browseMode === 'categorized' && state.categorizedRoot) {
+    const excluded = state.geoExcludedPaths.has(path);
+    const geoBtn = document.createElement('button');
+    geoBtn.type = 'button';
+    geoBtn.setAttribute('role', 'menuitem');
+    geoBtn.disabled = excluded;
+    const geoLabel = document.createElement('span');
+    geoLabel.textContent = excluded ? 'Removed from geo sets' : 'Remove from geo sets';
+    geoBtn.append(geoLabel);
+    if (excluded) geoBtn.classList.add('current');
+    geoBtn.setAttribute(
+      'aria-label',
+      excluded
+        ? 'Already removed from geo sets'
+        : 'Remove from geo sets — keeps its category, only stops it being used as geography'
+    );
+    geoBtn.addEventListener('click', () => {
+      closeGridContextMenu({ restoreFocus: true });
+      if (!excluded) removeFromGeoSets(path);
+    });
+    gridContextMenu.append(geoBtn);
+  }
 
   // Categorize — only meaningful when browsing a categorized root.
   if (state.browseMode === 'categorized') {
@@ -2746,6 +3094,10 @@ async function persistSettings() {
       multiFolderFilter: [...state.multiFolderFilter],
       categorizedRoot:   state.categorizedRoot,
       categorizedCategoryFilter: [...state.categorizedCategoryFilter],
+      // The selection persists; which set it happens to be showing does not — that is re-rolled
+      // on every new board, so saving it would only pin one random draw.
+      categorizedSetMode: state.setMode === 'off' ? null : state.setMode,
+      categorizedSetCountry: state.setCountry,
       startupBrowseMode: appSettings.startupBrowseMode,
       startupFolder:     null,
       startupMultiFolders: appSettings.startupMultiFolders,
@@ -2905,6 +3257,10 @@ categorizedRootChoose.addEventListener('click', chooseCategorizedRoot);
 categoriesSelectAll.addEventListener('click', () => setAllCategorizedCategories(true));
 categoriesSelectNone.addEventListener('click', () => setAllCategorizedCategories(false));
 categoriesRescan.addEventListener('click', () => enterCategorizedMode());
+categorizedSourceTabs.forEach(tab =>
+  tab.addEventListener('click', () => selectCategorizedSource(tab.dataset.categorizedSource)));
+setsClear.addEventListener('click', clearSetSelection);
+setsReload.addEventListener('click', () => loadCategorizedSets());
 folderModeTabs.forEach(tab => {
   tab.addEventListener('click', async () => {
     state.viewedBrowseMode = tab.dataset.browseMode;
@@ -2984,7 +3340,7 @@ zoomBiasDisplay.addEventListener('keydown', e => {
 
 btnSlideshow.addEventListener('click', toggleSlideshow);
 btnShuffle.addEventListener('click',   shuffleCurrent);
-btnRefresh.addEventListener('click',   refresh);
+btnRefresh.addEventListener('click',   () => refresh({ rotate: true }));
 
 btnNavPrev.addEventListener('click', navigateBack);
 btnNavNext.addEventListener('click', navigateForward);
@@ -3196,7 +3552,7 @@ document.addEventListener('keydown', e => {
   // Space — new set
   if (e.key === ' ' && !e.ctrlKey && !e.metaKey) {
     e.preventDefault();
-    refresh();
+    refresh({ rotate: true });
     return;
   }
 
@@ -3371,7 +3727,7 @@ window.SIV = {
   },
 
   // --- browsing (mirror the human actions) ---
-  async newSet() { refresh(); return this.getShown(); },
+  async newSet() { refresh({ rotate: true }); return this.getShown(); },
   async next()   { navigateForward(); return this.getShown(); },
   async prev()   { navigateBack(); return this.getShown(); },
   async shuffle() { shuffleCurrent(); return this.getShown(); },
@@ -3433,6 +3789,11 @@ armStartupWatchdog();
     normalizeMultiFolderFilter({ defaultAll: true });
     state.categorizedRoot  = s.categorizedRoot || null;
     state.categorizedCategoryFilter = new Set(Array.isArray(s.categorizedCategoryFilter) ? s.categorizedCategoryFilter : []);
+    // Provisional until `loadCategorizedSets` confirms the scope still has sets; it clears if not.
+    state.setMode = ['any', 'country'].includes(s.categorizedSetMode) ? s.categorizedSetMode : 'off';
+    state.setCountry = state.setMode === 'country' ? (s.categorizedSetCountry || null) : null;
+    if (state.setMode === 'country' && !state.setCountry) state.setMode = 'off';
+    state.categorizedSource = state.setMode !== 'off' ? 'sets' : 'categories';
     state.slideshowDuration = Math.max(1000, s.slideshowDuration || 5000);
     appSettings.squareAppCorners = !!s.squareAppCorners;
     appSettings.focusIndicators = s.focusIndicators !== false;

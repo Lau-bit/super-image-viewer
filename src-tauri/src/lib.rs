@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     fs::File,
     hash::{Hash, Hasher},
@@ -34,6 +34,18 @@ const IMAGE_EXTS: &[&str] = &[
 const RESTORED_WINDOW_PHYSICAL_X_OFFSET: f64 = -1.0;
 const CATEGORIZER_SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
 const CATEGORIZER_OCR_TEXT_DIR_NAME: &str = ".image-categorizer-ocr-text";
+// Curated image sets built by the sibling image-categorizer (country sets, from its geo layer).
+// Members are content hashes, the same keying the OCR sidecar uses, so they resolve through the
+// hash cache the categorized scan already maintains.
+const CATEGORIZER_GEO_SETS_FILE_NAME: &str = ".image-categorizer-geo-sets.json";
+// Images kicked out of geo set building by hand. Shared with image-categorizer, which honours it
+// when rebuilding sets — so an exclusion made here survives the next rebuild instead of being
+// undone by it.
+const CATEGORIZER_GEO_EXCLUDED_FILE_NAME: &str = ".image-categorizer-geo-excluded.json";
+const CATEGORIZER_GEO_EXCLUDED_NOTE: &str =
+    "Images excluded from geo sets, keyed by content hash. They keep their category and still \
+appear everywhere else - they are only kept out of country set building. Delete a line to let one \
+back in; image-categorizer reads this file when it rebuilds sets.";
 const CATEGORIZED_OCR_SNIPPET_MAX_CHARS: usize = 160;
 const CATEGORIZER_MAX_SCAN_DEPTH: usize = 4;
 const CATEGORIZER_HASH_SAMPLE_BYTES: usize = 65536;
@@ -79,6 +91,17 @@ struct Settings {
     categorized_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     categorized_category_filter: Option<Vec<String>>,
+    /// What is driving the pool when curated sets are in use: `"any"` (rotate across every
+    /// country) or `"country"` (rotate within `categorized_set_country`). `None` = the category
+    /// filter is driving instead. A set replaces the category filter rather than intersecting with
+    /// it — a curated sixteen diluted into a seventeen-thousand-image category is no longer a set.
+    ///
+    /// The *selection* persists, never the particular set on screen: which set is showing is
+    /// re-rolled on every new board, so storing it would only pin a random draw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    categorized_set_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    categorized_set_country: Option<String>,
     #[serde(default)]
     startup_browse_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,6 +208,8 @@ impl Default for Settings {
             multi_folder_filter: None,
             categorized_root: None,
             categorized_category_filter: None,
+            categorized_set_mode: None,
+            categorized_set_country: None,
             startup_browse_mode: "multi".to_string(),
             startup_folder: None,
             startup_multi_folders: Vec::new(),
@@ -511,6 +536,215 @@ fn get_categorized_ocr(app: AppHandle, root: String, paths: Vec<String>) -> Vec<
                 out.push(CategorizedOcrView { path, text: snippet });
             }
         }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Curated sets (written by image-categorizer's geo layer)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizerSetsFile {
+    #[serde(default)]
+    sets: Vec<CategorizerSet>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizerSet {
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    country: String,
+    #[serde(default)]
+    sources: usize,
+    #[serde(default)]
+    quality: String,
+    #[serde(default)]
+    members: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizedSetView {
+    id: String,
+    kind: String,
+    title: String,
+    country: String,
+    /// Distinct source videos behind the set — the number that says whether it is varied enough to
+    /// be worth practising on, as opposed to sixteen frames of the same drive.
+    sources: usize,
+    /// `diverse` (one frame per video) or `limited` (had to reuse videos).
+    quality: String,
+    /// Member image paths, in the order the set defines them.
+    paths: Vec<String>,
+    /// Members whose hash no longer maps to a file under this root.
+    missing: usize,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeoExcludedFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    excluded: BTreeMap<String, GeoExclusion>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeoExclusion {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    excluded_at: String,
+    #[serde(default)]
+    source: String,
+}
+
+fn geo_excluded_path(root: &str) -> PathBuf {
+    PathBuf::from(root).join(CATEGORIZER_GEO_EXCLUDED_FILE_NAME)
+}
+
+fn load_geo_excluded(root: &str) -> GeoExcludedFile {
+    fs::read_to_string(geo_excluded_path(root))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<GeoExcludedFile>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Marks images as never-again members of a geo set.
+///
+/// This does NOT recategorize anything: the image keeps its Low Text / High Text membership and
+/// still shows up everywhere else. It is a set-building veto, which is the narrow thing wanted —
+/// a portrait or a rollercoaster that happens to carry a real country is bad geography practice,
+/// not a miscategorized picture.
+///
+/// Returns the total number of exclusions on file so the caller can report it.
+#[tauri::command]
+fn exclude_from_geo_sets(app: AppHandle, root: String, paths: Vec<String>) -> Result<usize, String> {
+    if paths.is_empty() {
+        return Ok(load_geo_excluded(&root).excluded.len());
+    }
+    let hashes = load_categorized_hashes(&app, &root);
+    let mut file = load_geo_excluded(&root);
+    file.version = 1;
+    file.note = CATEGORIZER_GEO_EXCLUDED_NOTE.to_string();
+
+    let now = now_iso();
+    let mut added = 0usize;
+    for path in &paths {
+        let Some(entry) = hashes.get(path) else {
+            // No hash means the categorized scan has never seen this file; nothing stable to key on.
+            continue;
+        };
+        let name = Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        if file
+            .excluded
+            .insert(
+                entry.hash.clone(),
+                GeoExclusion {
+                    name,
+                    excluded_at: now.clone(),
+                    source: "super-image-viewer".to_string(),
+                },
+            )
+            .is_none()
+        {
+            added += 1;
+        }
+    }
+    if added == 0 {
+        return Ok(file.excluded.len());
+    }
+
+    let data = serde_json::to_string_pretty(&file)
+        .map_err(|error| format!("Failed to serialize geo exclusions: {error}"))?;
+    fs::write(geo_excluded_path(&root), data)
+        .map_err(|error| format!("Failed to save geo exclusions: {error}"))?;
+    Ok(file.excluded.len())
+}
+
+/// Excluded images as paths, so the UI can show the action as already done rather than offering it
+/// again on something already vetoed. Hashes with no file under this root are simply omitted.
+#[tauri::command]
+fn get_geo_excluded_paths(app: AppHandle, root: String) -> Vec<String> {
+    let excluded = load_geo_excluded(&root).excluded;
+    if excluded.is_empty() {
+        return Vec::new();
+    }
+    let hashes = load_categorized_hashes(&app, &root);
+    hashes
+        .into_iter()
+        .filter(|(_, entry)| excluded.contains_key(&entry.hash))
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// Lists the curated sets stored beside the categorized library, with member hashes resolved to
+/// real paths.
+///
+/// Resolution goes through the derived hash cache the categorized scan writes, so a root that has
+/// never been scanned in this app resolves nothing — that is reported as `missing` rather than as
+/// an error, and the caller tells the user to rescan. Sets that resolve to no files at all are
+/// dropped: an empty set is not something the UI can usefully offer.
+#[tauri::command]
+fn get_categorized_sets(app: AppHandle, root: String) -> Vec<CategorizedSetView> {
+    let path = PathBuf::from(&root).join(CATEGORIZER_GEO_SETS_FILE_NAME);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(file) = serde_json::from_str::<CategorizerSetsFile>(&raw) else {
+        return Vec::new();
+    };
+
+    // The cache is path -> hash; sets are keyed by hash, so invert it once for the whole batch.
+    let hashes = load_categorized_hashes(&app, &root);
+    let mut by_hash: HashMap<&str, &str> = HashMap::with_capacity(hashes.len());
+    for (image_path, entry) in &hashes {
+        by_hash.insert(entry.hash.as_str(), image_path.as_str());
+    }
+
+    // Hand-excluded members are dropped on read too, not only when the categorizer rebuilds — so a
+    // "remove from geo sets" takes effect immediately instead of waiting on the next rebuild.
+    let excluded = load_geo_excluded(&root).excluded;
+
+    let mut out = Vec::new();
+    for set in file.sets {
+        let mut paths = Vec::with_capacity(set.members.len());
+        let mut missing = 0usize;
+        for member in &set.members {
+            if excluded.contains_key(member) {
+                continue;
+            }
+            match by_hash.get(member.as_str()) {
+                Some(image_path) => paths.push((*image_path).to_string()),
+                None => missing += 1,
+            }
+        }
+        if paths.is_empty() {
+            continue;
+        }
+        out.push(CategorizedSetView {
+            title: if set.title.is_empty() { set.id.clone() } else { set.title.clone() },
+            id: set.id,
+            kind: set.kind,
+            country: set.country,
+            sources: set.sources,
+            quality: set.quality,
+            paths,
+            missing,
+        });
     }
     out
 }
@@ -1102,6 +1336,11 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.multi_folder_filter = settings.multi_folder_filter;
     current.categorized_root = settings.categorized_root;
     current.categorized_category_filter = settings.categorized_category_filter;
+    current.categorized_set_mode = match settings.categorized_set_mode.as_deref() {
+        Some("any") | Some("country") => settings.categorized_set_mode,
+        _ => None,
+    };
+    current.categorized_set_country = settings.categorized_set_country;
     current.startup_browse_mode = match settings.startup_browse_mode.as_str() {
         "multi" | "categorized" => settings.startup_browse_mode,
         _ => "multi".to_string(),
@@ -1497,6 +1736,9 @@ pub fn run() {
             list_multi_folder_images,
             scan_categorized_root,
             get_categorized_ocr,
+            get_categorized_sets,
+            exclude_from_geo_sets,
+            get_geo_excluded_paths,
             set_image_category,
             find_categorizer_root,
             load_settings,

@@ -452,6 +452,124 @@ body.ui-hidden #folder-panel {
   font-size: 11px;
 }
 
+/* ==============================
+   Categorized source: Categories | Sets
+   Two ways to fill the pool from one root. Only one drives it at a time, and the tab that is
+   actually driving carries the same amber "current" marker the browse-mode tabs use — otherwise a
+   set could be running the grid while the Categories tab is open and nothing would say so.
+   ============================== */
+
+#categorized-source-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px;
+}
+
+.categorized-source-tab {
+  flex: 1;
+}
+
+.categorized-source-tab.active {
+  background: var(--accent) !important;
+  border-color: var(--accent) !important;
+  color: #fff !important;
+}
+
+.categorized-source-tab.source-live {
+  box-shadow: inset 0 -2px 0 0 var(--mode-current);
+}
+
+.categorized-source-section {
+  display: none;
+}
+
+.categorized-source-section.visible {
+  display: block;
+}
+
+#sets-panel-bulk {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px 3px;
+}
+
+#toolbar #sets-panel-bulk button {
+  width: auto;
+  height: auto;
+  padding: 4px 8px;
+}
+
+#sets-list {
+  overflow-y: auto;
+  max-height: 320px;
+}
+
+.set-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.set-row:hover {
+  background: var(--btn-hover);
+  color: var(--text);
+}
+
+.set-row.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.set-row-any {
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+
+/* While "Any country" is rotating, mark which country the board on screen came from — otherwise
+   the panel says "Any country" and nothing tells you where you actually are. */
+.set-row-showing {
+  color: var(--text);
+}
+
+.set-row-showing .set-row-name::before {
+  content: '\25B8\00A0';
+  color: var(--mode-current);
+}
+
+.set-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.set-row-meta {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+.set-row-badge {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--mode-current);
+}
+
+.set-row.active .set-row-badge {
+  color: #ffe6a3;
+}
+
 .control-icon {
   width: 16px;
   height: 16px;
