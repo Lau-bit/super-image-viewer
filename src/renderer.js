@@ -44,7 +44,9 @@ function clamp(value, min, max) {
 const state = {
   folder:     null,
   allImages:  [],          // [{path, modified}] newest-first
-  browseMode: 'multi',    // 'multi' | 'categorized'
+  // 'multi' = pick folders. 'categorized' and 'geo' both browse ONE categorized root off the same
+  // scan and differ only in what fills the pool: the category filter, or a curated country set.
+  browseMode: 'multi',    // 'multi' | 'categorized' | 'geo'
   viewedBrowseMode: 'multi',
   multiFolders: [],
   multiFolderFilter: new Set(),
@@ -56,11 +58,14 @@ const state = {
   // Curated sets from the categorized root (image-categorizer's geo layer writes them).
   // A set is an alternative POOL SOURCE, not another filter: while a set drives the pool it IS the
   // pool, and the category checkboxes stop driving anything. Mixing a curated sixteen into a
-  // 17k-image category would simply dissolve it.
+  // 17k-image category would simply dissolve it. That is exactly why geo is a separate browse
+  // mode: `browseMode === 'geo'` is the ONLY thing that lets a set reach the grid, so a remembered
+  // country can never quietly replace the categorized library it was selected alongside.
   //
   // Selection is by COUNTRY, not by individual set: `setMode` is 'off' | 'any' | 'country', and
   // each new board re-rolls which of the eligible sets is showing. `categorizedSetId` is therefore
-  // a transient — the current draw — and is never persisted; the selection is.
+  // a transient — the current draw — and is never persisted; the selection is. The selection also
+  // survives leaving geo mode, so coming back lands on the country you left.
   categorizedSets: [],
   categorizedSetId: null,
   setMode: 'off',
@@ -69,7 +74,6 @@ const state = {
   // Paths vetoed as geo-set members this session. Mirrors the on-disk exclusion file so the
   // context menu can show the action as already done without re-reading it per right-click.
   geoExcludedPaths: new Set(),
-  categorizedSource: 'categories',  // which panel tab is showing: 'categories' | 'sets'
 
   imageCount: 9,
   emptyCount: 0,
@@ -217,6 +221,7 @@ const startupLoadingText = document.getElementById('startup-loading-text');
 const startupLoadingHint = document.getElementById('startup-loading-hint');
 const folderSectionMulti = document.getElementById('folder-section-multi');
 const folderSectionCategorized = document.getElementById('folder-section-categorized');
+const folderSectionGeo   = document.getElementById('folder-section-geo');
 const folderMultiAdd     = document.getElementById('folder-multi-add');
 const multiFolderListEl  = document.getElementById('multi-folder-list');
 const categorizedRootNameEl = document.getElementById('categorized-root-name');
@@ -225,9 +230,8 @@ const categoriesList     = document.getElementById('categories-list');
 const categoriesSelectAll = document.getElementById('categories-select-all');
 const categoriesSelectNone = document.getElementById('categories-select-none');
 const categoriesRescan   = document.getElementById('categories-rescan');
-const categorizedSourceTabs = [...document.querySelectorAll('.categorized-source-tab')];
-const categorizedSourceSectionCategories = document.getElementById('categorized-source-categories');
-const categorizedSourceSectionSets = document.getElementById('categorized-source-sets');
+const geoRootNameEl      = document.getElementById('geo-root-name');
+const geoRootChoose      = document.getElementById('geo-root-choose');
 const setsList           = document.getElementById('sets-list');
 const setsClear          = document.getElementById('sets-clear');
 const setsReload         = document.getElementById('sets-reload');
@@ -388,9 +392,9 @@ function startupSourceLabel() {
     const enabledCount = folders.filter(folder => enabled.has(fileKey(folder))).length || folders.length;
     return folders.length ? `${enabledCount}/${folders.length} folders` : 'No multi-folders set';
   }
-  return appSettings.startupCategorizedRoot
-    ? baseName(appSettings.startupCategorizedRoot)
-    : 'No categorized root set';
+  if (!appSettings.startupCategorizedRoot) return 'No categorized root set';
+  const root = baseName(appSettings.startupCategorizedRoot);
+  return appSettings.startupBrowseMode === 'geo' ? `${root} · geo` : root;
 }
 
 function syncStartupSourceSettings() {
@@ -424,18 +428,18 @@ function syncAutoSlideshowSourceSettings() {
   settingAutoSlideshowFolderNeeded.hidden = !shouldShowAutoSlideshowFolderPrompt();
 }
 
-async function loadAutoSlideshowCategorizedSource() {
+async function loadAutoSlideshowCategorizedSource(mode) {
   const root = appSettings.startupCategorizedRoot || state.categorizedRoot;
   if (appSettings.startupCategorizedRoot) {
     state.categorizedRoot = appSettings.startupCategorizedRoot;
     state.categorizedCategoryFilter = new Set(appSettings.startupCategorizedCategoryFilter);
   }
-  state.viewedBrowseMode = 'categorized';
+  state.viewedBrowseMode = mode;
   renderCategorizedRootRow();
   renderFolderPanelSections();
-  await enterCategorizedMode(root, { eager: true });
-  if (state.browseMode !== 'categorized') {
-    loadImagePool([], root ? baseName(root) : 'No categorized root', 'categorized');
+  await enterCategorizedMode(root, { eager: mode === 'categorized', targetMode: mode });
+  if (state.browseMode !== mode) {
+    loadImagePool([], root ? baseName(root) : 'No categorized root', mode);
   }
 }
 
@@ -456,17 +460,18 @@ async function loadConfiguredStartupSource() {
     return;
   }
 
+  const mode = appSettings.startupBrowseMode;
   state.categorizedRoot = appSettings.startupCategorizedRoot;
   state.categorizedCategoryFilter = new Set(appSettings.startupCategorizedCategoryFilter);
-  state.viewedBrowseMode = 'categorized';
+  state.viewedBrowseMode = mode;
   renderCategorizedRootRow();
   renderFolderPanelSections();
-  await enterCategorizedMode(undefined, { eager: true });
+  await enterCategorizedMode(undefined, { eager: mode === 'categorized', targetMode: mode });
 }
 
 async function loadAutoSlideshowSource() {
-  if (appSettings.autoSlideshowSource === 'categorized') {
-    await loadAutoSlideshowCategorizedSource();
+  if (appSettings.autoSlideshowSource === 'categorized' || appSettings.autoSlideshowSource === 'geo') {
+    await loadAutoSlideshowCategorizedSource(appSettings.autoSlideshowSource);
     return;
   }
 
@@ -578,7 +583,7 @@ function refreshLockedCellDecorations() {
 async function filePreviouslyPinned(path) {
   try {
     let root = null;
-    if (state.browseMode === 'categorized' && state.categorizedRoot) {
+    if (usesCategorizedRoot() && state.categorizedRoot) {
       root = state.categorizedRoot;
     } else if (window.viewerAPI.findCategorizerRoot) {
       root = await window.viewerAPI.findCategorizerRoot(path).catch(() => null);
@@ -586,7 +591,7 @@ async function filePreviouslyPinned(path) {
     if (!root) return false;
     await window.viewerAPI.setImageCategory(root, path, PREVIOUSLY_PINNED_CATEGORY);
     // Keep the category panel/counts current when it's the root we're browsing.
-    if (state.browseMode === 'categorized' && state.categorizedRoot === root) {
+    if (usesCategorizedRoot() && state.categorizedRoot === root) {
       applyLocalCategoryChange(path, PREVIOUSLY_PINNED_CATEGORY);
     }
     return true;
@@ -747,7 +752,7 @@ function accessibleImageName(cell, path) {
   const total = cells.length;
   const parts = [];
   if (index >= 0 && total) parts.push(`Image ${index + 1} of ${total}`);
-  const category = state.browseMode === 'categorized' ? categoryForPath(path) : null;
+  const category = usesCategorizedRoot() ? categoryForPath(path) : null;
   if (category) parts.push(category);
   const ocr = ocrTextCache.get(path);
   if (ocr) parts.push(`“${ocr}”`);
@@ -791,9 +796,9 @@ function moveGridFocus(fromCell, key) {
 
 // Fetch OCR text for the currently displayed categorized images and refresh
 // their names. Cheap: only the ~16 shown tiles, only the ones not already
-// cached. No-op outside categorized mode.
+// cached. No-op unless a categorized root is being browsed (categorized or geo).
 async function enrichAccessibleOcr() {
-  if (state.browseMode !== 'categorized' || !state.categorizedRoot) return;
+  if (!usesCategorizedRoot() || !state.categorizedRoot) return;
   if (!window.viewerAPI || !window.viewerAPI.getCategorizedOcr) return;
   const missing = state.displayedSlots.filter(p => p && !ocrTextCache.has(p));
   if (!missing.length) return;
@@ -1386,8 +1391,21 @@ function fileKey(path) {
   return String(path || '').toLocaleLowerCase();
 }
 
+const BROWSE_MODES = ['multi', 'categorized', 'geo'];
+
 function normalizeBrowseMode(mode) {
-  return mode === 'categorized' ? 'categorized' : 'multi';
+  return BROWSE_MODES.includes(mode) ? mode : 'multi';
+}
+
+// Categorized and Geo are two pools over ONE root and ONE scan: the category sidecar, its OCR,
+// the categorize/exclude actions and the hash cache are all equally available in both. Anything
+// that only needs "am I browsing a categorizer library" must ask this, not `=== 'categorized'`.
+function usesCategorizedRoot(mode = state.browseMode) {
+  return mode === 'categorized' || mode === 'geo';
+}
+
+function browseModeLabel(mode) {
+  return mode === 'multi' ? 'Folders' : mode === 'geo' ? 'Geo' : 'Categorized';
 }
 
 function uniqueFolders(folders) {
@@ -1472,7 +1490,7 @@ function noteCategorizedScanProgress(payload) {
     renderStartupScanProgress();
   }
   if (folderPanel.classList.contains('loading')
-      && folderPanel.dataset.loadingMode === 'categorized') {
+      && usesCategorizedRoot(folderPanel.dataset.loadingMode)) {
     folderLoadingText.textContent = categorizedScanLabel(
       folderPanel.dataset.loadingLabel || 'Scanning categories...'
     );
@@ -1492,6 +1510,12 @@ function renderFolderButton() {
       : enabled.length === 1
         ? baseName(enabled[0])
         : `${enabled.length}/${state.multiFolders.length} folders`;
+  } else if (state.browseMode === 'geo') {
+    // The country beats the root name here: in geo mode the root never changes but the country
+    // does, every board, and that is the thing worth reading off the toolbar.
+    const set = activeCategorizedSet();
+    const country = set ? (set.country || set.title) : state.setCountry;
+    label = country ? `Geo: ${country}` : 'Geo';
   } else {
     label = state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized';
   }
@@ -1499,17 +1523,50 @@ function renderFolderButton() {
   folderButtonLabel.textContent = label;
   btnFolder.classList.toggle('mode-multi', state.browseMode === 'multi');
   btnFolder.classList.toggle('mode-categorized', state.browseMode === 'categorized');
+  btnFolder.classList.toggle('mode-geo', state.browseMode === 'geo');
+  btnFolder.setAttribute('aria-label', `Open / manage image sources — ${browseModeLabel(state.browseMode)} mode`);
 }
 
 function renderFolderPanelSections() {
   folderModeTabs.forEach(tab => {
     tab.classList.toggle('active', tab.dataset.browseMode === state.viewedBrowseMode);
     tab.classList.toggle('current-mode', tab.dataset.browseMode === state.browseMode);
+    tab.setAttribute('aria-pressed', String(tab.dataset.browseMode === state.browseMode));
   });
   folderSectionMulti.classList.toggle('visible', state.viewedBrowseMode === 'multi');
   folderSectionCategorized.classList.toggle('visible', state.viewedBrowseMode === 'categorized');
-  renderCategorizedSourceTabs();
+  folderSectionGeo.classList.toggle('visible', state.viewedBrowseMode === 'geo');
   renderSetsPanel();
+}
+
+// Switch the whole browse mode from the tab strip (or the G shortcut). Categorized <-> Geo reuses
+// the scan already in memory — re-walking a 17k-image library just to change what fills the pool
+// is the opposite of "switching is simple".
+async function switchBrowseMode(mode) {
+  state.viewedBrowseMode = mode;
+  renderFolderPanelSections();
+  if (mode === 'multi') {
+    await enterMultiMode();
+    return;
+  }
+  if (mode === 'geo') {
+    await enterGeoMode();
+    return;
+  }
+  if (hasCategorizedScan()) {
+    applyCategorizedFilter();
+    return;
+  }
+  await enterCategorizedMode();
+}
+
+// Jump between the two categorized-root pools without opening the panel.
+function toggleGeoMode() {
+  if (!usesCategorizedRoot() && !state.categorizedRoot) {
+    showToast('Choose a categorized root first');
+    return;
+  }
+  switchBrowseMode(state.browseMode === 'geo' ? 'categorized' : 'geo');
 }
 
 function loadImagePool(images, label, mode, folder = null) {
@@ -1665,26 +1722,6 @@ function renderCategoriesPanel() {
   }
 }
 
-function renderCategorizedSourceTabs() {
-  for (const tab of categorizedSourceTabs) {
-    const active = tab.dataset.categorizedSource === state.categorizedSource;
-    tab.classList.toggle('active', active);
-    tab.setAttribute('aria-pressed', String(active));
-    // A set driving the pool while the Categories tab is open would otherwise be invisible.
-    tab.classList.toggle(
-      'source-live',
-      tab.dataset.categorizedSource === (state.setMode !== 'off' ? 'sets' : 'categories')
-    );
-  }
-  categorizedSourceSectionCategories.classList.toggle('visible', state.categorizedSource === 'categories');
-  categorizedSourceSectionSets.classList.toggle('visible', state.categorizedSource === 'sets');
-}
-
-function selectCategorizedSource(source) {
-  state.categorizedSource = source;
-  renderCategorizedSourceTabs();
-}
-
 // Sets grouped by the country they belong to, alphabetically. Selection happens at this level:
 // twelve numbered Brazils are one row you can hit, not twelve rows to scroll past.
 function setsByCountry() {
@@ -1722,35 +1759,52 @@ function refillSetBag(eligible) {
   state.setBag = ids;
 }
 
-// Swap the pool to the next set in the bag. Deliberately does NOT go through `loadImagePool`:
-// that resets history, and being able to arrow back to the country you just saw is most of the
-// value of rotating in the first place.
-function rotateSetIfActive() {
-  if (state.setMode === 'off') return false;
+// Draw the next set from the bag and make it the current one. Pool untouched — callers decide
+// whether that means an in-place swap (rotation) or a fresh `loadImagePool` (entering geo mode).
+function drawNextSet() {
   const eligible = eligibleSets();
-  if (!eligible.length) return false;
+  if (!eligible.length) return null;
   if (!state.setBag.length) refillSetBag(eligible);
   const nextId = state.setBag.pop();
   const set = state.categorizedSets.find(candidate => candidate.id === nextId);
+  if (!set) return null;
+  state.categorizedSetId = nextId;
+  return set;
+}
+
+// Swap the pool to the next set in the bag. Deliberately does NOT go through `loadImagePool`:
+// that resets history, and being able to arrow back to the country you just saw is most of the
+// value of rotating in the first place. Only ever fires in geo mode — in Categorized the pool
+// belongs to the category filter and nothing may take it over.
+function rotateSetIfActive() {
+  if (state.browseMode !== 'geo' || state.setMode === 'off') return false;
+  const set = drawNextSet();
   if (!set) return false;
 
-  state.categorizedSetId = nextId;
   const images = categorizedSetImages(set);
   state.allImages = [...images].sort((a, b) => b.modified - a.modified);
   folderNameEl.textContent = categorizedPoolLabel();
   document.body.classList.toggle('no-folder', !state.allImages.length);
+  renderFolderButton();
   renderSetsPanel();
   return true;
 }
 
-function categorizedPoolLabel() {
+function categorizedPoolLabel(mode = state.browseMode) {
   const root = state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized';
+  if (mode !== 'geo') return root;
   const set = activeCategorizedSet();
-  return set ? `${root} · ${set.title}` : root;
+  // "Geo" stays in front of the set title so the header always says which mode you are in.
+  return set ? `Geo · ${set.title}` : 'Geo · no sets';
 }
 
 function renderSetsPanel() {
-  setsClear.disabled = state.setMode === 'off';
+  // Always available while there is a root: it is the one-click way back to the categorized
+  // library, which has to work even when geo mode itself came up empty.
+  setsClear.disabled = !state.categorizedRoot;
+  geoRootNameEl.textContent = state.categorizedRoot ? baseName(state.categorizedRoot) : 'No root chosen';
+  if (state.categorizedRoot) geoRootNameEl.setAttribute('aria-label', state.categorizedRoot);
+  else geoRootNameEl.removeAttribute('aria-label');
   setsList.textContent = '';
 
   if (!state.categorizedRoot) {
@@ -1827,24 +1881,67 @@ function renderSetsPanel() {
   }
 }
 
-// Entering a scope draws its first set immediately and snaps the grid to that set's size —
-// a curated sixteen displayed nine at a time is no longer the thing that was curated. Later
-// rotations leave the count alone so the board does not resize under you every few seconds.
+// Picking a country from the panel also ENTERS geo mode — clicking a country and staying on the
+// category pool would be a dead control, and this is the switch the user actually reaches for.
 function selectSetScope(mode, country) {
   state.setMode = mode;
   state.setCountry = country;
   state.setBag = [];
   state.categorizedSetId = null;
-  if (!rotateSetIfActive()) {
-    state.setMode = 'off';
+  applyGeoPool();
+}
+
+// Board size for a scope: the LARGEST set it can draw, not the one that happened to come up.
+// A curated sixteen displayed nine at a time is no longer the thing that was curated — but sizing
+// to the draw is worse, because ~1 in 10 sets is short (some down to a single image) and under
+// "Any country" one unlucky first draw would pin the grid to four tiles for the whole session.
+// Rotations then leave the count alone, so the board never resizes under you mid-slideshow.
+function geoScopeImageCount(eligible) {
+  return eligible.reduce((max, set) => Math.max(max, set.paths.length), 0);
+}
+
+// Build (or rebuild) the geo pool for the current scope, drawing a set if none is in hand.
+function applyGeoPool() {
+  // No remembered scope (first visit, or the remembered one is gone): "Any country" is the sane
+  // default — it is the mode that works without asking the user to pick from 53 rows first.
+  if (state.setMode === 'off' && state.categorizedSets.length) {
+    state.setMode = 'any';
     state.setCountry = null;
-    applyCategorizedFilter();
+    state.setBag = [];
+  }
+  const set = activeCategorizedSet() || drawNextSet();
+  const images = set ? categorizedSetImages(set) : [];
+  renderSetsPanel();
+  // Sized before the pool loads, not after, so the board is built once at the right size.
+  if (set) syncImageCountControls(geoScopeImageCount(eligibleSets()));
+  loadImagePool(images, categorizedPoolLabel('geo'), 'geo');
+  if (!set) {
+    announce(state.categorizedSets.length
+      ? 'Geo — no sets for this country'
+      : 'Geo — no country sets built yet');
     return;
   }
-  const set = activeCategorizedSet();
-  applyCategorizedFilter();
-  if (set && set.paths.length !== state.imageCount) setImageCount(set.paths.length);
-  else persistSettings();
+  const scope = state.setMode === 'any' ? 'Any country' : state.setCountry;
+  announce(`Geo, ${scope} — showing ${set.title}, ${images.length} images from ${set.sources} videos`);
+}
+
+// Geo mode reuses the categorized root's scan whenever one is already in memory — switching
+// Categorized <-> Geo must be instant, not another walk over a 17k-image library.
+async function enterGeoMode() {
+  state.viewedBrowseMode = 'geo';
+  renderFolderPanelSections();
+  if (!state.categorizedRoot) {
+    loadImagePool([], 'No categorized root', 'geo');
+    return;
+  }
+  if (!hasCategorizedScan()) {
+    // Sets resolve member hashes through the cache the scan writes, so there is nothing to show
+    // part-way through: no eager pool here, unlike categorized mode.
+    await enterCategorizedMode(state.categorizedRoot, { targetMode: 'geo' });
+    return;
+  }
+  if (!state.categorizedSets.length) await loadCategorizedSets();
+  applyGeoPool();
 }
 
 // Veto this image as a geo-set member. It keeps its category and still appears everywhere else —
@@ -1877,14 +1974,10 @@ async function removeFromGeoSets(path) {
   }
 }
 
-function clearSetSelection() {
-  if (state.setMode === 'off') return;
-  state.setMode = 'off';
-  state.setCountry = null;
-  state.setBag = [];
-  state.categorizedSetId = null;
-  applyCategorizedFilter();
-  persistSettings();
+// Leave geo mode for the categorized library. The country selection is kept, not cleared, so
+// coming back lands where you left off.
+function leaveGeoMode() {
+  switchBrowseMode('categorized');
 }
 
 // Sets resolve through the hash cache the categorized scan writes, so this must run after a scan
@@ -1905,16 +1998,21 @@ async function loadCategorizedSets() {
   } catch {
     state.categorizedSets = [];
   }
-  // A remembered selection whose sets no longer exist must not silently keep driving the pool.
+  // A remembered country whose sets no longer exist must not keep being offered; the caller
+  // re-draws from whatever scope survives.
   state.setBag = [];
   state.categorizedSetId = null;
   if (state.setMode !== 'off' && !eligibleSets().length) {
     state.setMode = 'off';
     state.setCountry = null;
   }
-  if (state.setMode !== 'off') rotateSetIfActive();
   renderSetsPanel();
-  renderCategorizedSourceTabs();
+}
+
+// Reload button in the geo panel: pick up sets rebuilt in Image Categorizer without a rescan.
+async function reloadCategorizedSets() {
+  await loadCategorizedSets();
+  if (state.browseMode === 'geo') applyGeoPool();
 }
 
 function activeCategorizedSet() {
@@ -1940,12 +2038,23 @@ function categorizedSetImages(set) {
   return out;
 }
 
-function categorizedFilteredImages() {
-  const set = activeCategorizedSet();
-  if (set) return categorizedSetImages(set);
+// The pool for a mode over the categorized root. Which one it is comes from the MODE, never from
+// "is a set lying around" — that is what let a remembered country silently replace the categorized
+// library, and it is the one thing this must not do.
+function categorizedFilteredImages(mode = state.browseMode) {
+  if (mode === 'geo') {
+    const set = activeCategorizedSet();
+    return set ? categorizedSetImages(set) : [];
+  }
   return state.categorizedImages.filter(image =>
     state.categorizedCategoryFilter.has(image.category)
     && !(state.agentSafe && isAgentBlocked(image.category)));
+}
+
+// A finished scan of the current root is in memory, so both categorized and geo can be entered
+// without re-walking the library.
+function hasCategorizedScan() {
+  return !!state.categorizedRoot && state.categorizedImages.length > 0;
 }
 
 function finalizeCategorizedImagePool(images, label) {
@@ -1972,11 +2081,20 @@ function finalizeCategorizedImagePool(images, label) {
   persistSettings();
 }
 
-async function enterCategorizedMode(root = state.categorizedRoot, { eager = false } = {}) {
+// Scan a categorized root and load the pool for `targetMode`. Both categorized and geo come
+// through here on a cold start — one scan feeds both; only what it pours into the pool differs.
+async function enterCategorizedMode(
+  root = state.categorizedRoot,
+  { eager = false, targetMode = 'categorized' } = {},
+) {
+  // Geo has nothing to show part-way through: its sets resolve member hashes through the cache
+  // this scan writes, so a partial pool would resolve to nothing.
+  if (targetMode === 'geo') eager = false;
   if (!root) {
-    loadImagePool([], 'No categorized root', 'categorized');
+    loadImagePool([], 'No categorized root', targetMode);
     renderCategorizedRootRow();
     renderCategoriesPanel();
+    renderSetsPanel();
     return;
   }
   const scanNumber = ++categorizedScanSequence;
@@ -1993,7 +2111,7 @@ async function enterCategorizedMode(root = state.categorizedRoot, { eager = fals
     };
   });
 
-  setFolderLoading(true, 'Scanning categories...', 'categorized');
+  setFolderLoading(true, 'Scanning categories...', targetMode);
   const unlisten = await window.viewerAPI.onCategorizedScanProgress(payload => {
     if (scanNumber !== categorizedScanSequence) return;
     if (payload?.scanId !== scanId || payload?.root !== root) return;
@@ -2034,8 +2152,12 @@ async function enterCategorizedMode(root = state.categorizedRoot, { eager = fals
       // Only now: sets resolve member hashes through the cache this scan just wrote, so loading
       // them any earlier would resolve nothing and drop every set as empty.
       await loadCategorizedSets();
-      const filtered = categorizedFilteredImages();
-      const poolLabel = categorizedPoolLabel();
+      if (targetMode === 'geo') {
+        applyGeoPool();
+        return true;
+      }
+      const filtered = categorizedFilteredImages('categorized');
+      const poolLabel = categorizedPoolLabel('categorized');
       if (partialPoolShown) {
         finalizeCategorizedImagePool(filtered, poolLabel);
       } else {
@@ -2061,12 +2183,16 @@ async function enterCategorizedMode(root = state.categorizedRoot, { eager = fals
   return eager ? Promise.race([eagerFirstImages, finalize]) : finalize;
 }
 
-async function chooseCategorizedRoot() {
+// Both root-choose buttons land here — the root is shared by categorized and geo, so picking one
+// from the geo panel keeps you in geo rather than dumping you back into the category list.
+async function chooseCategorizedRoot(targetMode = 'categorized') {
   const folder = await window.viewerAPI.selectFolder();
   if (!folder) return;
-  await enterCategorizedMode(folder);
+  await enterCategorizedMode(folder, { targetMode });
 }
 
+// Always loads the CATEGORY pool: this is what a category checkbox, an agent-safe flip, or the
+// Categorized tab means, and none of them may hand the grid to a curated set.
 function applyCategorizedFilter() {
   // In agent-safe mode, blocked categories can't even sit in the filter set, so
   // the category panel and persisted filter reflect what's actually shown.
@@ -2077,14 +2203,8 @@ function applyCategorizedFilter() {
   }
   renderCategoriesPanel();
   renderSetsPanel();
-  const set = activeCategorizedSet();
-  const filtered = categorizedFilteredImages();
-  loadImagePool(filtered, categorizedPoolLabel(), 'categorized');
-  if (set) {
-    const scope = state.setMode === 'any' ? 'Any country' : state.setCountry;
-    announce(`${scope} — showing ${set.title}, ${filtered.length} images from ${set.sources} videos`);
-    return;
-  }
+  const filtered = categorizedFilteredImages('categorized');
+  loadImagePool(filtered, categorizedPoolLabel('categorized'), 'categorized');
   const selected = [...state.categorizedCategoryFilter];
   announce(selected.length
     ? `Showing ${selected.join(', ')} — ${filtered.length} images`
@@ -2092,6 +2212,8 @@ function applyCategorizedFilter() {
 }
 
 function toggleCategorizedCategory(name) {
+  // Ticking a category is an unambiguous "show me this pool", so it also leaves geo mode rather
+  // than silently changing a filter that is not driving anything.
   if (state.categorizedCategoryFilter.has(name)) state.categorizedCategoryFilter.delete(name);
   else state.categorizedCategoryFilter.add(name);
   applyCategorizedFilter();
@@ -2110,7 +2232,11 @@ function setAllCategorizedCategories(checked) {
 function setAgentSafe(on) {
   state.agentSafe = !!on;
   document.body.classList.toggle('agent-safe', state.agentSafe);
-  if (state.browseMode === 'categorized' && state.categorizedRoot) {
+  // Rebuild whichever pool is live — in geo mode that re-filters the set on screen; it must not
+  // change the mode out from under an agent that deliberately entered it.
+  if (state.browseMode === 'geo') {
+    applyGeoPool();
+  } else if (state.browseMode === 'categorized' && state.categorizedRoot) {
     applyCategorizedFilter();
   } else {
     renderCategoriesPanel();
@@ -2200,9 +2326,9 @@ function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = nul
   gridContextMenu.append(hideBtn);
 
   // Remove from geo sets — a set-building veto, not a recategorization. Offered whenever a
-  // categorized root is active, not only while a set is on screen: the point is to be able to
-  // knock out a bad member the moment you notice it, including before it ever lands in a set.
-  if (state.browseMode === 'categorized' && state.categorizedRoot) {
+  // categorized root is active, not only in geo mode: the point is to be able to knock out a bad
+  // member the moment you notice it, including before it ever lands in a set.
+  if (usesCategorizedRoot() && state.categorizedRoot) {
     const excluded = state.geoExcludedPaths.has(path);
     const geoBtn = document.createElement('button');
     geoBtn.type = 'button';
@@ -2225,8 +2351,8 @@ function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = nul
     gridContextMenu.append(geoBtn);
   }
 
-  // Categorize — only meaningful when browsing a categorized root.
-  if (state.browseMode === 'categorized') {
+  // Categorize — only meaningful when browsing a categorized root (either mode).
+  if (usesCategorizedRoot()) {
     const separator = document.createElement('div');
     separator.className = 'context-menu-separator';
     separator.setAttribute('role', 'separator');
@@ -2446,6 +2572,8 @@ async function categorizeImage(path, category) {
     await window.viewerAPI.setImageCategory(root, path, category);
     applyLocalCategoryChange(path, category);
 
+    // Only the category pool can filter an image out on the spot; a geo set is a fixed member
+    // list, so recategorizing inside it leaves the board alone.
     const filteredOut = state.browseMode === 'categorized'
       && !state.categorizedCategoryFilter.has(category);
     let removal = null;
@@ -2469,14 +2597,21 @@ async function categorizeImage(path, category) {
 // ==============================
 // Image count (max 99)
 // ==============================
-function setImageCount(n) {
-  n = Math.max(4, Math.min(99, Math.round(n)));
+// Count + its widgets, without touching the board. For callers that are about to rebuild the pool
+// anyway (entering a geo set), so the grid is laid out once, at the size the set asks for.
+function syncImageCountControls(n) {
+  n = clamp(Math.round(n), 4, 99);
   state.imageCount = n;
   state.emptyCount = Math.min(state.emptyCount, n - 1);
   countDisplayEl.textContent  = n;
   emptyDisplayEl.textContent  = state.emptyCount;
   settingSlider.value         = n;
   settingCountVal.textContent = n;
+  return n;
+}
+
+function setImageCount(n) {
+  syncImageCountControls(n);
   if (state.allImages.length) refresh();
   persistSettings();
 }
@@ -3094,8 +3229,9 @@ async function persistSettings() {
       multiFolderFilter: [...state.multiFolderFilter],
       categorizedRoot:   state.categorizedRoot,
       categorizedCategoryFilter: [...state.categorizedCategoryFilter],
-      // The selection persists; which set it happens to be showing does not — that is re-rolled
-      // on every new board, so saving it would only pin one random draw.
+      // The country selection persists; which set it happens to be showing does not — that is
+      // re-rolled on every new board, so saving it would only pin one random draw. This is the
+      // geo SCOPE, not a mode switch: `browseMode` alone decides whether it drives the pool.
       categorizedSetMode: state.setMode === 'off' ? null : state.setMode,
       categorizedSetCountry: state.setCountry,
       startupBrowseMode: appSettings.startupBrowseMode,
@@ -3146,14 +3282,20 @@ async function addStartupSlideshowFolder() {
   showToast('Set slideshow startup folder');
 }
 
+// Auto-slideshow follows the startup mode whenever that mode names a source of its own; only
+// 'multi' leaves the choice open (its own source list is the folder one).
+function autoSlideshowSourceForMode(mode) {
+  return mode === 'multi' ? 'folders' : mode;
+}
+
 async function useCurrentSourceAtStartup() {
   appSettings.startupBrowseMode = state.browseMode;
-  appSettings.autoSlideshowSource = state.browseMode === 'categorized' ? 'categorized' : 'folders';
+  appSettings.autoSlideshowSource = autoSlideshowSourceForMode(state.browseMode);
 
   if (state.browseMode === 'multi') {
     appSettings.startupMultiFolders = [...state.multiFolders];
     appSettings.startupMultiFolderFilter = [...state.multiFolderFilter];
-  } else if (state.browseMode === 'categorized') {
+  } else {
     appSettings.startupCategorizedRoot = state.categorizedRoot;
     appSettings.startupCategorizedCategoryFilter = [...state.categorizedCategoryFilter];
   }
@@ -3253,21 +3395,15 @@ btnFolder.addEventListener('click', e => {
 });
 btnOpenEmpty.addEventListener('click', addMultiFolder);
 folderMultiAdd.addEventListener('click', addMultiFolder);
-categorizedRootChoose.addEventListener('click', chooseCategorizedRoot);
+categorizedRootChoose.addEventListener('click', () => chooseCategorizedRoot('categorized'));
+geoRootChoose.addEventListener('click', () => chooseCategorizedRoot('geo'));
 categoriesSelectAll.addEventListener('click', () => setAllCategorizedCategories(true));
 categoriesSelectNone.addEventListener('click', () => setAllCategorizedCategories(false));
 categoriesRescan.addEventListener('click', () => enterCategorizedMode());
-categorizedSourceTabs.forEach(tab =>
-  tab.addEventListener('click', () => selectCategorizedSource(tab.dataset.categorizedSource)));
-setsClear.addEventListener('click', clearSetSelection);
-setsReload.addEventListener('click', () => loadCategorizedSets());
+setsClear.addEventListener('click', leaveGeoMode);
+setsReload.addEventListener('click', reloadCategorizedSets);
 folderModeTabs.forEach(tab => {
-  tab.addEventListener('click', async () => {
-    state.viewedBrowseMode = tab.dataset.browseMode;
-    renderFolderPanelSections();
-    if (state.viewedBrowseMode === 'multi') await enterMultiMode();
-    if (state.viewedBrowseMode === 'categorized') await enterCategorizedMode();
-  });
+  tab.addEventListener('click', () => switchBrowseMode(tab.dataset.browseMode));
 });
 
 btnCountDec.addEventListener('click', () => bumpCount(false));
@@ -3416,10 +3552,8 @@ settingAutoSlideshowFolderNeeded.addEventListener('click', e => {
 });
 
 settingStartupBrowseMode.addEventListener('change', async () => {
-  appSettings.startupBrowseMode = settingStartupBrowseMode.value;
-  appSettings.autoSlideshowSource = appSettings.startupBrowseMode === 'categorized'
-    ? 'categorized'
-    : 'folders';
+  appSettings.startupBrowseMode = normalizeBrowseMode(settingStartupBrowseMode.value);
+  appSettings.autoSlideshowSource = autoSlideshowSourceForMode(appSettings.startupBrowseMode);
   syncStartupSourceSettings();
   await persistSettings();
 });
@@ -3573,6 +3707,13 @@ document.addEventListener('keydown', e => {
     return;
   }
 
+  // G — flip between the categorized library and geo country sets
+  if ((e.key === 'g' || e.key === 'G') && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    toggleGeoMode();
+    return;
+  }
+
   // Escape — unwind modals one level at a time
   if (e.key === 'Escape') {
     e.preventDefault();
@@ -3682,12 +3823,13 @@ function finishStartupLoadingAfterFirstImage() {
 // category (Explicit), and setAgentSafe(true) extends that guarantee to the
 // whole window (human UI included) for the session.
 window.SIV = {
-  version: '1.1',
+  version: '1.2',
 
   // --- introspection ---
   blockedCategories: () => [...AGENT_BLOCKED_CATEGORIES],
   isAgentSafe: () => state.agentSafe,
   getState() {
+    const set = activeCategorizedSet();
     return {
       browseMode: state.browseMode,
       categorizedRoot: state.categorizedRoot,
@@ -3698,6 +3840,13 @@ window.SIV = {
         name: c.name, count: c.count, blocked: isAgentBlocked(c.name),
       })),
       filter: [...state.categorizedCategoryFilter],
+      // Geo mode: the scope that is rotating, and the set currently drawn from it.
+      geo: {
+        scope: state.setMode,
+        country: state.setCountry,
+        setsAvailable: state.categorizedSets.length,
+        showing: set ? { id: set.id, title: set.title, country: set.country, sources: set.sources } : null,
+      },
     };
   },
 
@@ -3718,7 +3867,7 @@ window.SIV = {
         of: total,
         path,
         filename: baseName(path),
-        category: state.browseMode === 'categorized' ? categoryForPath(path) : null,
+        category: usesCategorizedRoot() ? categoryForPath(path) : null,
         ocr: ocrTextCache.get(path) || '',
         name: accessibleImageName(cell, path),
         rect: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) },
@@ -3731,6 +3880,35 @@ window.SIV = {
   async next()   { navigateForward(); return this.getShown(); },
   async prev()   { navigateBack(); return this.getShown(); },
   async shuffle() { shuffleCurrent(); return this.getShown(); },
+
+  // --- browse mode ---
+  // Geo is a mode, not a filter: entering it replaces the pool with one curated country set and
+  // leaving it restores the category pool. The blocked-category guard holds in both.
+  async setBrowseMode(mode) {
+    if (!BROWSE_MODES.includes(mode)) throw new Error(`Unknown browse mode: ${mode}`);
+    await switchBrowseMode(mode);
+    return this.getState();
+  },
+  // Countries that have at least one set, in panel order.
+  geoCountries() {
+    return setsByCountry().map(([country, sets]) => ({
+      country,
+      sets: sets.length,
+      sources: sets.reduce((sum, set) => sum + set.sources, 0),
+      diverse: sets.some(set => set.quality === 'diverse'),
+    }));
+  },
+  // `country` = null rotates across every country ("Any country"). Enters geo mode.
+  async setGeoScope(country = null) {
+    if (country && !state.categorizedSets.some(set => (set.country || set.title) === country)) {
+      throw new Error(`No geo sets for: ${country}`);
+    }
+    state.viewedBrowseMode = 'geo';
+    renderFolderPanelSections();
+    if (!hasCategorizedScan()) await enterGeoMode();
+    selectSetScope(country ? 'country' : 'any', country);
+    return this.getState();
+  },
 
   // --- category control (always allowlist-enforced) ---
   setAgentSafe,
@@ -3789,11 +3967,12 @@ armStartupWatchdog();
     normalizeMultiFolderFilter({ defaultAll: true });
     state.categorizedRoot  = s.categorizedRoot || null;
     state.categorizedCategoryFilter = new Set(Array.isArray(s.categorizedCategoryFilter) ? s.categorizedCategoryFilter : []);
-    // Provisional until `loadCategorizedSets` confirms the scope still has sets; it clears if not.
+    // The remembered geo SCOPE, restored regardless of mode — it only reaches the grid if
+    // `browseMode` is 'geo'. Provisional until `loadCategorizedSets` confirms the country still
+    // has sets; it clears if not.
     state.setMode = ['any', 'country'].includes(s.categorizedSetMode) ? s.categorizedSetMode : 'off';
     state.setCountry = state.setMode === 'country' ? (s.categorizedSetCountry || null) : null;
     if (state.setMode === 'country' && !state.setCountry) state.setMode = 'off';
-    state.categorizedSource = state.setMode !== 'off' ? 'sets' : 'categories';
     state.slideshowDuration = Math.max(1000, s.slideshowDuration || 5000);
     appSettings.squareAppCorners = !!s.squareAppCorners;
     appSettings.focusIndicators = s.focusIndicators !== false;
@@ -3810,14 +3989,12 @@ armStartupWatchdog();
     appSettings.firstAutoOpenSlideshow = !!(s.firstAutoOpenSlideshow || s.autoOpenSlideshow);
     appSettings.secondaryAutoOpenSlideshow = !!s.secondaryAutoOpenSlideshow;
     const loadedStartupBrowseMode = normalizeBrowseMode(s.startupBrowseMode);
-    const loadedAutoSource = ['folders', 'categorized'].includes(s.autoSlideshowSource)
+    const loadedAutoSource = ['folders', 'categorized', 'geo'].includes(s.autoSlideshowSource)
       ? s.autoSlideshowSource
-      : loadedStartupBrowseMode === 'categorized'
-        ? 'categorized'
-        : 'folders';
-    appSettings.autoSlideshowSource = loadedStartupBrowseMode === 'categorized'
-      ? 'categorized'
-      : loadedAutoSource;
+      : autoSlideshowSourceForMode(loadedStartupBrowseMode);
+    appSettings.autoSlideshowSource = loadedStartupBrowseMode === 'multi'
+      ? loadedAutoSource
+      : autoSlideshowSourceForMode(loadedStartupBrowseMode);
     appSettings.autoHideUiOnStartup = !!s.autoHideUiOnStartup;
     appSettings.instantFilterCategorized = s.instantFilterCategorized !== false;
     appSettings.startupBrowseMode = loadedStartupBrowseMode;
@@ -3875,6 +4052,8 @@ armStartupWatchdog();
       if (windowLabel === 'main' || isSecondWindow()) {
         if (state.browseMode === 'multi' && state.multiFolders.length) {
           await enterMultiMode();
+        } else if (state.browseMode === 'geo' && state.categorizedRoot) {
+          await enterGeoMode();
         } else if (state.browseMode === 'categorized' && state.categorizedRoot) {
           await enterCategorizedMode(undefined, { eager: true });
         } else {

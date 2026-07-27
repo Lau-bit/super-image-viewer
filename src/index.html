@@ -36,9 +36,10 @@
         <span id="folder-button-label">Folder</span>
       </button>
       <div id="folder-panel">
-        <div id="folder-mode-tabs">
+        <div id="folder-mode-tabs" role="group" aria-label="Browse mode">
           <button type="button" class="folder-mode-tab active" data-browse-mode="multi">Folders</button>
           <button type="button" class="folder-mode-tab" data-browse-mode="categorized">Categorized</button>
+          <button type="button" class="folder-mode-tab" data-browse-mode="geo" aria-label="Geo — curated country sets">Geo</button>
         </div>
         <div class="folder-panel-group">
           <div class="folder-panel-title">Startup</div>
@@ -47,6 +48,7 @@
             <select id="setting-startup-browse-mode" class="settings-select">
               <option value="multi">Folders</option>
               <option value="categorized">Categorized</option>
+              <option value="geo">Geo</option>
             </select>
           </label>
           <button type="button" class="folder-panel-btn" id="setting-use-current-source">Use current source at startup</button>
@@ -59,6 +61,7 @@
             <select id="setting-auto-slideshow-source" class="settings-select">
               <option value="folders">Folders</option>
               <option value="categorized">Categorized</option>
+              <option value="geo">Geo</option>
             </select>
           </label>
           <button type="button" class="folder-panel-btn" id="setting-auto-slideshow-folder-needed" hidden>Set slideshow startup folder</button>
@@ -76,25 +79,26 @@
             <span id="categorized-root-name">No root chosen</span>
             <button type="button" class="folder-panel-btn" id="categorized-root-choose">Choose</button>
           </div>
-          <div id="categorized-source-tabs" role="group" aria-label="Categorized source type">
-            <button type="button" class="categorized-source-tab active" data-categorized-source="categories" aria-pressed="true">Categories</button>
-            <button type="button" class="categorized-source-tab" data-categorized-source="sets" aria-pressed="false">Sets</button>
+          <div id="categories-panel-bulk">
+            <button type="button" id="categories-select-all">All</button>
+            <button type="button" id="categories-select-none">None</button>
+            <button type="button" id="categories-rescan" aria-label="Rescan categorized root">&#x21BB;</button>
           </div>
-          <div id="categorized-source-categories" class="categorized-source-section visible">
-            <div id="categories-panel-bulk">
-              <button type="button" id="categories-select-all">All</button>
-              <button type="button" id="categories-select-none">None</button>
-              <button type="button" id="categories-rescan" aria-label="Rescan categorized root">&#x21BB;</button>
-            </div>
-            <div id="categories-list"></div>
+          <div id="categories-list"></div>
+        </div>
+        <!-- Geo is its own browse mode, not a tab inside Categorized: it replaces the category
+             pool with a curated country set, so hiding it behind Categorized made a 16-image geo
+             set look like the whole library had vanished. -->
+        <div id="folder-section-geo" class="folder-section">
+          <div id="geo-root-row">
+            <span id="geo-root-name">No root chosen</span>
+            <button type="button" class="folder-panel-btn" id="geo-root-choose">Choose</button>
           </div>
-          <div id="categorized-source-sets" class="categorized-source-section">
-            <div id="sets-panel-bulk">
-              <button type="button" id="sets-clear">Use categories</button>
-              <button type="button" id="sets-reload" aria-label="Reload image sets">&#x21BB;</button>
-            </div>
-            <div id="sets-list"></div>
+          <div id="sets-panel-bulk">
+            <button type="button" id="sets-clear">Back to categories</button>
+            <button type="button" id="sets-reload" aria-label="Reload country sets">&#x21BB;</button>
           </div>
+          <div id="sets-list"></div>
         </div>
       </div>
     </div>
@@ -249,6 +253,7 @@
           <div class="shortcut-row"><kbd>&#8592;</kbd><span>Previous set</span></div>
           <div class="shortcut-row"><kbd>&#8594;</kbd><span>Next set</span></div>
           <div class="shortcut-row"><kbd>Ctrl</kbd><kbd>Z</kbd><span>Undo hide / categorize</span></div>
+          <div class="shortcut-row"><kbd>G</kbd><span>Geo &#8596; Categorized</span></div>
           <div class="shortcut-row"><kbd>Shift</kbd><kbd>Q</kbd><span>Show / hide the UI</span></div>
           <div class="shortcut-row"><kbd>?</kbd><span>This list</span></div>
           <div class="shortcut-row"><kbd>Esc</kbd><span>Close menu / panel</span></div>

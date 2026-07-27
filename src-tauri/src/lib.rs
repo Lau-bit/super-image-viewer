@@ -91,10 +91,12 @@ struct Settings {
     categorized_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     categorized_category_filter: Option<Vec<String>>,
-    /// What is driving the pool when curated sets are in use: `"any"` (rotate across every
-    /// country) or `"country"` (rotate within `categorized_set_country`). `None` = the category
-    /// filter is driving instead. A set replaces the category filter rather than intersecting with
-    /// it — a curated sixteen diluted into a seventeen-thousand-image category is no longer a set.
+    /// The geo SCOPE: `"any"` (rotate across every country) or `"country"` (rotate within
+    /// `categorized_set_country`). `None` = nothing picked yet. It is remembered independently of
+    /// the mode and only reaches the grid while `browse_mode == "geo"` — a set replaces the
+    /// category filter rather than intersecting with it (a curated sixteen diluted into a
+    /// seventeen-thousand-image category is no longer a set), so it must never be able to take
+    /// over the categorized pool just by having been selected once.
     ///
     /// The *selection* persists, never the particular set on screen: which set is showing is
     /// re-rolled on every new board, so storing it would only pin a random draw.
@@ -1329,7 +1331,7 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.secondary_display_folder_enabled = settings.secondary_display_folder_enabled;
     current.secondary_display_folder = settings.secondary_display_folder;
     current.browse_mode = match settings.browse_mode.as_str() {
-        "multi" | "categorized" => settings.browse_mode,
+        "multi" | "categorized" | "geo" => settings.browse_mode,
         _ => "multi".to_string(),
     };
     current.multi_folders = settings.multi_folders;
@@ -1342,7 +1344,7 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     };
     current.categorized_set_country = settings.categorized_set_country;
     current.startup_browse_mode = match settings.startup_browse_mode.as_str() {
-        "multi" | "categorized" => settings.startup_browse_mode,
+        "multi" | "categorized" | "geo" => settings.startup_browse_mode,
         _ => "multi".to_string(),
     };
     current.startup_folder = settings.startup_folder;
@@ -1374,7 +1376,7 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.first_auto_open_slideshow = settings.first_auto_open_slideshow;
     current.secondary_auto_open_slideshow = settings.secondary_auto_open_slideshow;
     current.auto_slideshow_source = match settings.auto_slideshow_source.as_str() {
-        "folders" | "categorized" => settings.auto_slideshow_source,
+        "folders" | "categorized" | "geo" => settings.auto_slideshow_source,
         _ => "folders".to_string(),
     };
     current.auto_hide_ui_on_startup = settings.auto_hide_ui_on_startup;
@@ -1626,7 +1628,6 @@ async fn open_image_window(
         .lock()
         .unwrap()
         .insert(label.clone(), owner_label);
-    let settings = load_settings_inner(&app);
 
     let image_window = match WebviewWindowBuilder::new(
         &app,
@@ -1652,7 +1653,12 @@ async fn open_image_window(
     };
 
     set_app_window_icon(&image_window);
-    let _ = set_square_window_corners(&image_window, settings.square_app_corners);
+    // Floating images keep rounded corners whatever "Square app outer corners" says: that setting
+    // is about the app's own chrome, and a hard-cornered picture floating over the desktop reads as
+    // a glitch rather than a style. `false` means DWMWCP_DEFAULT — "let the system decide" — so
+    // Windows still squares this window off by itself the moment it is snapped or maximized. Both
+    // behaviours, natively, with no snap tracking of our own.
+    let _ = set_square_window_corners(&image_window, false);
     // Set size first, then position last: on Windows a resize can nudge the
     // window across DPI boundaries, so the final `set_position` pins the
     // clamped placement. Physical units avoid any logical round-trip drift.
@@ -1753,6 +1759,20 @@ pub fn run() {
             open_image_window,
             get_assigned_image_path,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // Backstop against surviving our own closed window. A thread still holding
+            // a runtime handle at teardown can park forever (any blocking `win.*` call
+            // made after the event loop stops serving dispatches never returns), leaving
+            // an invisible process with no UI that holds a Windows image lock on this
+            // exe — which then fails the next build with "failed to remove file /
+            // Access is denied (os error 5)". Diagnosed for real in tauri-dev-broker's
+            // GUI on 2026-07-26; this app spawns no long-lived thread today, so this is
+            // insurance against one being added. Safe to exit hard: the only Drop impl
+            // here is a scoped open-claim guard, and settings are written in commands.
+            if let tauri::RunEvent::Exit = event {
+                std::process::exit(0);
+            }
+        });
 }
