@@ -44,9 +44,10 @@ function clamp(value, min, max) {
 const state = {
   folder:     null,
   allImages:  [],          // [{path, modified}] newest-first
-  // 'multi' = pick folders. 'categorized' and 'geo' both browse ONE categorized root off the same
-  // scan and differ only in what fills the pool: the category filter, or a curated country set.
-  browseMode: 'multi',    // 'multi' | 'categorized' | 'geo'
+  // 'multi' = pick folders. Every other mode browses ONE categorized root off the same scan and
+  // differs only in what fills the board: the category filter, a curated country set, both blended
+  // per board ('mix'), or both taking turns a whole board at a time ('alt').
+  browseMode: 'multi',    // 'multi' | 'categorized' | 'geo' | 'mix' | 'alt'
   viewedBrowseMode: 'multi',
   multiFolders: [],
   multiFolderFilter: new Set(),
@@ -59,8 +60,9 @@ const state = {
   // A set is an alternative POOL SOURCE, not another filter: while a set drives the pool it IS the
   // pool, and the category checkboxes stop driving anything. Mixing a curated sixteen into a
   // 17k-image category would simply dissolve it. That is exactly why geo is a separate browse
-  // mode: `browseMode === 'geo'` is the ONLY thing that lets a set reach the grid, so a remembered
-  // country can never quietly replace the categorized library it was selected alongside.
+  // mode: `browseMode` being 'geo' (whole board) or 'mix' (a ratio of it) is the ONLY thing that
+  // lets a set reach the grid, so a remembered country can never quietly replace the categorized
+  // library it was selected alongside.
   //
   // Selection is by COUNTRY, not by individual set: `setMode` is 'off' | 'any' | 'country', and
   // each new board re-rolls which of the eligible sets is showing. `categorizedSetId` is therefore
@@ -68,9 +70,29 @@ const state = {
   // survives leaving geo mode, so coming back lands on the country you left.
   categorizedSets: [],
   categorizedSetId: null,
+  // Which set is actually ON THE GRID, as opposed to which one the pool was last swapped to.
+  // The two diverge for as long as a board outlives the draw that produced it: arrowing back
+  // replays an older country's tiles, and the slideshow rotates the pool a second early so the
+  // next country's images have time to preload. Every country label reads THIS, never
+  // `categorizedSetId`, or the toolbar cheerfully reads "Geo: Denmark" over a Korean board.
+  displayedSetId: null,
   setMode: 'off',
   setCountry: null,
   setBag: [],                       // shuffled ids not yet drawn this cycle
+
+  // The two "blend" modes, mix and alt. Neither merges the pools — merging is what would make a
+  // curated sixteen meaningless beside a 17k-image category — they divide them with a ratio, and
+  // differ only in WHAT the ratio divides:
+  //   mix  — the TILES of every board: round(mixRatio%) of them come from the country set.
+  //   alt  — the BOARDS: whole boards take turns, altRatio% of them geo. This is the one that
+  //          shows a country set intact, which is the point of curating sixteen images.
+  // `geoSidePaths` marks which members of `allImages` belong to the geo side — the only thing
+  // telling the two apart once they are in one pool (which they must be, so hide/undo, replacement
+  // picks, preload and the floating viewer keep working unchanged).
+  mixRatio: 50,                     // percent of each board's TILES drawn from the geo set
+  altRatio: 50,                     // percent of BOARDS that are geo boards
+  altBoardIndex: 0,                 // which step of the alternation the current board is
+  geoSidePaths: new Set(),
   // Paths vetoed as geo-set members this session. Mirrors the on-disk exclusion file so the
   // context menu can show the action as already done without re-reading it per right-click.
   geoExcludedPaths: new Set(),
@@ -222,6 +244,7 @@ const startupLoadingHint = document.getElementById('startup-loading-hint');
 const folderSectionMulti = document.getElementById('folder-section-multi');
 const folderSectionCategorized = document.getElementById('folder-section-categorized');
 const folderSectionGeo   = document.getElementById('folder-section-geo');
+const folderSectionBlend = document.getElementById('folder-section-blend');
 const folderMultiAdd     = document.getElementById('folder-multi-add');
 const multiFolderListEl  = document.getElementById('multi-folder-list');
 const categorizedRootNameEl = document.getElementById('categorized-root-name');
@@ -235,6 +258,14 @@ const geoRootChoose      = document.getElementById('geo-root-choose');
 const setsList           = document.getElementById('sets-list');
 const setsClear          = document.getElementById('sets-clear');
 const setsReload         = document.getElementById('sets-reload');
+const blendRootNameEl    = document.getElementById('blend-root-name');
+const blendRootChoose    = document.getElementById('blend-root-choose');
+const blendHintEl        = document.getElementById('blend-hint');
+const blendRatioSlider   = document.getElementById('blend-ratio-slider');
+const blendRatioValue    = document.getElementById('blend-ratio-value');
+const blendRatioDetail   = document.getElementById('blend-ratio-detail');
+const blendCategoriesList = document.getElementById('blend-categories-list');
+const blendSetsList      = document.getElementById('blend-sets-list');
 const countDisplayEl     = document.getElementById('count-display');
 const emptyDisplayEl     = document.getElementById('empty-display');
 const btnFolder          = document.getElementById('btn-folder');
@@ -299,11 +330,13 @@ function applyGridLayout(count) {
 // ==============================
 // Image selection
 // ==============================
-function pickRandom(n, exclude = null) {
-  if (!state.allImages.length) return [];
+// Takes the list to draw from rather than reading `state.allImages`: mix mode picks each half of a
+// board from its own side of the pool, and that is the only difference between the two.
+function pickRandomFrom(images, n, exclude = null) {
+  if (n <= 0 || !images.length) return [];
   const pool   = exclude
-    ? state.allImages.filter(img => !exclude.has(img.path))
-    : state.allImages.slice();
+    ? images.filter(img => !exclude.has(img.path))
+    : images.slice();
   const result = [];
   while (result.length < n && pool.length) {
     const idx = Math.floor(Math.random() * pool.length);
@@ -314,10 +347,97 @@ function pickRandom(n, exclude = null) {
 
 // `exclude` (locked images already placed) is filtered out after slicing from
 // `offset`, so the chrono page start still indexes into the full timeline.
-function pickChrono(n, offset, exclude = null) {
-  let list = state.allImages.slice(Math.max(0, offset));
+function pickChronoFrom(images, n, offset, exclude = null) {
+  if (n <= 0) return [];
+  let list = images.slice(Math.max(0, offset));
   if (exclude) list = list.filter(img => !exclude.has(img.path));
   return list.slice(0, n).map(img => img.path);
+}
+
+function pickRandom(n, exclude = null) {
+  return pickRandomFrom(state.allImages, n, exclude);
+}
+
+function pickChrono(n, offset, exclude = null) {
+  return pickChronoFrom(state.allImages, n, offset, exclude);
+}
+
+// Split `n` image slots between the two sides. This is the whole of what the two ratio sliders do
+// — everything else about mix/alt is bookkeeping to keep the two pools distinguishable inside one
+// `allImages`. Mix divides a board; Alt hands the whole board to one side and lets the ratio
+// decide how often each side's turn comes round.
+function blendSlotSplit(n, mode = state.browseMode) {
+  if (mode === 'alt') {
+    return altBoardIsGeo() ? { geo: n, categorized: 0 } : { geo: 0, categorized: n };
+  }
+  const geo = clamp(Math.round((n * state.mixRatio) / 100), 0, n);
+  return { geo, categorized: n - geo };
+}
+
+// Is the board at `index` a geo board? Evenly spaced rather than random: at 50% the user asked for
+// alternation, and a coin flip clumps into runs of four that read as the mode being broken. The
+// modulo walk gives G,C,G,C at 50%, G,C,C,C at 25%, G,C,G,G at 75% — and starts on geo, because
+// entering the mode and seeing the category library is not what picking Alt meant.
+function altBoardIsGeo(index = state.altBoardIndex) {
+  if (state.altRatio <= 0) return false;
+  if (state.altRatio >= 100) return true;
+  return ((index * state.altRatio) % 100) < state.altRatio;
+}
+
+// How many of the next `count` boards are geo — for the panel readout, which otherwise cannot say
+// anything more useful than a percentage.
+function altBoardPattern(count = 8) {
+  return Array.from({ length: count }, (_, i) => altBoardIsGeo(state.altBoardIndex + i));
+}
+
+// The live pool, cut back into its two sides. Derived from `allImages` rather than kept alongside
+// it, so an image hidden this session is gone from whichever side it was on.
+function blendSubPools() {
+  const geo = [];
+  const categorized = [];
+  for (const image of state.allImages) {
+    (state.geoSidePaths.has(image.path) ? geo : categorized).push(image);
+  }
+  return { geo, categorized };
+}
+
+// A chrono page start indexes into `allImages`, which in these modes is both sides at once;
+// applying that offset unchanged to a 16-image set would park it on its last image forever. Scale
+// it into each side instead, so paging forward advances both proportionally.
+function scaleChronoOffset(offset, subLength, totalLength) {
+  if (!offset || subLength <= 0 || totalLength <= 0) return 0;
+  return Math.min(subLength, Math.floor((offset * subLength) / totalLength));
+}
+
+// One board's worth of paths, split per `blendSlotSplit`.
+//
+// Mix lets a short side spill into the other, because a blended board with holes in it is just a
+// worse blended board. Alt must NOT: its whole promise is that a geo board is nothing but that
+// country, so a three-image set shows three images and thirteen empty cells — exactly what geo
+// mode already does with a short set.
+function pickBlendPaths(n, exclude, chronoOffset) {
+  const { geo, categorized } = blendSubPools();
+  const split = blendSlotSplit(n);
+  const total = geo.length + categorized.length;
+  const taken = new Set(exclude);
+
+  const take = (images, count) => {
+    const picks = state.displayMode === 'random'
+      ? pickRandomFrom(images, count, taken)
+      : pickChronoFrom(images, count, scaleChronoOffset(chronoOffset, images.length, total), taken);
+    for (const path of picks) taken.add(path);
+    return picks;
+  };
+
+  if (state.browseMode === 'alt') {
+    return take(split.geo ? geo : categorized, n);
+  }
+
+  const geoPicks = take(geo, split.geo);
+  const catPicks = take(categorized, split.categorized + (split.geo - geoPicks.length));
+  const shortfall = n - geoPicks.length - catPicks.length;
+  const spill = shortfall > 0 ? take(geo, shortfall) : [];
+  return [...geoPicks, ...catPicks, ...spill];
 }
 
 // Build a slot array: image paths + null empty slots, all shuffled together.
@@ -335,9 +455,11 @@ function generateSlots(chronoOffset = state.chronoOffset) {
   const imgN      = total - empties;
   const freshImgN = Math.max(0, imgN - lockedCount);
 
-  const paths = state.displayMode === 'random'
-    ? pickRandom(freshImgN, lockedPaths)
-    : pickChrono(freshImgN, chronoOffset, lockedPaths);
+  const paths = usesBlendPool()
+    ? pickBlendPaths(freshImgN, lockedPaths, chronoOffset)
+    : state.displayMode === 'random'
+      ? pickRandom(freshImgN, lockedPaths)
+      : pickChrono(freshImgN, chronoOffset, lockedPaths);
 
   // Non-locked slot contents: fresh images, padding nulls, and empty slots,
   // shuffled together — then poured into the positions locks didn't claim.
@@ -367,10 +489,23 @@ function generateSlots(chronoOffset = state.chronoOffset) {
 // ==============================
 function pushHistory(slots, chronoOffset) {
   hist.stack.splice(hist.pos + 1);                 // discard forward entries
-  hist.stack.push({ slots: [...slots], chronoOffset });
+  // Stamp the geo set these slots were drawn from. A board is a snapshot of one country, so the
+  // country belongs to the history entry — not to a mutable "current draw" that has already moved
+  // on by the time you arrow back to it.
+  const setId = boardSetId();
+  hist.stack.push({ slots: [...slots], chronoOffset, setId });
   if (hist.stack.length > HISTORY_MAX) hist.stack.shift();
   hist.pos = hist.stack.length - 1;
+  setDisplayedSet(setId);
   syncNavButtons();
+}
+
+// The set the board being pushed is actually made of. In alt, every other board is a CATEGORY
+// board that happens to have a country set loaded beside it — stamping that set would put a
+// country name over a board with none of its images on it.
+function boardSetId() {
+  if (state.browseMode === 'alt' && !altBoardIsGeo()) return null;
+  return state.categorizedSetId;
 }
 
 function restoreEntry(entry, options = {}) {
@@ -378,7 +513,24 @@ function restoreEntry(entry, options = {}) {
   // set is replayed; the stored history entry itself is left untouched.
   state.displayedSlots = overlayLocks([...entry.slots]);
   state.chronoOffset   = entry.chronoOffset;
+  // Replaying an older board puts an older country back on screen; the labels must follow it back.
+  setDisplayedSet(entry.setId ?? null);
   renderGrid(state.displayedSlots, options);
+}
+
+// Point every country-facing label at `setId` and repaint them. One place, because the folder
+// button, the pool header and the "showing" mark in the sets panel must never disagree about
+// which country the grid is displaying.
+function setDisplayedSet(setId) {
+  if (state.displayedSetId === setId) return;
+  state.displayedSetId = setId;
+  syncDisplayedSetLabels();
+}
+
+function syncDisplayedSetLabels() {
+  renderFolderButton();
+  if (usesGeoSets()) folderNameEl.textContent = categorizedPoolLabel();
+  renderSetsPanel();
 }
 
 function syncNavButtons() {
@@ -394,7 +546,12 @@ function startupSourceLabel() {
   }
   if (!appSettings.startupCategorizedRoot) return 'No categorized root set';
   const root = baseName(appSettings.startupCategorizedRoot);
-  return appSettings.startupBrowseMode === 'geo' ? `${root} · geo` : root;
+  if (appSettings.startupBrowseMode === 'geo') return `${root} · geo`;
+  if (usesBlendPool(appSettings.startupBrowseMode)) {
+    const mode = appSettings.startupBrowseMode;
+    return `${root} · ${mode} ${blendRatio(mode)}% geo`;
+  }
+  return root;
 }
 
 function syncStartupSourceSettings() {
@@ -470,7 +627,7 @@ async function loadConfiguredStartupSource() {
 }
 
 async function loadAutoSlideshowSource() {
-  if (appSettings.autoSlideshowSource === 'categorized' || appSettings.autoSlideshowSource === 'geo') {
+  if (['categorized', 'geo', 'mix', 'alt'].includes(appSettings.autoSlideshowSource)) {
     await loadAutoSlideshowCategorizedSource(appSettings.autoSlideshowSource);
     return;
   }
@@ -1240,7 +1397,14 @@ function navigateBack() {
   restoreEntry(hist.stack[hist.pos], { stagger: state.slideshow });
   syncNavButtons();
   rescheduleSlideshowTick();
-  if (!state.slideshow) announce('Previous set');
+  if (!state.slideshow) announce(`Previous set${navSetSuffix()}`);
+}
+
+// The country an arrow landed on, for the live region. Only where a set is showing.
+function navSetSuffix() {
+  if (!usesGeoSets()) return '';
+  const set = displayedCategorizedSet();
+  return set ? ` — ${set.country || set.title}` : '';
 }
 
 function navigateForward() {
@@ -1249,7 +1413,7 @@ function navigateForward() {
     hist.pos++;
     restoreEntry(hist.stack[hist.pos], { stagger: state.slideshow });
     syncNavButtons();
-    if (!state.slideshow) announce('Next set');
+    if (!state.slideshow) announce(`Next set${navSetSuffix()}`);
   } else {
     const preloadedPlan = state.slideshow ? takeSlideshowPreloadPlan() : null;
     if (preloadedPlan) {
@@ -1370,6 +1534,7 @@ function clearDisplayFolder() {
   state.allImages = [];
   state.displayedSlots = [];
   state.chronoOffset = 0;
+  state.displayedSetId = null;
   hist.stack = [];
   hist.pos = -1;
   // Same reason as in loadImagePool: undo entries restore by pool index, and
@@ -1391,21 +1556,37 @@ function fileKey(path) {
   return String(path || '').toLocaleLowerCase();
 }
 
-const BROWSE_MODES = ['multi', 'categorized', 'geo'];
+const BROWSE_MODES = ['multi', 'categorized', 'geo', 'mix', 'alt'];
 
 function normalizeBrowseMode(mode) {
   return BROWSE_MODES.includes(mode) ? mode : 'multi';
 }
 
-// Categorized and Geo are two pools over ONE root and ONE scan: the category sidecar, its OCR,
-// the categorize/exclude actions and the hash cache are all equally available in both. Anything
+// Every mode but 'multi' is a pool over ONE root and ONE scan: the category sidecar, its OCR, the
+// categorize/exclude actions and the hash cache are all equally available in all of them. Anything
 // that only needs "am I browsing a categorizer library" must ask this, not `=== 'categorized'`.
 function usesCategorizedRoot(mode = state.browseMode) {
-  return mode === 'categorized' || mode === 'geo';
+  return mode !== 'multi';
+}
+
+// A country set reaches the grid in these modes and nowhere else, so they are the ones that rotate
+// on a new board and the ones whose labels can name a country.
+function usesGeoSets(mode = state.browseMode) {
+  return mode === 'geo' || mode === 'mix' || mode === 'alt';
+}
+
+// Mix and Alt share everything except what their ratio divides: one union pool marked up by
+// `geoSidePaths`, one panel section, one set of controls.
+function usesBlendPool(mode = state.browseMode) {
+  return mode === 'mix' || mode === 'alt';
 }
 
 function browseModeLabel(mode) {
-  return mode === 'multi' ? 'Folders' : mode === 'geo' ? 'Geo' : 'Categorized';
+  if (mode === 'multi') return 'Folders';
+  if (mode === 'geo') return 'Geo';
+  if (mode === 'mix') return 'Mix';
+  if (mode === 'alt') return 'Alt';
+  return 'Categorized';
 }
 
 function uniqueFolders(folders) {
@@ -1510,12 +1691,20 @@ function renderFolderButton() {
       : enabled.length === 1
         ? baseName(enabled[0])
         : `${enabled.length}/${state.multiFolders.length} folders`;
-  } else if (state.browseMode === 'geo') {
-    // The country beats the root name here: in geo mode the root never changes but the country
-    // does, every board, and that is the thing worth reading off the toolbar.
-    const set = activeCategorizedSet();
-    const country = set ? (set.country || set.title) : state.setCountry;
-    label = country ? `Geo: ${country}` : 'Geo';
+  } else if (usesGeoSets()) {
+    // The country beats the root name here: in these modes the root never changes but the country
+    // does, every board, and that is the thing worth reading off the toolbar. It names what is on
+    // the GRID — the pool may already have rotated past it.
+    const set = displayedCategorizedSet();
+    const prefix = browseModeLabel(state.browseMode);
+    // Alt's category boards have no country at all — naming the root there is the honest label,
+    // and it is also the one that tells you which half of the alternation you are looking at.
+    const country = set
+      ? (set.country || set.title)
+      : (state.browseMode === 'alt'
+        ? (state.categorizedRoot ? baseName(state.categorizedRoot) : null)
+        : state.setCountry);
+    label = country ? `${prefix}: ${country}` : prefix;
   } else {
     label = state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized';
   }
@@ -1524,7 +1713,13 @@ function renderFolderButton() {
   btnFolder.classList.toggle('mode-multi', state.browseMode === 'multi');
   btnFolder.classList.toggle('mode-categorized', state.browseMode === 'categorized');
   btnFolder.classList.toggle('mode-geo', state.browseMode === 'geo');
-  btnFolder.setAttribute('aria-label', `Open / manage image sources — ${browseModeLabel(state.browseMode)} mode`);
+  btnFolder.classList.toggle('mode-mix', state.browseMode === 'mix');
+  btnFolder.classList.toggle('mode-alt', state.browseMode === 'alt');
+  const ratio = usesBlendPool() ? ` — ${blendRatio()}% geo` : '';
+  btnFolder.setAttribute(
+    'aria-label',
+    `Open / manage image sources — ${browseModeLabel(state.browseMode)} mode${ratio}`
+  );
 }
 
 function renderFolderPanelSections() {
@@ -1536,7 +1731,13 @@ function renderFolderPanelSections() {
   folderSectionMulti.classList.toggle('visible', state.viewedBrowseMode === 'multi');
   folderSectionCategorized.classList.toggle('visible', state.viewedBrowseMode === 'categorized');
   folderSectionGeo.classList.toggle('visible', state.viewedBrowseMode === 'geo');
+  folderSectionBlend.classList.toggle('visible', usesBlendPool(state.viewedBrowseMode));
+  // Categorized and Geo each own a list that Mix/Alt also show. Both render into the tab being
+  // VIEWED and only that one, so switching tabs repopulates rather than paying for two copies of
+  // a 53-row country list on every board.
+  renderCategoriesPanel();
   renderSetsPanel();
+  syncBlendControls();
 }
 
 // Switch the whole browse mode from the tab strip (or the G shortcut). Categorized <-> Geo reuses
@@ -1553,20 +1754,26 @@ async function switchBrowseMode(mode) {
     await enterGeoMode();
     return;
   }
+  if (usesBlendPool(mode)) {
+    await enterBlendMode(mode);
+    return;
+  }
   if (hasCategorizedScan()) {
-    applyCategorizedFilter();
+    // Not `applyCategorizedFilter()`: that one is mode-aware and would keep a mix board mixed,
+    // which is the opposite of what pressing the Categorized tab means.
+    loadCategorizedPool();
     return;
   }
   await enterCategorizedMode();
 }
 
-// Jump between the two categorized-root pools without opening the panel.
-function toggleGeoMode() {
+// Jump between the categorized-root pools without opening the panel.
+function toggleCategorizedRootMode(mode) {
   if (!usesCategorizedRoot() && !state.categorizedRoot) {
     showToast('Choose a categorized root first');
     return;
   }
-  switchBrowseMode(state.browseMode === 'geo' ? 'categorized' : 'geo');
+  switchBrowseMode(state.browseMode === mode ? 'categorized' : mode);
 }
 
 function loadImagePool(images, label, mode, folder = null) {
@@ -1576,6 +1783,8 @@ function loadImagePool(images, label, mode, folder = null) {
   state.browseMode = mode;
   state.viewedBrowseMode = mode;
   state.chronoOffset = 0;
+  // History is what remembers which country each board showed; dropping it drops those stamps too.
+  state.displayedSetId = usesGeoSets(mode) ? boardSetId() : null;
   hist.stack = [];
   hist.pos = -1;
   // Undo entries splice back into this pool by index — they mean nothing once
@@ -1691,13 +1900,21 @@ function renderCategorizedRootRow() {
   else categorizedRootNameEl.removeAttribute('aria-label');
 }
 
+// The category checkboxes appear in two places — the Categorized tab, where they own the whole
+// board, and the shared Mix/Alt tab, where they own the non-geo share. Only the visible one is
+// built.
+function categoriesListContainer() {
+  return usesBlendPool(state.viewedBrowseMode) ? blendCategoriesList : categoriesList;
+}
+
 function renderCategoriesPanel() {
-  categoriesList.textContent = '';
+  const container = categoriesListContainer();
+  container.textContent = '';
   if (!state.categorizedCategories.length) {
     const empty = document.createElement('div');
     empty.className = 'categories-empty';
     empty.textContent = 'No categorized images found.';
-    categoriesList.append(empty);
+    container.append(empty);
     return;
   }
   for (const category of state.categorizedCategories) {
@@ -1718,7 +1935,7 @@ function renderCategoriesPanel() {
     count.className = 'category-checkbox-count';
     count.textContent = category.count;
     row.append(checkbox, name, count);
-    categoriesList.append(row);
+    container.append(row);
   }
 }
 
@@ -1774,56 +1991,105 @@ function drawNextSet() {
 
 // Swap the pool to the next set in the bag. Deliberately does NOT go through `loadImagePool`:
 // that resets history, and being able to arrow back to the country you just saw is most of the
-// value of rotating in the first place. Only ever fires in geo mode — in Categorized the pool
-// belongs to the category filter and nothing may take it over.
+// value of rotating in the first place. Only fires where a set drives the grid — in Categorized
+// the pool belongs to the category filter and nothing may take it over.
 function rotateSetIfActive() {
-  if (state.browseMode !== 'geo' || state.setMode === 'off') return false;
+  if (!usesGeoSets() || state.setMode === 'off') return false;
+  // Alt advances its alternation here — this is the one call every "new board" path already makes
+  // before generating slots, so the counter and the board it labels can never disagree. A board
+  // that is about to be a CATEGORY board must not consume a country draw, or half the countries
+  // would be spent unseen.
+  if (state.browseMode === 'alt') {
+    state.altBoardIndex++;
+    if (!altBoardIsGeo()) return false;
+  }
   const set = drawNextSet();
   if (!set) return false;
 
-  const images = categorizedSetImages(set);
+  let images;
+  if (usesBlendPool()) {
+    // Rebuild only the geo side. Rebuilding the whole blend pool would also un-hide every image
+    // hidden from the categorized side — every five seconds, in a slideshow.
+    const geo = categorizedSetImages(set);
+    const geoPaths = new Set(geo.map(image => image.path));
+    // The set being retired does NOT simply leave: a member that is also in the shown categories
+    // was only on the geo side because the geo side claims duplicates, and it belongs to the
+    // categorized side now. Dropping the whole outgoing set instead bled ~16 images out of the
+    // pool per board — invisible for one rotation, a real hole after a slideshow.
+    const kept = state.allImages.filter(image => !geoPaths.has(image.path)
+      && (!state.geoSidePaths.has(image.path) || inCategoryFilter(image)));
+    state.geoSidePaths = geoPaths;
+    images = [...geo, ...kept];
+  } else {
+    images = categorizedSetImages(set);
+  }
   state.allImages = [...images].sort((a, b) => b.modified - a.modified);
-  folderNameEl.textContent = categorizedPoolLabel();
   document.body.classList.toggle('no-folder', !state.allImages.length);
-  renderFolderButton();
-  renderSetsPanel();
+  // Deliberately NOT relabelling here. The new country's tiles are not on screen yet — the
+  // slideshow rotates a whole preload-lead ahead of showing them — so naming it now is the
+  // stale-label bug in the other direction. `pushHistory` relabels once the board is rendered.
   return true;
 }
 
 function categorizedPoolLabel(mode = state.browseMode) {
   const root = state.categorizedRoot ? baseName(state.categorizedRoot) : 'Categorized';
-  if (mode !== 'geo') return root;
-  const set = activeCategorizedSet();
+  if (!usesGeoSets(mode)) return root;
+  const set = displayedCategorizedSet();
+  if (mode === 'mix') {
+    // Both sides are named, because in mix both are on the board: the ratio says how much of it
+    // each one got.
+    const geo = set ? set.title : 'no sets';
+    return `Mix ${state.mixRatio}/${100 - state.mixRatio} · ${geo} + ${root}`;
+  }
+  if (mode === 'alt') {
+    // Only ONE side is on the board, so name only that one — with the ratio in front so the
+    // rhythm you are in is still readable from a category board.
+    return `Alt ${state.altRatio}/${100 - state.altRatio} · ${set ? set.title : root}`;
+  }
   // "Geo" stays in front of the set title so the header always says which mode you are in.
   return set ? `Geo · ${set.title}` : 'Geo · no sets';
+}
+
+// The country list is shared by the Geo tab and the Mix/Alt tab; like the category list, only the
+// tab being viewed is built, so a board never pays to render 53 rows twice.
+function setsListContainer() {
+  return usesBlendPool(state.viewedBrowseMode) ? blendSetsList : setsList;
 }
 
 function renderSetsPanel() {
   // Always available while there is a root: it is the one-click way back to the categorized
   // library, which has to work even when geo mode itself came up empty.
   setsClear.disabled = !state.categorizedRoot;
-  geoRootNameEl.textContent = state.categorizedRoot ? baseName(state.categorizedRoot) : 'No root chosen';
-  if (state.categorizedRoot) geoRootNameEl.setAttribute('aria-label', state.categorizedRoot);
-  else geoRootNameEl.removeAttribute('aria-label');
-  setsList.textContent = '';
+  const rootLabel = state.categorizedRoot ? baseName(state.categorizedRoot) : 'No root chosen';
+  for (const el of [geoRootNameEl, blendRootNameEl]) {
+    el.textContent = rootLabel;
+    if (state.categorizedRoot) el.setAttribute('aria-label', state.categorizedRoot);
+    else el.removeAttribute('aria-label');
+  }
+  const container = setsListContainer();
+  container.textContent = '';
 
   if (!state.categorizedRoot) {
     const empty = document.createElement('div');
     empty.className = 'categories-empty';
     empty.textContent = 'Choose a categorized root first.';
-    setsList.append(empty);
+    container.append(empty);
     return;
   }
   if (!state.categorizedSets.length) {
     const empty = document.createElement('div');
     empty.className = 'categories-empty';
-    empty.textContent = 'No image sets found. Build country sets in Image Categorizer, then reload.';
-    setsList.append(empty);
+    // Mix and Alt still work without sets — they just degenerate to the category pool — so say
+    // that rather than leaving the tab looking broken.
+    empty.textContent = usesBlendPool(state.viewedBrowseMode)
+      ? `No country sets found — ${browseModeLabel(state.viewedBrowseMode)} is showing categorized images only. Build country sets in Image Categorizer, then reload from the Geo tab.`
+      : 'No image sets found. Build country sets in Image Categorizer, then reload.';
+    container.append(empty);
     return;
   }
 
   const grouped = setsByCountry();
-  const current = activeCategorizedSet();
+  const current = displayedCategorizedSet();
 
   const addRow = ({ label, meta, active, onClick, ariaLabel, extraClass }) => {
     const row = document.createElement('button');
@@ -1840,9 +2106,13 @@ function renderSetsPanel() {
     row.append(name, metaEl);
     row.setAttribute('aria-label', ariaLabel);
     row.addEventListener('click', onClick);
-    setsList.append(row);
+    container.append(row);
     return row;
   };
+
+  // Which mode a row click lands in is decided by the tab it was rendered into, not by the mode
+  // at click time — the same list is the Geo tab's switch and the Mix/Alt tab's geo-side picker.
+  const target = usesBlendPool(state.viewedBrowseMode) ? state.viewedBrowseMode : 'geo';
 
   const totalVideos = state.categorizedSets.reduce((sum, set) => sum + set.sources, 0);
   addRow({
@@ -1851,7 +2121,7 @@ function renderSetsPanel() {
     active: state.setMode === 'any',
     extraClass: 'set-row-any',
     ariaLabel: `Any country — rotate pseudorandomly across all ${state.categorizedSets.length} sets, ${totalVideos} videos`,
-    onClick: () => selectSetScope('any', null),
+    onClick: () => selectSetScope('any', null, target),
   });
 
   for (const [country, sets] of grouped) {
@@ -1865,7 +2135,7 @@ function renderSetsPanel() {
       ariaLabel: `${country} — ${sets.length} set${sets.length === 1 ? '' : 's'}, ${videos} videos${
         limited ? ', limited variety' : ''
       }`,
-      onClick: () => selectSetScope('country', country),
+      onClick: () => selectSetScope('country', country, target),
     });
     if (limited) {
       const badge = document.createElement('span');
@@ -1881,14 +2151,16 @@ function renderSetsPanel() {
   }
 }
 
-// Picking a country from the panel also ENTERS geo mode — clicking a country and staying on the
-// category pool would be a dead control, and this is the switch the user actually reaches for.
-function selectSetScope(mode, country) {
+// Picking a country from the panel also ENTERS the mode that shows it — clicking a country and
+// staying on the category pool would be a dead control, and this is the switch the user actually
+// reaches for. `target` says which of the two set-showing modes that is.
+function selectSetScope(mode, country, target = usesGeoSets() ? state.browseMode : 'geo') {
   state.setMode = mode;
   state.setCountry = country;
   state.setBag = [];
   state.categorizedSetId = null;
-  applyGeoPool();
+  if (usesBlendPool(target)) applyBlendPool(target);
+  else applyGeoPool();
 }
 
 // Board size for a scope: the LARGEST set it can draw, not the one that happened to come up.
@@ -1910,6 +2182,9 @@ function applyGeoPool() {
     state.setBag = [];
   }
   const set = activeCategorizedSet() || drawNextSet();
+  // A fresh pool discards history, so the board about to be built IS this set — say so before the
+  // label is computed below, not after.
+  state.displayedSetId = state.categorizedSetId;
   const images = set ? categorizedSetImages(set) : [];
   renderSetsPanel();
   // Sized before the pool loads, not after, so the board is built once at the right size.
@@ -1944,6 +2219,150 @@ async function enterGeoMode() {
   applyGeoPool();
 }
 
+// ==============================
+// Mix + Alt — the two modes that hold both pools at once
+// ==============================
+// The two sources stay separate all the way to the board: the set is a member list and the
+// category filter is a 17k-image pool, so merging them into one pool and drawing at random would
+// hand the set roughly 0.1% of the tiles. A ratio divides them instead — Mix divides the tiles of
+// a board, Alt divides the boards (see `pickBlendPaths`). They still have to live in ONE
+// `state.allImages`, because everything downstream — hide/undo, replacement picks, slideshow
+// preload, the floating viewer, chrono paging — indexes that one array; `geoSidePaths` is what
+// tells the two halves apart inside it.
+function blendRatio(mode = state.browseMode) {
+  return mode === 'alt' ? state.altRatio : state.mixRatio;
+}
+
+function buildBlendPool(set) {
+  const geo = set ? categorizedSetImages(set) : [];
+  const geoPaths = new Set(geo.map(image => image.path));
+  // A set member that is also in the shown categories belongs to the geo side only — otherwise it
+  // could land on the board twice, once from each half.
+  const rest = categorizedFilteredImages('categorized').filter(image => !geoPaths.has(image.path));
+  return { images: [...geo, ...rest], geoPaths, geoCount: geo.length };
+}
+
+// Build (or rebuild) the pool for `mode` from the current scope + category filter.
+function applyBlendPool(mode = state.browseMode) {
+  if (state.setMode === 'off' && state.categorizedSets.length) {
+    state.setMode = 'any';
+    state.setCountry = null;
+    state.setBag = [];
+  }
+  // Alt restarts its alternation on a fresh pool so entering the mode always opens on a geo board
+  // — the mode's whole point is the country set, and opening on the category library reads as
+  // "nothing happened".
+  if (mode === 'alt') state.altBoardIndex = 0;
+  const set = activeCategorizedSet() || drawNextSet();
+  state.displayedSetId = mode === 'alt' && !altBoardIsGeo() ? null : state.categorizedSetId;
+  const { images, geoPaths, geoCount } = buildBlendPool(set);
+  state.geoSidePaths = geoPaths;
+  renderSetsPanel();
+  syncBlendControls();
+  // Alt shows a set INTACT, so it sizes the board to the scope's largest set exactly as geo does —
+  // a curated sixteen shown nine at a time is not the thing that was curated. Mix must not: only a
+  // share of its tiles come from the set, so sizing to sixteen would blow up a nine-tile board.
+  if (set && mode === 'alt') syncImageCountControls(geoScopeImageCount(eligibleSets()));
+  loadImagePool(images, categorizedPoolLabel(mode), mode);
+  const board = Math.max(1, state.imageCount - state.emptyCount);
+  const split = blendSlotSplit(board, mode);
+  const label = browseModeLabel(mode);
+  if (!set) {
+    announce(`${label} — no country set, showing ${images.length} categorized images`);
+    return;
+  }
+  const scope = state.setMode === 'any' ? 'Any country' : state.setCountry;
+  if (mode === 'alt') {
+    const cadence = altBoardCadence();
+    announce(`Alt ${state.altRatio}% geo boards, ${scope} — showing ${set.title}, ${geoCount} images;`
+      + ` one ${cadence.side} board in every ${cadence.every}`);
+    return;
+  }
+  announce(`Mix ${state.mixRatio}% geo, ${scope} — ${split.geo} of ${board}`
+    + ` tiles from ${set.title} (${geoCount} images), the rest categorized`);
+}
+
+// Same deal as geo: reuse the scan in memory, and only fall back to a walk of the library when
+// there isn't one.
+async function enterBlendMode(mode) {
+  state.viewedBrowseMode = mode;
+  renderFolderPanelSections();
+  if (!state.categorizedRoot) {
+    loadImagePool([], 'No categorized root', mode);
+    return;
+  }
+  if (!hasCategorizedScan()) {
+    await enterCategorizedMode(state.categorizedRoot, { targetMode: mode });
+    return;
+  }
+  if (!state.categorizedSets.length) await loadCategorizedSets();
+  applyBlendPool(mode);
+}
+
+// The ratio only changes how the next board is DEALT, never what is in the pool — so this rebuilds
+// the board and nothing else. `rebuild: false` is the drag case: the readout tracks the slider,
+// the grid waits for the release. Which ratio it sets follows the tab you are looking at, since
+// the slider is shared.
+function setBlendRatio(ratio, { rebuild = true, mode = state.viewedBrowseMode } = {}) {
+  const key = mode === 'alt' ? 'altRatio' : 'mixRatio';
+  const next = clamp(Math.round(ratio / 5) * 5, 0, 100);
+  const changed = next !== state[key];
+  state[key] = next;
+  syncBlendControls();
+  if (!rebuild) return next;
+  if (changed && state.browseMode === mode) {
+    syncDisplayedSetLabels();
+    // Not `{rotate: true}`: changing the ratio should re-deal the board you are on, not move the
+    // country out from under it.
+    if (state.allImages.length) refresh();
+    announce(`${browseModeLabel(mode)} ${next}% geo`);
+  }
+  persistSettings();
+  return next;
+}
+
+// "one X in every N" for the current ratio, naming whichever side is the RARE one — past 50% the
+// geo framing inverts into nonsense ("1 geo board in every 1" at 75%), and what you actually want
+// to know there is how often the category library comes round. Ratios that don't divide 100 evenly
+// round, which is why the panel prints the literal upcoming pattern beside this.
+function altBoardCadence() {
+  const rare = state.altRatio > 50 ? 100 - state.altRatio : state.altRatio;
+  const side = state.altRatio > 50 ? 'categorized' : 'geo';
+  return { side, every: rare > 0 ? Math.round(100 / rare) : 0 };
+}
+
+// Both blend modes drive the one shared control strip; which ratio it shows follows the tab.
+function syncBlendControls() {
+  const mode = usesBlendPool(state.viewedBrowseMode) ? state.viewedBrowseMode : 'mix';
+  const ratio = blendRatio(mode);
+  if (blendRatioSlider.value !== String(ratio)) blendRatioSlider.value = ratio;
+  blendRatioValue.textContent = `${ratio}% geo`;
+
+  if (mode === 'alt') {
+    blendHintEl.textContent = 'Whole boards, one source at a time — the slider is how many of them'
+      + ' are the country set.';
+    const pattern = altBoardPattern().map(isGeo => (isGeo ? 'G' : 'c')).join(' ');
+    const cadence = altBoardCadence();
+    blendRatioDetail.textContent = ratio === 0 ? 'Categorized boards only'
+      : ratio === 100 ? 'Geo boards only'
+        : ratio === 50 ? `Alternating every board — next: ${pattern}`
+          : `1 ${cadence.side} board in every ${cadence.every} — next: ${pattern}`;
+    blendRatioSlider.setAttribute('aria-label', 'Share of boards drawn from the geo country set');
+    blendRatioSlider.setAttribute('aria-valuetext', ratio > 0 && ratio < 100
+      ? `${ratio} percent geo boards — one ${cadence.side} board in every ${cadence.every}`
+      : `${ratio} percent geo boards`);
+    return;
+  }
+
+  blendHintEl.textContent = 'Every board blends both — the slider is the tile split.';
+  const split = blendSlotSplit(Math.max(1, state.imageCount - state.emptyCount), 'mix');
+  const board = split.geo + split.categorized;
+  blendRatioDetail.textContent = `${split.geo} geo · ${split.categorized} categorized per board of ${board}`;
+  blendRatioSlider.setAttribute('aria-label', 'Share of each board drawn from the geo country set');
+  blendRatioSlider.setAttribute('aria-valuetext',
+    `${ratio} percent geo — ${split.geo} of ${board} tiles`);
+}
+
 // Veto this image as a geo-set member. It keeps its category and still appears everywhere else —
 // this only stops it being served as geography. Persistent and honoured by image-categorizer too,
 // so unlike Hide it is NOT on the undo stack: reversing it means deleting that line from
@@ -1952,6 +2371,9 @@ async function removeFromGeoSets(path) {
   const root = state.categorizedRoot;
   if (!root || state.geoExcludedPaths.has(path)) return;
   state.geoExcludedPaths.add(path);
+  // Permanent, unlike Hide — so it leaves the geo side for good rather than coming back on the
+  // next undo or rotation.
+  state.geoSidePaths.delete(path);
 
   // Prune from every loaded set so no later rotation can hand it back this session.
   for (const set of state.categorizedSets) {
@@ -2013,11 +2435,25 @@ async function loadCategorizedSets() {
 async function reloadCategorizedSets() {
   await loadCategorizedSets();
   if (state.browseMode === 'geo') applyGeoPool();
+  else if (usesBlendPool()) applyBlendPool();
 }
 
 function activeCategorizedSet() {
   if (!state.categorizedSetId) return null;
   return state.categorizedSets.find(set => set.id === state.categorizedSetId) || null;
+}
+
+// The set the GRID is showing. Use this for anything the user reads off the screen; use
+// `activeCategorizedSet()` only for what the pool is made of. Falls back to the pool's set so a
+// board pushed before a set existed (or by a non-geo mode) still labels itself sanely.
+function displayedCategorizedSet() {
+  // No fallback in alt: there, `displayedSetId === null` is a positive statement — this board is a
+  // category board — and falling back to the loaded set would relabel it with a country.
+  const id = state.browseMode === 'alt'
+    ? state.displayedSetId
+    : (state.displayedSetId || state.categorizedSetId);
+  if (!id) return null;
+  return state.categorizedSets.find(set => set.id === id) || null;
 }
 
 // The pool when a set is selected: its members, resolved back to the scanned image records so they
@@ -2046,9 +2482,17 @@ function categorizedFilteredImages(mode = state.browseMode) {
     const set = activeCategorizedSet();
     return set ? categorizedSetImages(set) : [];
   }
-  return state.categorizedImages.filter(image =>
-    state.categorizedCategoryFilter.has(image.category)
-    && !(state.agentSafe && isAgentBlocked(image.category)));
+  // Mix and Alt hold both, and the caller that installs this pool must also install the matching
+  // `geoSidePaths` — go through `applyBlendPool`/`buildBlendPool` rather than this.
+  if (usesBlendPool(mode)) return buildBlendPool(activeCategorizedSet()).images;
+  return state.categorizedImages.filter(inCategoryFilter);
+}
+
+// "Would the category pool show this image?" — shared so a mix rotation, which decides one image
+// at a time whether a retiring set member stays, can't drift from the filter it is standing in for.
+function inCategoryFilter(image) {
+  return state.categorizedCategoryFilter.has(image.category)
+    && !(state.agentSafe && isAgentBlocked(image.category));
 }
 
 // A finished scan of the current root is in memory, so both categorized and geo can be entered
@@ -2087,9 +2531,9 @@ async function enterCategorizedMode(
   root = state.categorizedRoot,
   { eager = false, targetMode = 'categorized' } = {},
 ) {
-  // Geo has nothing to show part-way through: its sets resolve member hashes through the cache
-  // this scan writes, so a partial pool would resolve to nothing.
-  if (targetMode === 'geo') eager = false;
+  // Geo (and the geo half of mix) has nothing to show part-way through: its sets resolve member
+  // hashes through the cache this scan writes, so a partial pool would resolve to nothing.
+  if (usesGeoSets(targetMode)) eager = false;
   if (!root) {
     loadImagePool([], 'No categorized root', targetMode);
     renderCategorizedRootRow();
@@ -2156,6 +2600,10 @@ async function enterCategorizedMode(
         applyGeoPool();
         return true;
       }
+      if (usesBlendPool(targetMode)) {
+        applyBlendPool(targetMode);
+        return true;
+      }
       const filtered = categorizedFilteredImages('categorized');
       const poolLabel = categorizedPoolLabel('categorized');
       if (partialPoolShown) {
@@ -2191,16 +2639,19 @@ async function chooseCategorizedRoot(targetMode = 'categorized') {
   await enterCategorizedMode(folder, { targetMode });
 }
 
-// Always loads the CATEGORY pool: this is what a category checkbox, an agent-safe flip, or the
-// Categorized tab means, and none of them may hand the grid to a curated set.
-function applyCategorizedFilter() {
-  // In agent-safe mode, blocked categories can't even sit in the filter set, so
-  // the category panel and persisted filter reflect what's actually shown.
-  if (state.agentSafe) {
-    for (const name of [...state.categorizedCategoryFilter]) {
-      if (isAgentBlocked(name)) state.categorizedCategoryFilter.delete(name);
-    }
+// In agent-safe mode, blocked categories can't even sit in the filter set, so
+// the category panel and persisted filter reflect what's actually shown.
+function sanitizeCategoryFilter() {
+  if (!state.agentSafe) return;
+  for (const name of [...state.categorizedCategoryFilter]) {
+    if (isAgentBlocked(name)) state.categorizedCategoryFilter.delete(name);
   }
+}
+
+// Hand the grid to the CATEGORY pool, whatever mode it was in. The Categorized tab means exactly
+// this, and so does anything else that has decided the category filter now owns the whole board.
+function loadCategorizedPool() {
+  sanitizeCategoryFilter();
   renderCategoriesPanel();
   renderSetsPanel();
   const filtered = categorizedFilteredImages('categorized');
@@ -2211,9 +2662,22 @@ function applyCategorizedFilter() {
     : 'No categories selected');
 }
 
+// A change to the category FILTER, applied wherever that filter is driving something. In mix it
+// drives a share of the board, so it rebuilds the mix; everywhere else the filter IS the board.
+function applyCategorizedFilter() {
+  if (usesBlendPool()) {
+    sanitizeCategoryFilter();
+    renderCategoriesPanel();
+    applyBlendPool();
+    return;
+  }
+  loadCategorizedPool();
+}
+
 function toggleCategorizedCategory(name) {
-  // Ticking a category is an unambiguous "show me this pool", so it also leaves geo mode rather
-  // than silently changing a filter that is not driving anything.
+  // Ticking a category is an unambiguous "show me this pool", so outside mix it also leaves geo
+  // mode rather than silently changing a filter that is not driving anything. In mix the filter
+  // owns half the board already, so the tick stays put and just re-deals.
   if (state.categorizedCategoryFilter.has(name)) state.categorizedCategoryFilter.delete(name);
   else state.categorizedCategoryFilter.add(name);
   applyCategorizedFilter();
@@ -2232,12 +2696,14 @@ function setAllCategorizedCategories(checked) {
 function setAgentSafe(on) {
   state.agentSafe = !!on;
   document.body.classList.toggle('agent-safe', state.agentSafe);
-  // Rebuild whichever pool is live — in geo mode that re-filters the set on screen; it must not
-  // change the mode out from under an agent that deliberately entered it.
+  // Rebuild whichever pool is live — in geo/mix mode that re-filters the set on screen; it must
+  // not change the mode out from under an agent that deliberately entered it.
   if (state.browseMode === 'geo') {
     applyGeoPool();
+  } else if (usesBlendPool()) {
+    applyBlendPool();
   } else if (state.browseMode === 'categorized' && state.categorizedRoot) {
-    applyCategorizedFilter();
+    loadCategorizedPool();
   } else {
     renderCategoriesPanel();
   }
@@ -2573,9 +3039,11 @@ async function categorizeImage(path, category) {
     applyLocalCategoryChange(path, category);
 
     // Only the category pool can filter an image out on the spot; a geo set is a fixed member
-    // list, so recategorizing inside it leaves the board alone.
-    const filteredOut = state.browseMode === 'categorized'
-      && !state.categorizedCategoryFilter.has(category);
+    // list, so recategorizing inside it leaves the board alone. In mix that is per-image: the
+    // categorized half filters, the set members sitting beside it do not.
+    const onCategorySide = state.browseMode === 'categorized'
+      || (usesBlendPool() && !state.geoSidePaths.has(path));
+    const filteredOut = onCategorySide && !state.categorizedCategoryFilter.has(category);
     let removal = null;
     if (appSettings.instantFilterCategorized && filteredOut) {
       removal = removeDisplayedImage(path);
@@ -2607,6 +3075,8 @@ function syncImageCountControls(n) {
   emptyDisplayEl.textContent  = state.emptyCount;
   settingSlider.value         = n;
   settingCountVal.textContent = n;
+  // The mix readout is "N geo · M categorized per board" — a board-size change moves both.
+  syncBlendControls();
   return n;
 }
 
@@ -2671,6 +3141,7 @@ function setEmptyCount(n) {
   n = Math.max(0, Math.min(state.imageCount - 1, Math.round(n)));
   state.emptyCount       = n;
   emptyDisplayEl.textContent = n;
+  syncBlendControls();
   if (state.allImages.length) refresh();
   persistSettings();
 }
@@ -3234,6 +3705,8 @@ async function persistSettings() {
       // geo SCOPE, not a mode switch: `browseMode` alone decides whether it drives the pool.
       categorizedSetMode: state.setMode === 'off' ? null : state.setMode,
       categorizedSetCountry: state.setCountry,
+      mixGeoRatio:       state.mixRatio,
+      altGeoRatio:       state.altRatio,
       startupBrowseMode: appSettings.startupBrowseMode,
       startupFolder:     null,
       startupMultiFolders: appSettings.startupMultiFolders,
@@ -3397,6 +3870,15 @@ btnOpenEmpty.addEventListener('click', addMultiFolder);
 folderMultiAdd.addEventListener('click', addMultiFolder);
 categorizedRootChoose.addEventListener('click', () => chooseCategorizedRoot('categorized'));
 geoRootChoose.addEventListener('click', () => chooseCategorizedRoot('geo'));
+blendRootChoose.addEventListener('click', () =>
+  chooseCategorizedRoot(usesBlendPool(state.viewedBrowseMode) ? state.viewedBrowseMode : 'mix'));
+// Readout tracks the drag; the board re-deals on release. Re-rendering up to 99 tiles per slider
+// step is the one thing that would make the slider feel broken.
+blendRatioSlider.addEventListener('input', () => setBlendRatio(blendRatioSlider.value, { rebuild: false }));
+blendRatioSlider.addEventListener('change', () => {
+  setBlendRatio(blendRatioSlider.value);
+  blendRatioSlider.blur();
+});
 categoriesSelectAll.addEventListener('click', () => setAllCategorizedCategories(true));
 categoriesSelectNone.addEventListener('click', () => setAllCategorizedCategories(false));
 categoriesRescan.addEventListener('click', () => enterCategorizedMode());
@@ -3710,7 +4192,21 @@ document.addEventListener('keydown', e => {
   // G — flip between the categorized library and geo country sets
   if ((e.key === 'g' || e.key === 'G') && !e.ctrlKey && !e.metaKey) {
     e.preventDefault();
-    toggleGeoMode();
+    toggleCategorizedRootMode('geo');
+    return;
+  }
+
+  // M — flip between the categorized library and the mixed board
+  if ((e.key === 'm' || e.key === 'M') && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    toggleCategorizedRootMode('mix');
+    return;
+  }
+
+  // A — flip between the categorized library and alternating boards
+  if ((e.key === 'a' || e.key === 'A') && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    toggleCategorizedRootMode('alt');
     return;
   }
 
@@ -3823,13 +4319,15 @@ function finishStartupLoadingAfterFirstImage() {
 // category (Explicit), and setAgentSafe(true) extends that guarantee to the
 // whole window (human UI included) for the session.
 window.SIV = {
-  version: '1.2',
+  version: '1.4',
 
   // --- introspection ---
   blockedCategories: () => [...AGENT_BLOCKED_CATEGORIES],
   isAgentSafe: () => state.agentSafe,
   getState() {
-    const set = activeCategorizedSet();
+    // `showing` must mean what is on the grid, which after an arrow-back is an older set than the
+    // one the pool holds.
+    const set = displayedCategorizedSet();
     return {
       browseMode: state.browseMode,
       categorizedRoot: state.categorizedRoot,
@@ -3840,12 +4338,30 @@ window.SIV = {
         name: c.name, count: c.count, blocked: isAgentBlocked(c.name),
       })),
       filter: [...state.categorizedCategoryFilter],
-      // Geo mode: the scope that is rotating, and the set currently drawn from it.
+      // Geo mode: the scope that is rotating, and the set currently drawn from it. In mix the
+      // same fields describe the geo SHARE of the board.
       geo: {
         scope: state.setMode,
         country: state.setCountry,
         setsAvailable: state.categorizedSets.length,
         showing: set ? { id: set.id, title: set.title, country: set.country, sources: set.sources } : null,
+      },
+      // How a mix board is split. `geoTiles`/`categorizedTiles` are what the next board will deal,
+      // not a count of what is on screen (locks and a short set both move that).
+      mix: {
+        ratio: state.mixRatio,
+        geoTiles: blendSlotSplit(Math.max(1, state.imageCount - state.emptyCount), 'mix').geo,
+        categorizedTiles: blendSlotSplit(Math.max(1, state.imageCount - state.emptyCount), 'mix').categorized,
+        geoPoolSize: state.geoSidePaths.size,
+      },
+      // Alt's alternation. `boardIsGeo` describes the board ON SCREEN; `upcoming` is the pattern
+      // from here, so an agent can tell "one more board" from "four more" before the set it wants.
+      alt: {
+        ratio: state.altRatio,
+        boardIndex: state.altBoardIndex,
+        boardIsGeo: altBoardIsGeo(),
+        cadence: altBoardCadence(),
+        upcoming: altBoardPattern().map(isGeo => (isGeo ? 'geo' : 'categorized')),
       },
     };
   },
@@ -3898,16 +4414,32 @@ window.SIV = {
       diverse: sets.some(set => set.quality === 'diverse'),
     }));
   },
-  // `country` = null rotates across every country ("Any country"). Enters geo mode.
+  // `country` = null rotates across every country ("Any country"). Enters geo mode — or, if the
+  // window is already mixing, re-scopes the geo share without dropping the mix.
   async setGeoScope(country = null) {
     if (country && !state.categorizedSets.some(set => (set.country || set.title) === country)) {
       throw new Error(`No geo sets for: ${country}`);
     }
-    state.viewedBrowseMode = 'geo';
+    const target = usesBlendPool() ? state.browseMode : 'geo';
+    state.viewedBrowseMode = target;
     renderFolderPanelSections();
-    if (!hasCategorizedScan()) await enterGeoMode();
-    selectSetScope(country ? 'country' : 'any', country);
+    if (!hasCategorizedScan()) await (usesBlendPool(target) ? enterBlendMode(target) : enterGeoMode());
+    selectSetScope(country ? 'country' : 'any', country, target);
     return this.getState();
+  },
+
+  // The tile split for a mixed board: 0 = all categorized, 100 = all geo. Rounded to the same 5%
+  // steps the slider uses. Only meaningful in mix mode, but settable from anywhere.
+  setMixRatio(ratio) {
+    setBlendRatio(Number(ratio), { mode: 'mix' });
+    return this.getState().mix;
+  },
+
+  // The share of BOARDS that are geo boards in alt mode. Same 0–100 in 5% steps; 50 is strict
+  // alternation.
+  setAltRatio(ratio) {
+    setBlendRatio(Number(ratio), { mode: 'alt' });
+    return this.getState().alt;
   },
 
   // --- category control (always allowlist-enforced) ---
@@ -3973,6 +4505,8 @@ armStartupWatchdog();
     state.setMode = ['any', 'country'].includes(s.categorizedSetMode) ? s.categorizedSetMode : 'off';
     state.setCountry = state.setMode === 'country' ? (s.categorizedSetCountry || null) : null;
     if (state.setMode === 'country' && !state.setCountry) state.setMode = 'off';
+    state.mixRatio = clamp(Math.round((s.mixGeoRatio ?? 50) / 5) * 5, 0, 100);
+    state.altRatio = clamp(Math.round((s.altGeoRatio ?? 50) / 5) * 5, 0, 100);
     state.slideshowDuration = Math.max(1000, s.slideshowDuration || 5000);
     appSettings.squareAppCorners = !!s.squareAppCorners;
     appSettings.focusIndicators = s.focusIndicators !== false;
@@ -3989,7 +4523,7 @@ armStartupWatchdog();
     appSettings.firstAutoOpenSlideshow = !!(s.firstAutoOpenSlideshow || s.autoOpenSlideshow);
     appSettings.secondaryAutoOpenSlideshow = !!s.secondaryAutoOpenSlideshow;
     const loadedStartupBrowseMode = normalizeBrowseMode(s.startupBrowseMode);
-    const loadedAutoSource = ['folders', 'categorized', 'geo'].includes(s.autoSlideshowSource)
+    const loadedAutoSource = ['folders', 'categorized', 'geo', 'mix', 'alt'].includes(s.autoSlideshowSource)
       ? s.autoSlideshowSource
       : autoSlideshowSourceForMode(loadedStartupBrowseMode);
     appSettings.autoSlideshowSource = loadedStartupBrowseMode === 'multi'
@@ -4054,6 +4588,8 @@ armStartupWatchdog();
           await enterMultiMode();
         } else if (state.browseMode === 'geo' && state.categorizedRoot) {
           await enterGeoMode();
+        } else if (usesBlendPool() && state.categorizedRoot) {
+          await enterBlendMode(state.browseMode);
         } else if (state.browseMode === 'categorized' && state.categorizedRoot) {
           await enterCategorizedMode(undefined, { eager: true });
         } else {

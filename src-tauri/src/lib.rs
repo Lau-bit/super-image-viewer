@@ -104,6 +104,18 @@ struct Settings {
     categorized_set_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     categorized_set_country: Option<String>,
+    /// Mix mode's tile split: the percentage of each board drawn from the country set, the rest
+    /// from the category filter. 0 = all categorized, 100 = all geo. It is a *board* ratio, not a
+    /// pool weight — the two pools never merge, because a curated sixteen dropped into a
+    /// seventeen-thousand-image category would draw roughly none of the tiles.
+    #[serde(default = "default_blend_geo_ratio")]
+    mix_geo_ratio: u32,
+    /// Alt mode's BOARD split: the percentage of whole boards that are geo boards, the rest drawn
+    /// entirely from the category filter. Same 0-100 scale as `mix_geo_ratio` and deliberately a
+    /// separate setting — one is "how much of a board", the other "how many boards", and a user
+    /// who wants a heavy blend does not necessarily want geo four boards out of five.
+    #[serde(default = "default_blend_geo_ratio")]
+    alt_geo_ratio: u32,
     #[serde(default)]
     startup_browse_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +209,10 @@ fn default_auto_slideshow_source() -> String {
     String::new()
 }
 
+fn default_blend_geo_ratio() -> u32 {
+    50
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -212,6 +228,8 @@ impl Default for Settings {
             categorized_category_filter: None,
             categorized_set_mode: None,
             categorized_set_country: None,
+            mix_geo_ratio: 50,
+            alt_geo_ratio: 50,
             startup_browse_mode: "multi".to_string(),
             startup_folder: None,
             startup_multi_folders: Vec::new(),
@@ -1331,7 +1349,7 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.secondary_display_folder_enabled = settings.secondary_display_folder_enabled;
     current.secondary_display_folder = settings.secondary_display_folder;
     current.browse_mode = match settings.browse_mode.as_str() {
-        "multi" | "categorized" | "geo" => settings.browse_mode,
+        "multi" | "categorized" | "geo" | "mix" | "alt" => settings.browse_mode,
         _ => "multi".to_string(),
     };
     current.multi_folders = settings.multi_folders;
@@ -1343,8 +1361,12 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
         _ => None,
     };
     current.categorized_set_country = settings.categorized_set_country;
+    // The struct field alone is not enough — `save_settings` copies field by field, so an
+    // un-copied one is parsed, dropped, and looks exactly like a stale binary.
+    current.mix_geo_ratio = settings.mix_geo_ratio.min(100);
+    current.alt_geo_ratio = settings.alt_geo_ratio.min(100);
     current.startup_browse_mode = match settings.startup_browse_mode.as_str() {
-        "multi" | "categorized" | "geo" => settings.startup_browse_mode,
+        "multi" | "categorized" | "geo" | "mix" | "alt" => settings.startup_browse_mode,
         _ => "multi".to_string(),
     };
     current.startup_folder = settings.startup_folder;
@@ -1376,7 +1398,7 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.first_auto_open_slideshow = settings.first_auto_open_slideshow;
     current.secondary_auto_open_slideshow = settings.secondary_auto_open_slideshow;
     current.auto_slideshow_source = match settings.auto_slideshow_source.as_str() {
-        "folders" | "categorized" | "geo" => settings.auto_slideshow_source,
+        "folders" | "categorized" | "geo" | "mix" | "alt" => settings.auto_slideshow_source,
         _ => "folders".to_string(),
     };
     current.auto_hide_ui_on_startup = settings.auto_hide_ui_on_startup;

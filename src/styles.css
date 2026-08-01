@@ -236,7 +236,9 @@ body.ui-hidden #startup-loading-overlay {
 
 #btn-folder.mode-multi,
 #btn-folder.mode-categorized,
-#btn-folder.mode-geo {
+#btn-folder.mode-geo,
+#btn-folder.mode-mix,
+#btn-folder.mode-alt {
   color: #fff;
   border-color: var(--accent);
 }
@@ -267,12 +269,12 @@ body.ui-hidden #folder-panel {
 
 #folder-mode-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 3px;
   padding: 0 8px 6px;
   border-bottom: 1px solid var(--border);
 }
 
-#toolbar #folder-mode-tabs button,
 #toolbar .folder-panel-btn,
 #toolbar #categories-panel-bulk button,
 #toolbar .multi-folder-remove {
@@ -281,9 +283,19 @@ body.ui-hidden #folder-panel {
   padding: 4px 8px;
 }
 
+/* Four tabs share 360px, and "Categorized" is the long one — trim the padding rather than let it
+   ellipsize down to "Categori…". */
+#toolbar #folder-mode-tabs button {
+  width: auto;
+  height: auto;
+  padding: 4px 5px;
+}
+
+/* Grow from the label's own width, never below it: five tabs at an equal `flex: 1` share would
+   squeeze "Categorized" into "Categori…" long before the row is actually full. `wrap` is the
+   backstop if a future mode does overflow the 360px panel. */
 .folder-mode-tab {
-  flex: 1;
-  min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -417,7 +429,8 @@ body.ui-hidden #folder-panel {
 
 .multi-folder-name,
 .category-checkbox-name,
-#categorized-root-name {
+#categorized-root-name,
+#blend-root-name {
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -431,6 +444,7 @@ body.ui-hidden #folder-panel {
 
 #categorized-root-row,
 #geo-root-row,
+#blend-root-row,
 #categories-panel-bulk {
   display: flex;
   align-items: center;
@@ -439,7 +453,8 @@ body.ui-hidden #folder-panel {
 }
 
 #categorized-root-name,
-#geo-root-name {
+#geo-root-name,
+#blend-root-name {
   color: var(--text-muted);
   font-size: 11px;
 }
@@ -546,6 +561,63 @@ body.ui-hidden #folder-panel {
 
 .set-row.active .set-row-badge {
   color: #ffe6a3;
+}
+
+/* ==============================
+   Mix + Alt — the two modes where a country set and the category library both reach the grid
+   The pools cannot be merged (a curated sixteen would dissolve in a 17k-image category), so a
+   ratio divides them: Mix splits the TILES of each board, Alt splits the BOARDS. Same four
+   controls either way, hence one shared section. One scroller for the whole tab: it stacks a root
+   row, the ratio, the category checkboxes and the country list — no fixed per-list height fits.
+   ============================== */
+
+#folder-section-blend {
+  overflow-y: auto;
+}
+
+.blend-hint {
+  padding: 0 10px 5px;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+#blend-ratio-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px 2px;
+}
+
+#blend-ratio-slider {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.blend-ratio-value {
+  flex: 0 0 auto;
+  min-width: 52px;
+  color: var(--text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.blend-ratio-detail {
+  padding: 0 10px 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+  min-height: 14px;
+}
+
+.blend-subhead {
+  padding: 5px 10px 3px;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
 }
 
 .control-icon {

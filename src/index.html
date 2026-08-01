@@ -40,6 +40,8 @@
           <button type="button" class="folder-mode-tab active" data-browse-mode="multi">Folders</button>
           <button type="button" class="folder-mode-tab" data-browse-mode="categorized">Categorized</button>
           <button type="button" class="folder-mode-tab" data-browse-mode="geo" aria-label="Geo — curated country sets">Geo</button>
+          <button type="button" class="folder-mode-tab" data-browse-mode="mix" aria-label="Mix — a country set and the category library on one board, at a ratio you set">Mix</button>
+          <button type="button" class="folder-mode-tab" data-browse-mode="alt" aria-label="Alt — whole boards alternating between a country set and the category library">Alt</button>
         </div>
         <div class="folder-panel-group">
           <div class="folder-panel-title">Startup</div>
@@ -49,6 +51,8 @@
               <option value="multi">Folders</option>
               <option value="categorized">Categorized</option>
               <option value="geo">Geo</option>
+              <option value="mix">Mix</option>
+              <option value="alt">Alt</option>
             </select>
           </label>
           <button type="button" class="folder-panel-btn" id="setting-use-current-source">Use current source at startup</button>
@@ -62,6 +66,8 @@
               <option value="folders">Folders</option>
               <option value="categorized">Categorized</option>
               <option value="geo">Geo</option>
+              <option value="mix">Mix</option>
+              <option value="alt">Alt</option>
             </select>
           </label>
           <button type="button" class="folder-panel-btn" id="setting-auto-slideshow-folder-needed" hidden>Set slideshow startup folder</button>
@@ -99,6 +105,28 @@
             <button type="button" id="sets-reload" aria-label="Reload country sets">&#x21BB;</button>
           </div>
           <div id="sets-list"></div>
+        </div>
+        <!-- Mix and Alt are the two modes where a set and the category filter BOTH reach the grid,
+             and they take the same four inputs (root, ratio, categories, country) — so they share
+             one section and differ only in what the ratio means. Mix splits the TILES of every
+             board; Alt splits the BOARDS. Neither merges the pools: a curated sixteen dissolves in
+             a 17k-image category. -->
+        <div id="folder-section-blend" class="folder-section">
+          <div id="blend-root-row">
+            <span id="blend-root-name">No root chosen</span>
+            <button type="button" class="folder-panel-btn" id="blend-root-choose">Choose</button>
+          </div>
+          <div id="blend-hint" class="blend-hint"></div>
+          <div id="blend-ratio-row">
+            <input type="range" id="blend-ratio-slider" min="0" max="100" step="5" value="50"
+                   aria-label="Geo share">
+            <span id="blend-ratio-value" class="blend-ratio-value">50% geo</span>
+          </div>
+          <div id="blend-ratio-detail" class="blend-ratio-detail"></div>
+          <div class="blend-subhead">Categorized share</div>
+          <div id="blend-categories-list"></div>
+          <div class="blend-subhead">Geo share — country</div>
+          <div id="blend-sets-list"></div>
         </div>
       </div>
     </div>
@@ -254,6 +282,8 @@
           <div class="shortcut-row"><kbd>&#8594;</kbd><span>Next set</span></div>
           <div class="shortcut-row"><kbd>Ctrl</kbd><kbd>Z</kbd><span>Undo hide / categorize</span></div>
           <div class="shortcut-row"><kbd>G</kbd><span>Geo &#8596; Categorized</span></div>
+          <div class="shortcut-row"><kbd>M</kbd><span>Mix &#8596; Categorized</span></div>
+          <div class="shortcut-row"><kbd>A</kbd><span>Alt &#8596; Categorized</span></div>
           <div class="shortcut-row"><kbd>Shift</kbd><kbd>Q</kbd><span>Show / hide the UI</span></div>
           <div class="shortcut-row"><kbd>?</kbd><span>This list</span></div>
           <div class="shortcut-row"><kbd>Esc</kbd><span>Close menu / panel</span></div>
