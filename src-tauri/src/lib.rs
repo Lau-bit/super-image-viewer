@@ -28,9 +28,20 @@ const DWMWCP_DEFAULT: u32 = 0;
 #[cfg(windows)]
 const DWMWCP_DONOTROUND: u32 = 1;
 
-const IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico", "avif", "tif", "tiff",
-];
+// Only formats WebView2 can actually decode. `tif`/`tiff` used to be here and
+// were the worst kind of listing: the scan counted them, the grid drew a cell
+// for them, and Chromium has no TIFF decoder — so they were permanently blank
+// tiles that kept getting re-drawn. A format the viewer cannot show does not
+// belong in the pool.
+const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico", "avif"];
+/// How far below a chosen folder the plain-folder scan walks. Deeper than the
+/// categorized scan's cap of 4 on purpose: that one hashes every file it finds,
+/// so its depth limit is protecting real work, while this one only reads
+/// directory entries. Picking a folder is also an explicit "show me what is in
+/// here", and real photo trees nest further than four
+/// (Photos/2024/Summer/Trip/DCIM/100CANON/…). Still capped, so a symlink loop
+/// or a drive root terminates.
+const MULTI_FOLDER_MAX_SCAN_DEPTH: usize = 8;
 const RESTORED_WINDOW_PHYSICAL_X_OFFSET: f64 = -1.0;
 const CATEGORIZER_SIDECAR_FILE_NAME: &str = ".image-categorizer.json";
 const CATEGORIZER_OCR_TEXT_DIR_NAME: &str = ".image-categorizer-ocr-text";
@@ -276,6 +287,13 @@ struct AppState {
     /// Serializes read/modify/write access to the derived on-disk hash cache
     /// when several viewer windows scan at the same time.
     categorized_hash_cache_io: Mutex<()>,
+    /// The parsed hash cache for one root, kept in memory: `(root, cache file
+    /// mtime, entries)`. `get_categorized_ocr` runs once per board and used to
+    /// re-read and re-parse the whole file each time — 8.6 MB of JSON for a 30k
+    /// library, measured at 252 ms per board, on the main thread. Keyed on the
+    /// file's mtime so a rewrite by another window (or the categorizer) is
+    /// picked up without any invalidation call.
+    categorized_hash_memo: Mutex<Option<(String, u64, HashMap<String, CategorizedHashEntry>)>>,
 }
 
 /// Releases an `opening_images` claim on drop, so an early return, an error, or
@@ -535,21 +553,66 @@ fn ocr_snippet(text: &str) -> String {
     }
 }
 
+/// Resolve `paths` to their content hashes, reusing the parsed hash cache when
+/// the file behind it has not changed. Keyed on the cache file's mtime, so a
+/// rewrite by another window or by the categorizer is picked up with no
+/// invalidation call. Everything unknown (no mtime, poisoned lock) falls back to
+/// a plain load: this is a speed cache over a cache and must never be the reason
+/// a lookup fails.
+///
+/// Returns hashes rather than the map so the 30k-entry map is never cloned —
+/// that clone was most of what the memo was supposed to save.
+fn categorized_hashes_for(app: &AppHandle, root: &str, paths: &[String]) -> Vec<Option<String>> {
+    let stamp = categorized_hash_cache_path(app)
+        .ok()
+        .map(|path| modified_ms(&path))
+        .unwrap_or_default();
+    let state = app.state::<AppState>();
+    let pick = |entries: &HashMap<String, CategorizedHashEntry>| {
+        paths
+            .iter()
+            .map(|path| entries.get(path).map(|entry| entry.hash.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    if stamp != 0 {
+        if let Ok(memo) = state.categorized_hash_memo.lock() {
+            if let Some((memo_root, memo_stamp, entries)) = memo.as_ref() {
+                if memo_root == root && *memo_stamp == stamp {
+                    return pick(entries);
+                }
+            }
+        }
+    }
+
+    let entries = load_categorized_hashes(app, root);
+    let picked = pick(&entries);
+    if stamp != 0 {
+        if let Ok(mut memo) = state.categorized_hash_memo.lock() {
+            *memo = Some((root.to_string(), stamp, entries));
+        }
+    }
+    picked
+}
+
 /// Look up the categorizer's OCR text for the given images. OCR lives in a
 /// per-image `<hash>.txt` under the root's `.image-categorizer-ocr-text` dir;
 /// path -> hash comes from the same derived hash cache the scan writes. Called
 /// on demand for the ~16 displayed tiles, never over the whole library, so it
 /// stays cheap. Images with no OCR text are simply omitted from the result.
-#[tauri::command]
-fn get_categorized_ocr(app: AppHandle, root: String, paths: Vec<String>) -> Vec<CategorizedOcrView> {
-    let hashes = load_categorized_hashes(&app, &root);
+fn get_categorized_ocr_blocking(
+    app: AppHandle,
+    root: String,
+    paths: Vec<String>,
+) -> Vec<CategorizedOcrView> {
+    let hashes = categorized_hashes_for(&app, &root, &paths);
     let ocr_dir = PathBuf::from(&root).join(CATEGORIZER_OCR_TEXT_DIR_NAME);
     let mut out = Vec::new();
-    for path in paths {
-        let Some(entry) = hashes.get(&path) else {
+    for (path, hash) in paths.into_iter().zip(hashes) {
+        let Some(hash) = hash else {
             continue;
         };
-        let file = ocr_dir.join(format!("{}.txt", entry.hash));
+        let file = ocr_dir.join(format!("{hash}.txt"));
         if let Ok(text) = fs::read_to_string(&file) {
             let snippet = ocr_snippet(&text);
             if !snippet.is_empty() {
@@ -558,6 +621,20 @@ fn get_categorized_ocr(app: AppHandle, root: String, paths: Vec<String>) -> Vec<
         }
     }
     out
+}
+
+// `async` on purpose: a plain `fn` command runs on the MAIN thread, and this one
+// reads one small text file per shown tile. Even memoized that is disk work on
+// the thread that also has to keep the window responsive.
+#[tauri::command]
+async fn get_categorized_ocr(
+    app: AppHandle,
+    root: String,
+    paths: Vec<String>,
+) -> Result<Vec<CategorizedOcrView>, String> {
+    tauri::async_runtime::spawn_blocking(move || get_categorized_ocr_blocking(app, root, paths))
+        .await
+        .map_err(|error| format!("OCR lookup failed: {error}"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1263,26 +1340,64 @@ fn create_viewer_window(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// Walks one chosen folder. Subfolders are included (bounded by
+// MULTI_FOLDER_MAX_SCAN_DEPTH): a folder of images is very often a folder OF
+// FOLDERS of images, and the top-level-only scan this replaced answered that
+// with a near-empty grid and no way to tell why. Dot-folders are skipped, the
+// same rule the categorized scan uses, so `.thumbnails` / VCS dirs stay out.
+fn collect_folder_images(dir: &Path, depth: usize, seen: &mut HashSet<String>, out: &mut Vec<ImageInfo>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // A symlinked directory needs the target's metadata; the depth cap is
+        // what keeps a link that points at an ancestor from looping forever.
+        let is_dir = if file_type.is_symlink() {
+            fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false)
+        } else {
+            file_type.is_dir()
+        };
+        if is_dir {
+            if !name.starts_with('.') && depth < MULTI_FOLDER_MAX_SCAN_DEPTH {
+                collect_folder_images(&path, depth + 1, seen, out);
+            }
+            continue;
+        }
+        if !is_image_path(&path) {
+            continue;
+        }
+        let text = path.to_string_lossy().to_string();
+        // Two enabled folders can name the same directory in different ways
+        // (trailing slash, case, a junction) — the pool must still hold each
+        // file once, or that image is twice as likely to be drawn and can
+        // appear twice on one board.
+        if !seen.insert(text.to_lowercase()) {
+            continue;
+        }
+        out.push(ImageInfo {
+            path: text,
+            modified: modified_ms(&path),
+        });
+    }
+}
+
 fn list_multi_folder_images_blocking(folders: Vec<String>) -> Vec<ImageInfo> {
     let mut images = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for folder in folders {
         let dir = PathBuf::from(folder);
         if !dir.is_dir() {
             continue;
         }
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if !path.is_file() || !is_image_path(&path) {
-                continue;
-            }
-            images.push(ImageInfo {
-                path: path.to_string_lossy().to_string(),
-                modified: modified_ms(&path),
-            });
-        }
+        collect_folder_images(&dir, 0, &mut seen, &mut images);
     }
     images.sort_by(|a, b| b.modified.cmp(&a.modified));
     images

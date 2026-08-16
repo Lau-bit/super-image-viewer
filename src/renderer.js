@@ -18,6 +18,13 @@ const MANUAL_ZOOM_MAX = 4;
 const MANUAL_DRAG_THRESHOLD_PX = 4;
 const MANUAL_WHEEL_ZOOM_FACTOR = 0.0015;
 const SLIDESHOW_PRELOAD_LEAD_MS = 1200;
+// How many of the next board's images the slideshow warms ahead of the swap.
+// The preload holds a decoded copy of everything it fetches, so an uncapped one
+// means two full boards resident at once — harmless at the usual 16 tiles,
+// measured at +438 MB on a 99-tile board of 4K images (1.57 GB -> 2.00 GB).
+// Above the cap the remaining tiles simply decode as they are swapped in, which
+// is what every non-slideshow board already does.
+const SLIDESHOW_PRELOAD_MAX_IMAGES = 48;
 const SLIDESHOW_STAGGER_BATCH_SIZE = 6;
 const SLIDESHOW_STAGGER_DELAY_MS = 28;
 const PORTRAIT_AUTO_BIAS_MIN_ASPECT = 1.02;
@@ -332,15 +339,41 @@ function applyGridLayout(count) {
 // ==============================
 // Takes the list to draw from rather than reading `state.allImages`: mix mode picks each half of a
 // board from its own side of the pool, and that is the only difference between the two.
+//
+// Draws by index rather than by copying the pool. The copy-and-splice version
+// this replaced allocated a fresh array of EVERY image in the library on every
+// board — 30k objects to choose 99 of them, on the slideshow path. Sampling by
+// index is the same distribution without the copy; the fallback keeps the exact
+// old behaviour for the case index sampling is bad at (a board nearly as large
+// as the pool, where rejection sampling would spin).
 function pickRandomFrom(images, n, exclude = null) {
   if (n <= 0 || !images.length) return [];
-  const pool   = exclude
-    ? images.filter(img => !exclude.has(img.path))
-    : images.slice();
+  const excluded = exclude ? exclude.size : 0;
+  const available = images.length - excluded;
+  if (n >= available / 4) {
+    const pool = exclude
+      ? images.filter(img => !exclude.has(img.path))
+      : images.slice();
+    const result = [];
+    while (result.length < n && pool.length) {
+      const idx = Math.floor(Math.random() * pool.length);
+      result.push(pool.splice(idx, 1)[0].path);
+    }
+    return result;
+  }
+
   const result = [];
-  while (result.length < n && pool.length) {
-    const idx = Math.floor(Math.random() * pool.length);
-    result.push(pool.splice(idx, 1)[0].path);
+  // Tracks PATHS, not indices: two pool entries can name the same file, and a
+  // board must never show one image twice.
+  const taken = new Set(exclude || []);
+  // Bounded so a pool that is mostly excluded cannot spin here; whatever it has
+  // by then is a slightly short board, not a hang.
+  const maxDraws = n * 12 + 40;
+  for (let draw = 0; draw < maxDraws && result.length < n; draw++) {
+    const path = images[Math.floor(Math.random() * images.length)].path;
+    if (taken.has(path)) continue;
+    taken.add(path);
+    result.push(path);
   }
   return result;
 }
@@ -792,22 +825,114 @@ function toggleLock(path) {
 // ==============================
 // Render grid
 // ==============================
-function applyImageSlot(img, slot) {
+function applyImageSlot(img, slot, position = null) {
   if (img.getAttribute('data-src') === slot) return;
   clearImageManualZoom(img);
   img.setAttribute('data-src', slot);
   img.removeAttribute('data-pending-src');
   img.removeAttribute('title');
   const cell = img.closest('.grid-cell');
-  setCellAccessibility(cell, slot);
+  setCellAccessibility(cell, slot, position);
   img.classList.remove('loaded');
   img.onload  = () => {
     img.classList.add('loaded');
     const loadedCell = img.closest('.grid-cell');
     if (loadedCell) applyZoomFillToCell(loadedCell);
   };
-  img.onerror = () => {};
+  // A file that won't decode is not a tile that should sit there blank. The
+  // path is captured rather than re-read off the element: by the time the error
+  // fires the cell may already hold something else, and it is THIS image that
+  // is unusable.
+  img.onerror = () => noteImageLoadFailure(slot);
   img.src = window.viewerAPI.getFileUrl(slot);
+}
+
+// ------------------------------------------------------------------
+// Unloadable images
+// ------------------------------------------------------------------
+// An image can be listed by the scan and still be impossible to show: deleted
+// or renamed since the scan, zero bytes, truncated, or simply not a real image
+// behind an image extension. Nothing used to happen — the cell stayed blank,
+// the path stayed in the pool, and every later board could draw it again. So a
+// folder with a few bad files showed permanent holes in the grid.
+//
+// A failure therefore retires the path for the session: out of the pool, out of
+// history, unlocked if it was pinned, and its slot refilled from the pool.
+// Failures are batched to the next frame because a board of 99 tiles can fail
+// dozens at once, and each one re-renders the grid.
+const failedImagePaths = new Set();
+const pendingImageFailures = new Set();
+let imageFailureFlush = null;
+
+// Scoped to the pool, not to the session. A rescan has just seen these files on
+// disk, so it earns them one fresh attempt each — and keeping the old set would
+// be worse than useless: the "already known bad" short-circuit below would skip
+// retiring them from the NEW pool, putting the permanently blank tile back.
+function resetImageFailures() {
+  if (imageFailureFlush !== null) cancelAnimationFrame(imageFailureFlush);
+  imageFailureFlush = null;
+  failedImagePaths.clear();
+  pendingImageFailures.clear();
+}
+
+function noteImageLoadFailure(path) {
+  if (!path || failedImagePaths.has(path)) return;
+  failedImagePaths.add(path);
+  pendingImageFailures.add(path);
+  if (imageFailureFlush !== null) return;
+  imageFailureFlush = requestAnimationFrame(flushImageLoadFailures);
+}
+
+function flushImageLoadFailures() {
+  imageFailureFlush = null;
+  const dropped = new Set(pendingImageFailures);
+  pendingImageFailures.clear();
+  if (!dropped.size) return;
+
+  const poolBefore = state.allImages.length;
+  state.allImages = state.allImages.filter(image => !dropped.has(image.path));
+  for (const path of dropped) {
+    purgeFromHistory(path);
+    // A pinned image that no longer exists would otherwise reserve its cell on
+    // every future board — the one way a dead file can outlive this cleanup.
+    if (isLocked(path)) unlockImage(path);
+  }
+  clearSlideshowPreload();
+
+  const shown = new Set(state.displayedSlots.filter(Boolean));
+  let changed = false;
+  state.displayedSlots.forEach((slot, index) => {
+    if (!dropped.has(slot)) return;
+    shown.delete(slot);
+    const replacement = pickReplacementImage(shown);
+    if (replacement) shown.add(replacement);
+    state.displayedSlots[index] = replacement;
+    changed = true;
+  });
+
+  if (changed) {
+    renderGrid(state.displayedSlots);
+    syncHistoryHead();
+    if (state.slideshow) rescheduleSlideshowTick();
+  }
+  if (poolBefore && !state.allImages.length) {
+    document.body.classList.add('no-folder');
+    state.displayedSlots = [];
+    clearGridCells();
+    syncNavButtons();
+  }
+  console.warn(`Dropped ${dropped.size} unreadable image(s) from the pool`, [...dropped]);
+}
+
+// Empty the grid, releasing the per-image manual pan/zoom bookkeeping first.
+// Dropping the elements without this leaks `manualZoomActiveCount`, and that
+// counter is what tells every later zoom pass whether it can skip the manual
+// override work for every cell.
+function clearGridCells() {
+  for (const img of imageGrid.querySelectorAll('img')) deleteImageManualZoom(img);
+  imageGrid.textContent = '';
+  hoveredCell = null;
+  lastManualZoomCell = null;
 }
 
 function renderGrid(slots, options = {}) {
@@ -837,10 +962,16 @@ function renderGrid(slots, options = {}) {
       return c;
     })();
 
+    // Where this tile sits, for its accessible name. Passed down rather than
+    // recomputed per cell: working it out from the DOM means a querySelectorAll
+    // + indexOf inside a loop that already knows the answer, which is O(n²) over
+    // the board — 99 tiles was 9,801 cell visits per render.
+    const position = { index: i, total: slots.length };
+
     if (slot === null) {
       cell.classList.add('empty-slot');
       cell.classList.remove('locked');
-      setCellAccessibility(cell, null);
+      setCellAccessibility(cell, null, position);
       const img = cell.querySelector('img');
       if (img) {
         clearImageManualZoom(img);
@@ -859,12 +990,12 @@ function renderGrid(slots, options = {}) {
       if (img.getAttribute('data-src') !== slot) {
         if (stagger) {
           img.setAttribute('data-pending-src', slot);
-          pendingImageUpdates.push({ img, slot });
+          pendingImageUpdates.push({ img, slot, position });
         }
-        else applyImageSlot(img, slot);
+        else applyImageSlot(img, slot, position);
       } else {
         img.removeAttribute('data-pending-src');
-        setCellAccessibility(cell, slot);
+        setCellAccessibility(cell, slot, position);
       }
     }
   });
@@ -877,17 +1008,17 @@ function renderGrid(slots, options = {}) {
     const batch = Math.floor(index / SLIDESHOW_STAGGER_BATCH_SIZE);
     window.setTimeout(() => {
       if (renderToken !== state.gridRenderToken) return;
-      applyImageSlot(update.img, update.slot);
+      applyImageSlot(update.img, update.slot, update.position);
     }, batch * SLIDESHOW_STAGGER_DELAY_MS);
   });
 }
 
-function setCellAccessibility(cell, path) {
+function setCellAccessibility(cell, path, position = null) {
   if (!cell) return;
   const button = cell.querySelector('.grid-cell-accessibility');
   if (!button) return;
   if (path) {
-    button.setAttribute('aria-label', accessibleImageName(cell, path));
+    button.setAttribute('aria-label', accessibleImageName(cell, path, position));
     button.disabled = false;
     button.hidden = false;
   } else {
@@ -903,10 +1034,16 @@ function setCellAccessibility(cell, path) {
 // its OCR text snippet when known, then the filename as a stable handle. OCR is
 // filled in asynchronously by enrichAccessibleOcr(); until it arrives the name
 // still carries position + category + filename.
-function accessibleImageName(cell, path) {
-  const cells = [...imageGrid.querySelectorAll('.grid-cell')];
-  const index = cells.indexOf(cell);
-  const total = cells.length;
+// `position` ({index, total}) is supplied by every caller that is already
+// walking the grid; only the one-off callers pay for looking it up.
+function accessibleImageName(cell, path, position = null) {
+  let index = position ? position.index : -1;
+  let total = position ? position.total : 0;
+  if (!position) {
+    const cells = [...imageGrid.querySelectorAll('.grid-cell')];
+    index = cells.indexOf(cell);
+    total = cells.length;
+  }
   const parts = [];
   if (index >= 0 && total) parts.push(`Image ${index + 1} of ${total}`);
   const category = usesCategorizedRoot() ? categoryForPath(path) : null;
@@ -924,12 +1061,13 @@ let ocrFetchToken = 0;
 
 // Re-apply accessible names to every occupied cell (e.g. after OCR arrives).
 function refreshAccessibleNames() {
-  for (const cell of imageGrid.querySelectorAll('.grid-cell')) {
-    if (cell.classList.contains('empty-slot')) continue;
+  const cells = [...imageGrid.querySelectorAll('.grid-cell')];
+  cells.forEach((cell, index) => {
+    if (cell.classList.contains('empty-slot')) return;
     const img = cell.querySelector('img');
     const path = img && img.getAttribute('data-src');
-    if (path) setCellAccessibility(cell, path);
-  }
+    if (path) setCellAccessibility(cell, path, { index, total: cells.length });
+  });
 }
 
 // 2D roving focus between grid tiles. Columns mirror applyGridLayout's
@@ -1337,7 +1475,7 @@ function startSlideshowPreload() {
   const token = ++state.slideshowPreloadToken;
   const plan = buildNextSlideshowPlan();
   const keepAlive = [];
-  const paths = [...new Set(plan.slots.filter(Boolean))];
+  const paths = [...new Set(plan.slots.filter(Boolean))].slice(0, SLIDESHOW_PRELOAD_MAX_IMAGES);
 
   const preload = {
     ...plan,
@@ -1527,9 +1665,9 @@ document.addEventListener('visibilitychange', () => {
 // ==============================
 function clearDisplayFolder() {
   state.gridRenderToken++;
+  claimPoolLoad();
   clearSlideshowPreload();
-  hoveredCell = null;
-  lastManualZoomCell = null;
+  resetImageFailures();
   state.folder = null;
   state.allImages = [];
   state.displayedSlots = [];
@@ -1540,7 +1678,7 @@ function clearDisplayFolder() {
   // Same reason as in loadImagePool: undo entries restore by pool index, and
   // this drops the pool they refer to.
   undoStack.length = 0;
-  imageGrid.textContent = '';
+  clearGridCells();
   folderNameEl.textContent = '';
   document.body.classList.add('no-folder');
   renderFolderButton();
@@ -1778,6 +1916,7 @@ function toggleCategorizedRootMode(mode) {
 
 function loadImagePool(images, label, mode, folder = null) {
   clearSlideshowPreload();
+  resetImageFailures();
   state.allImages = [...images].sort((a, b) => b.modified - a.modified);
   state.folder = folder;
   state.browseMode = mode;
@@ -1797,7 +1936,7 @@ function loadImagePool(images, label, mode, folder = null) {
   if (state.allImages.length) refresh();
   else {
     state.displayedSlots = [];
-    imageGrid.textContent = '';
+    clearGridCells();
     syncNavButtons();
   }
   persistSettings();
@@ -1841,9 +1980,31 @@ function renderMultiFolderList() {
   }
 }
 
+// Every pool load has to be able to say "I am no longer the one that matters".
+// A folder scan is slow enough to outlive the decision that started it: ticking
+// two folders in a row, or switching to another browse mode mid-scan, used to
+// let the OLDER scan install its pool when it finished — the second tick showed
+// the first tick's images, and a scan could drag you back out of Categorized
+// several seconds after you left. The categorized scan already had this guard
+// (`categorizedScanSequence`); this is the same idea for every source.
+let poolLoadSequence = 0;
+
+function claimPoolLoad() {
+  const ticket = ++poolLoadSequence;
+  // Whatever the previous load was showing in the panel is over — it either
+  // finished or has just been superseded by this one. A caller that has its own
+  // scan to report turns the indicator straight back on. Without this, a slow
+  // folder scan overtaken by an INSTANT source switch (the categorized pool is
+  // already in memory, so nothing awaits) would leave "Scanning folders..." up
+  // for good: the superseded scan is no longer allowed to touch the UI.
+  setFolderLoading(false);
+  return () => ticket === poolLoadSequence;
+}
+
 async function enterMultiMode() {
   normalizeMultiFolderFilter({ defaultAll: false });
-  const folders = enabledMultiFolders();
+  const folders = uniqueFolders(enabledMultiFolders());
+  const current = claimPoolLoad();
   if (!folders.length) {
     loadImagePool([], 'No multi-folders enabled', 'multi');
     return;
@@ -1851,12 +2012,14 @@ async function enterMultiMode() {
   setFolderLoading(true, 'Scanning folders...', 'multi');
   try {
     const images = await window.viewerAPI.listMultiFolderImages(folders);
+    if (!current()) return;
     loadImagePool(images, `${folders.length} folder${folders.length === 1 ? '' : 's'}`, 'multi');
   } catch (error) {
+    if (!current()) return;
     showToast('Failed to load folders');
     console.error(error);
   } finally {
-    setFolderLoading(false);
+    if (current()) setFolderLoading(false);
   }
 }
 
@@ -2174,6 +2337,7 @@ function geoScopeImageCount(eligible) {
 
 // Build (or rebuild) the geo pool for the current scope, drawing a set if none is in hand.
 function applyGeoPool() {
+  claimPoolLoad();
   // No remembered scope (first visit, or the remembered one is gone): "Any country" is the sane
   // default — it is the mode that works without asking the user to pick from 53 rows first.
   if (state.setMode === 'off' && state.categorizedSets.length) {
@@ -2244,6 +2408,7 @@ function buildBlendPool(set) {
 
 // Build (or rebuild) the pool for `mode` from the current scope + category filter.
 function applyBlendPool(mode = state.browseMode) {
+  claimPoolLoad();
   if (state.setMode === 'off' && state.categorizedSets.length) {
     state.setMode = 'any';
     state.setCountry = null;
@@ -2463,10 +2628,9 @@ function displayedCategorizedSet() {
 // CATEGORY filter, and a set is a straight member list that bypasses category filtering entirely —
 // so without this, selecting a set would be a way around the one rule that must not have one.
 function categorizedSetImages(set) {
-  const byPath = new Map(state.categorizedImages.map(image => [image.path, image]));
   const out = [];
   for (const path of set.paths) {
-    const image = byPath.get(path);
+    const image = categorizedImageFor(path);
     if (!image) continue;
     if (state.agentSafe && isAgentBlocked(image.category)) continue;
     out.push(image);
@@ -2503,6 +2667,7 @@ function hasCategorizedScan() {
 
 function finalizeCategorizedImagePool(images, label) {
   clearSlideshowPreload();
+  resetImageFailures();
   state.allImages = [...images].sort((a, b) => b.modified - a.modified);
   state.folder = null;
   state.browseMode = 'categorized';
@@ -2541,6 +2706,10 @@ async function enterCategorizedMode(
     renderSetsPanel();
     return;
   }
+  // Claimed here and NOT in the eager partial-pool install below: the partial
+  // pool is this same operation showing its first images early, so it must not
+  // read as a newer load that supersedes its own finished scan.
+  const current = claimPoolLoad();
   const scanNumber = ++categorizedScanSequence;
   const scanId = `${windowLabel}-${scanNumber}-${Date.now()}`;
   const partialImages = [];
@@ -2584,7 +2753,11 @@ async function enterCategorizedMode(
   const finalize = (async () => {
     try {
       const scan = await window.viewerAPI.scanCategorizedRoot(root, scanId);
-      if (scanNumber !== categorizedScanSequence) return false;
+      // Two ways this scan can be obsolete by now: another categorized scan
+      // started (scanNumber), or the user moved to a different SOURCE entirely
+      // while this one ran (current) — a folder scan that finished first used
+      // to be silently replaced by this one seconds later.
+      if (scanNumber !== categorizedScanSequence || !current()) return false;
       state.categorizedRoot = scan.root;
       state.categorizedImages = scan.images;
       state.categorizedCategories = scan.categories;
@@ -2613,7 +2786,7 @@ async function enterCategorizedMode(
       }
       return true;
     } catch (error) {
-      if (scanNumber === categorizedScanSequence) {
+      if (scanNumber === categorizedScanSequence && current()) {
         showToast('Failed to load categorized root');
         console.error(error);
       }
@@ -2651,6 +2824,7 @@ function sanitizeCategoryFilter() {
 // Hand the grid to the CATEGORY pool, whatever mode it was in. The Categorized tab means exactly
 // this, and so does anything else that has decided the category filter now owns the whole board.
 function loadCategorizedPool() {
+  claimPoolLoad();
   sanitizeCategoryFilter();
   renderCategoriesPanel();
   renderSetsPanel();
@@ -2714,8 +2888,31 @@ function setAgentSafe(on) {
 // ==============================
 // Right-click image menu
 // ==============================
+// path -> scan record, over `state.categorizedImages`. Rebuilt only when that
+// array is REPLACED (identity check), and it holds the very same record objects,
+// so an in-place category edit is visible through it without invalidation.
+//
+// This exists because the lookups below run per tile per board: the linear
+// `find` they replaced cost 43 ms to render one 99-tile board against the real
+// 30k-image library — 99 scans of 30k records, every five seconds in a
+// slideshow. With the index the same render is ~3 ms.
+let categorizedIndexSource = null;
+let categorizedIndex = new Map();
+
+function categorizedImageIndex() {
+  if (categorizedIndexSource !== state.categorizedImages) {
+    categorizedIndexSource = state.categorizedImages;
+    categorizedIndex = new Map(state.categorizedImages.map(image => [image.path, image]));
+  }
+  return categorizedIndex;
+}
+
+function categorizedImageFor(path) {
+  return categorizedImageIndex().get(path) || null;
+}
+
 function categoryForPath(path) {
-  const entry = state.categorizedImages.find(image => image.path === path);
+  const entry = categorizedImageFor(path);
   return entry ? entry.category : null;
 }
 
@@ -2864,7 +3061,7 @@ function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = nul
 // without re-hashing the whole root; the sidecar on disk is the source of
 // truth on the next rescan.
 function applyLocalCategoryChange(path, category) {
-  const entry = state.categorizedImages.find(image => image.path === path);
+  const entry = categorizedImageFor(path);
   const previous = entry ? entry.category : null;
   if (previous === category) return;
   if (entry) entry.category = category;
@@ -3418,6 +3615,23 @@ function manualZoomOverflow(img, rect, totalScale) {
     maxTx: Math.max(0, (renderedW - rect.width) / 2),
     maxTy: Math.max(0, (renderedH - rect.height) / 2),
   };
+}
+
+// Pull a manual pan back inside what the cell can actually show. The reachable
+// range is a function of the cell's pixel size, so a resize (or a move to a
+// monitor with another scale factor) can leave a pan pointing past the edge —
+// re-clamping keeps the user's zoom instead of resetting it, which is what
+// recenterManualZoom would do.
+function clampManualZoomToCell(cell) {
+  const img = cell && cell.querySelector('img');
+  const manual = img && imageManualZoom.get(img);
+  if (!manual || manual.resetting || !img.naturalWidth || !img.naturalHeight) return;
+  const rect = cell.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const totalScale = zoomFillScale(appSettings.zoomFillAmount) * manual.scale;
+  const { maxTx, maxTy } = manualZoomOverflow(img, rect, totalScale);
+  manual.tx = clamp(manual.tx, -maxTx, maxTx);
+  manual.ty = clamp(manual.ty, -maxTy, maxTy);
 }
 
 function applyManualOverride(cell) {
@@ -4131,6 +4345,41 @@ gridContextMenu.addEventListener('keydown', e => {
 // scroll/resize; simplest is to just dismiss it.
 window.addEventListener('resize', closeGridContextMenu);
 imageGrid.addEventListener('scroll', closeGridContextMenu, true);
+
+// ==============================
+// Reflow on resize / DPI change
+// ==============================
+// Every number the zoom-fill layer computes — the portrait fill scale, the
+// manual pan clamp — is derived from a cell's pixel rect, and nothing recomputed
+// them when that rect changed. Resize the window (or drag it to a monitor with a
+// different scale factor, which changes each cell's CSS size without resizing
+// the window at all) and every tile kept the transform it was given for the old
+// cell until the next board replaced it: portraits over- or under-filled, and a
+// panned image could sit past an edge that had moved.
+//
+// A ResizeObserver on the grid catches both causes, since a DPI change resizes
+// the grid in CSS pixels too. Coalesced to one pass per frame — a drag-resize
+// fires this continuously, and the pass reads layout for every cell.
+let zoomFillReflowFrame = null;
+
+function scheduleZoomFillReflow() {
+  if (zoomFillReflowFrame !== null) return;
+  zoomFillReflowFrame = requestAnimationFrame(() => {
+    zoomFillReflowFrame = null;
+    if (!imageGrid.childElementCount) return;
+    // Re-clamp any manual pan first: the reachable range shrank or grew with
+    // the cell, and a pan left past the new limit shows dead space.
+    if (manualZoomActiveCount > 0) {
+      for (const cell of imageGrid.querySelectorAll('.grid-cell.manual-zoom')) {
+        clampManualZoomToCell(cell);
+      }
+    }
+    applyZoomFillToImages();
+  });
+}
+
+new ResizeObserver(scheduleZoomFillReflow).observe(imageGrid);
+window.addEventListener('resize', scheduleZoomFillReflow);
 
 // ==============================
 // Keyboard shortcuts
