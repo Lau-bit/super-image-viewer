@@ -675,6 +675,20 @@ body.ui-hidden #folder-panel {
   color: #fff;
 }
 
+/* The play glyph carries the same yellow as the ON pill, so the control reads as
+   "slideshow" at a glance in either state. Two ids because `#toolbar button`
+   (0,1,0,1) outranks a lone `#btn-slideshow` (0,1,0,0) and would win the colour
+   back; `:not(.active)` keeps it clear of the ON rule below, which two ids would
+   otherwise outrank and leave the pill with yellow-on-yellow text. */
+#toolbar #btn-slideshow:not(.active) {
+  color: var(--mode-current);
+  border-color: rgba(240, 180, 41, 0.34);
+}
+
+#toolbar #btn-slideshow:not(.active):hover {
+  border-color: rgba(240, 180, 41, 0.6);
+}
+
 #btn-slideshow.active {
   background: #f0b429;
   border-color: #ffd166;
@@ -1353,6 +1367,110 @@ body.ui-hidden #settings-panel {
   height: 1px;
   background: var(--border);
   margin: 4px 6px;
+}
+
+/* ==============================
+   Slideshow interval popover
+   Anchored under the slideshow button by JS; same panel skin as the image
+   context menu so a right-click always produces the same kind of surface.
+   ============================== */
+#slideshow-timer-popover {
+  position: fixed;
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  z-index: 300;
+}
+
+#slideshow-timer-popover.open {
+  display: flex;
+}
+
+.slideshow-timer-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding: 1px 2px 0;
+}
+
+.slideshow-timer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.slideshow-timer-row button {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  background: var(--btn-hover);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.slideshow-timer-row button:hover:not(:disabled) {
+  background: var(--btn-active);
+  color: #fff;
+}
+
+.slideshow-timer-row button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+#slideshow-timer-input {
+  width: 62px;
+  background: var(--btn-hover);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 12px;
+  text-align: center;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.slideshow-timer-unit {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.slideshow-timer-presets {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+}
+
+.slideshow-timer-presets button {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 11px;
+  padding: 4px 0;
+  cursor: pointer;
+}
+
+.slideshow-timer-presets button:hover {
+  background: var(--btn-hover);
+  color: #fff;
+}
+
+.slideshow-timer-presets button.current {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 /* ==============================

@@ -435,6 +435,72 @@ fn modified_ms(path: &Path) -> u64 {
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------------------------
+// Path safety
+// ---------------------------------------------------------------------------------------------
+
+/// Open one folder to the `asset:` protocol, so the webview can load the images under it.
+///
+/// **`assetProtocol.scope` in tauri.conf.json is `[]` on purpose, and this function is why** — the
+/// config format takes no comments, so the reason lives here. It used to be `["**"]`, which meant any
+/// code running in the page could read every file this account can — `fetch(convertFileSrc(
+/// 'C:\\Windows\\win.ini'))` returned its contents. That made the page's integrity the only thing
+/// guarding the filesystem, and this app deliberately gives the page up: devtools ship in release
+/// and `td` drives it over CDP. So the grant moved here, to the two commands that actually open a
+/// folder, and covers exactly what the user pointed the app at.
+///
+/// Grants are per-session (the scope is in memory, never persisted), which is the right lifetime:
+/// every launch re-scans through these same commands before a single tile renders.
+///
+/// Failing to widen the scope is not fatal to the scan — it costs images, not correctness — so this
+/// warns rather than turning a scan into an error.
+fn grant_asset_access(app: &AppHandle, dir: &str) {
+    if dir.is_empty() {
+        return;
+    }
+    if let Err(error) = app.asset_protocol_scope().allow_directory(dir, true) {
+        eprintln!("Failed to grant asset access to {dir}: {error}");
+    }
+}
+
+/// Is `path` really inside `root`?
+///
+/// Both sides are canonicalized first, so `..` segments, mixed separators and 8.3 short names all
+/// collapse before the comparison — a `starts_with` on the raw strings is a check in name only.
+/// A path that cannot be canonicalized (missing, unreadable) is NOT contained: these callers are
+/// about to write, and "I could not tell" has to fail closed.
+///
+/// Note this resolves symlinks, so an image reached through a symlinked subfolder counts as living
+/// wherever it really is, not where it was reached from.
+fn path_is_inside(root: &str, path: &str) -> bool {
+    let (Ok(root), Ok(path)) = (fs::canonicalize(root), fs::canonicalize(path)) else {
+        return false;
+    };
+    path.starts_with(&root)
+}
+
+/// The write commands take a `root` and a `path` straight from the frontend and neither is checked
+/// by Tauri. Without this, `set_image_category` would hash any readable file on the machine and
+/// file the result into any existing categorizer sidecar on the machine — confirmed, by writing a
+/// .txt from outside into a root the app had never been pointed at.
+fn require_path_inside(root: &str, path: &str) -> Result<(), String> {
+    if path_is_inside(root, path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Refusing to act on {path}: it is not inside the categorizer root {root}."
+        ))
+    }
+}
+
+/// A hash from the cache is about to become a FILENAME (`<hash>.txt`). Everything writing that
+/// cache today is this app, hashing with `categorizer_hash_file`, so the values are hex — but the
+/// cache is a plain JSON file on disk, and one bad entry would otherwise walk `join` out of the OCR
+/// directory. Cheap to make that structurally impossible instead of merely true today.
+fn is_safe_hash(hash: &str) -> bool {
+    !hash.is_empty() && hash.len() <= 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn categorizer_hash_file(path: &Path, size: u64) -> Result<String, String> {
     let mut file =
         File::open(path).map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
@@ -626,7 +692,7 @@ fn get_categorized_ocr_blocking(
     let ocr_dir = PathBuf::from(&root).join(CATEGORIZER_OCR_TEXT_DIR_NAME);
     let mut out = Vec::new();
     for (path, hash) in paths.into_iter().zip(hashes) {
-        let Some(hash) = hash else {
+        let Some(hash) = hash.filter(|hash| is_safe_hash(hash)) else {
             continue;
         };
         let file = ocr_dir.join(format!("{hash}.txt"));
@@ -755,6 +821,14 @@ fn exclude_from_geo_sets(app: AppHandle, root: String, paths: Vec<String>) -> Re
     let now = now_iso();
     let mut added = 0usize;
     for path in &paths {
+        // This is the only write in the app that does not need a pre-existing file, so an unchecked
+        // `root` would let it drop a JSON file anywhere on disk. It happens to be safe already —
+        // `load_categorized_hashes` is keyed BY ROOT, so an unscanned root yields no hashes and the
+        // loop below adds nothing — but that containment is a side effect of the cache's shape, and
+        // a refactor of the cache would remove it without a word. State it instead of relying on it.
+        if !path_is_inside(&root, path) {
+            continue;
+        }
         let Some(entry) = hashes.get(path) else {
             // No hash means the categorized scan has never seen this file; nothing stable to key on.
             continue;
@@ -1114,6 +1188,10 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 fn set_image_category_blocking(root: String, path: String, category: String) -> Result<(), String> {
+    // `root` and `path` are two independent strings from the frontend; nothing else ties them
+    // together. Every real caller passes a file that lives under the root it names, so this only
+    // ever rejects a call that had no business being made.
+    require_path_inside(&root, &path)?;
     let sidecar_path = PathBuf::from(&root).join(CATEGORIZER_SIDECAR_FILE_NAME);
     let raw = fs::read_to_string(&sidecar_path)
         .map_err(|_| "Not a categorized folder (no .image-categorizer.json found).".to_string())?;
@@ -1421,7 +1499,15 @@ fn list_multi_folder_images_blocking(folders: Vec<String>) -> Vec<ImageInfo> {
 }
 
 #[tauri::command]
-async fn list_multi_folder_images(folders: Vec<String>) -> Result<Vec<ImageInfo>, String> {
+async fn list_multi_folder_images(
+    app: AppHandle,
+    folders: Vec<String>,
+) -> Result<Vec<ImageInfo>, String> {
+    // Before the scan, not after: the returned paths become `asset:` URLs the moment the frontend
+    // has them, and with an empty static scope an ungranted folder renders a grid of blank tiles.
+    for folder in &folders {
+        grant_asset_access(&app, folder);
+    }
     tauri::async_runtime::spawn_blocking(move || list_multi_folder_images_blocking(folders))
         .await
         .map_err(|error| format!("Multi-folder scan failed: {error}"))
@@ -1434,6 +1520,9 @@ async fn scan_categorized_root(
     root: String,
     scan_id: String,
 ) -> Result<CategorizedRootView, String> {
+    // Ahead of the spawn, because this scan streams partial results out by event as it goes — a
+    // grant that waited for the return would leave the eager first board blank.
+    grant_asset_access(&app, &root);
     let window_label = window.label().to_string();
     tauri::async_runtime::spawn_blocking(move || {
         scan_categorized_root_blocking(app, window_label, root, scan_id)

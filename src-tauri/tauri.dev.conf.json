@@ -1,7 +1,7 @@
 {
   "build": {
     "devUrl": "http://localhost:1430",
-    "beforeDevCommand": "live-server src --port=1430 --no-browser"
+    "beforeDevCommand": "live-server src --port=1430 --no-browser --host=127.0.0.1"
   },
   "app": {
     "security": {

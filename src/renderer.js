@@ -354,6 +354,12 @@ const btnMinimize        = document.getElementById('btn-minimize');
 const btnClose           = document.getElementById('btn-close');
 const gridContextMenu    = document.getElementById('grid-context-menu');
 let gridContextMenuReturnFocus = null;
+const slideshowTimerPopover = document.getElementById('slideshow-timer-popover');
+const slideshowTimerInput   = document.getElementById('slideshow-timer-input');
+const slideshowTimerDec     = document.getElementById('slideshow-timer-dec');
+const slideshowTimerInc     = document.getElementById('slideshow-timer-inc');
+const slideshowTimerPresets = document.querySelector('.slideshow-timer-presets');
+let slideshowTimerReturnFocus = null;
 
 // ==============================
 // Grid layout
@@ -1909,6 +1915,112 @@ function stopSlideshow() {
 function toggleSlideshow() {
   if (state.slideshow) stopSlideshow();
   else startSlideshow();
+}
+
+// ==============================
+// Slideshow interval popover (right-click the slideshow button)
+// The interval is the one slideshow setting worth changing WHILE it runs, so it
+// gets a second home here as well as in Settings. Both write the same
+// `state.slideshowDuration`; `syncSlideshowDurationControls` keeps them equal.
+// ==============================
+const SLIDESHOW_DURATION_MIN_SEC = 1;
+const SLIDESHOW_DURATION_MAX_SEC = 3600;
+const SLIDESHOW_DURATION_PRESETS = [3, 5, 10, 20, 30, 60];
+
+function slideshowDurationSeconds() {
+  return Math.round(state.slideshowDuration / 1000);
+}
+
+function clampSlideshowSeconds(sec) {
+  if (!Number.isFinite(sec)) return 5;
+  return Math.min(SLIDESHOW_DURATION_MAX_SEC, Math.max(SLIDESHOW_DURATION_MIN_SEC, Math.round(sec)));
+}
+
+// Coarser steps as the interval grows: 1 s matters at 4 s and is invisible at 5 min.
+function steppedSlideshowSeconds(sec, direction) {
+  const step = sec < 10 ? 1 : sec < 60 ? 5 : sec < 300 ? 30 : 60;
+  // Stepping up from 7 with a step of 1 gives 8; stepping up from 12 with a step
+  // of 5 should land on 15, not 17 — snap to the step's own grid.
+  const next = direction > 0
+    ? Math.floor(sec / step) * step + step
+    : Math.ceil(sec / step) * step - step;
+  return clampSlideshowSeconds(next);
+}
+
+// The single writer for the interval. Every entry point (popover input,
+// steppers, presets, the settings panel field) goes through here.
+function setSlideshowDuration(sec, { persist = true } = {}) {
+  const clamped = clampSlideshowSeconds(sec);
+  const changed = clamped * 1000 !== state.slideshowDuration;
+  state.slideshowDuration = clamped * 1000;
+  syncSlideshowDurationControls();
+  if (state.slideshow) rescheduleSlideshowTick();
+  if (persist && changed) persistSettings();
+  return clamped;
+}
+
+function syncSlideshowDurationControls() {
+  const sec = slideshowDurationSeconds();
+  settingSlideshowDur.value = sec;
+  slideshowTimerInput.value = sec;
+  slideshowTimerDec.disabled = sec <= SLIDESHOW_DURATION_MIN_SEC;
+  slideshowTimerInc.disabled = sec >= SLIDESHOW_DURATION_MAX_SEC;
+  for (const btn of slideshowTimerPresets.children) {
+    btn.classList.toggle('current', Number(btn.dataset.seconds) === sec);
+  }
+}
+
+function buildSlideshowTimerPresets() {
+  slideshowTimerPresets.textContent = '';
+  for (const sec of SLIDESHOW_DURATION_PRESETS) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.dataset.seconds = String(sec);
+    btn.textContent = `${sec}s`;
+    btn.setAttribute('aria-label', `Set slideshow interval to ${sec} seconds`);
+    btn.addEventListener('click', () => setSlideshowDuration(sec));
+    slideshowTimerPresets.append(btn);
+  }
+}
+
+function slideshowTimerPopoverOpen() {
+  return slideshowTimerPopover.classList.contains('open');
+}
+
+function closeSlideshowTimerPopover({ restoreFocus = false } = {}) {
+  if (!slideshowTimerPopoverOpen()) return;
+  slideshowTimerPopover.classList.remove('open');
+  const returnFocus = slideshowTimerReturnFocus;
+  slideshowTimerReturnFocus = null;
+  if (restoreFocus && returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+}
+
+function openSlideshowTimerPopover({ focusInput = false } = {}) {
+  closeGridContextMenu();
+  setSettingsOpen(false);
+  setFolderPanelOpen(false);
+  slideshowTimerReturnFocus = btnSlideshow;
+  syncSlideshowDurationControls();
+  slideshowTimerPopover.classList.add('open');
+
+  // Anchor under the button, clamped to the viewport the same way the image
+  // context menu is. Measured after .open, since a display:none box has no size.
+  const anchor = btnSlideshow.getBoundingClientRect();
+  const maxX = window.innerWidth - slideshowTimerPopover.offsetWidth - 4;
+  const maxY = window.innerHeight - slideshowTimerPopover.offsetHeight - 4;
+  slideshowTimerPopover.style.left = `${Math.max(4, Math.min(anchor.left, maxX))}px`;
+  slideshowTimerPopover.style.top = `${Math.max(4, Math.min(anchor.bottom + 4, maxY))}px`;
+
+  if (focusInput) {
+    slideshowTimerInput.focus({ preventScroll: true });
+    slideshowTimerInput.select();
+  }
+  announce(`Slideshow interval ${slideshowDurationSeconds()} seconds`);
+}
+
+function toggleSlideshowTimerPopover(opts) {
+  if (slideshowTimerPopoverOpen()) closeSlideshowTimerPopover({ restoreFocus: true });
+  else openSlideshowTimerPopover(opts);
 }
 
 // Restart the auto-advance countdown without disturbing the preload. Hand
@@ -4232,6 +4344,7 @@ function startZoomBiasRepeat(button, pointerId) {
 function setUiHidden(hidden) {
   state.uiHidden = hidden;
   document.body.classList.toggle('ui-hidden', hidden);
+  if (hidden) closeSlideshowTimerPopover();
 }
 
 // ==============================
@@ -4554,7 +4667,82 @@ zoomBiasDisplay.addEventListener('keydown', e => {
   }
 });
 
-btnSlideshow.addEventListener('click', toggleSlideshow);
+buildSlideshowTimerPresets();
+syncSlideshowDurationControls();
+
+btnSlideshow.addEventListener('click', e => {
+  // A left-click while the interval popover is open just dismisses it, rather
+  // than also flipping the slideshow the user was about to time.
+  if (slideshowTimerPopoverOpen()) {
+    e.stopPropagation();
+    closeSlideshowTimerPopover({ restoreFocus: true });
+    return;
+  }
+  toggleSlideshow();
+});
+
+// Right-click / ContextMenu key / Shift+F10 on the slideshow button -> interval popover.
+// stopPropagation keeps the document-level handler (which suppresses the native
+// webview menu and opens the image menu) out of it.
+let slideshowTimerKeyOpenStamp = -Infinity;
+
+btnSlideshow.addEventListener('keydown', e => {
+  if (e.key !== 'ContextMenu' && !(e.shiftKey && e.key === 'F10')) return;
+  e.preventDefault();
+  e.stopPropagation();
+  slideshowTimerKeyOpenStamp = e.timeStamp;
+  if (!slideshowTimerPopoverOpen()) openSlideshowTimerPopover({ focusInput: true });
+});
+
+btnSlideshow.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  e.stopPropagation();
+  // Some webviews dispatch a synthetic contextmenu alongside the ContextMenu /
+  // Shift+F10 keydown handled above. Don't let that second event toggle closed
+  // what the first just opened.
+  if (e.timeStamp - slideshowTimerKeyOpenStamp < 400) return;
+  // A real right-click carries button 2; a keyboard-synthesized one carries 0,
+  // and only that one should steal focus into the field.
+  toggleSlideshowTimerPopover({ focusInput: e.button !== 2 });
+});
+
+slideshowTimerPopover.addEventListener('click', e => e.stopPropagation());
+slideshowTimerPopover.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  e.stopPropagation();
+});
+
+slideshowTimerPopover.addEventListener('keydown', e => {
+  // The global keydown handler bails out inside INPUTs, so Escape is handled here.
+  if (e.key !== 'Escape') return;
+  e.preventDefault();
+  e.stopPropagation();
+  closeSlideshowTimerPopover({ restoreFocus: true });
+});
+
+slideshowTimerDec.addEventListener('click', () => {
+  setSlideshowDuration(steppedSlideshowSeconds(slideshowDurationSeconds(), -1));
+});
+slideshowTimerInc.addEventListener('click', () => {
+  setSlideshowDuration(steppedSlideshowSeconds(slideshowDurationSeconds(), +1));
+});
+
+// 'input' applies as you type so the running slideshow retimes live; the field is
+// re-normalised on 'change' (blur/Enter), which is also where a half-typed or
+// empty value gets snapped back to something legal.
+slideshowTimerInput.addEventListener('input', () => {
+  const raw = parseInt(slideshowTimerInput.value, 10);
+  if (!Number.isFinite(raw) || raw < SLIDESHOW_DURATION_MIN_SEC) return;
+  const typed = slideshowTimerInput.value;
+  setSlideshowDuration(raw);
+  // Keep what is being typed intact — syncing would rewrite "10" to "10" but
+  // also fight a user midway through typing "100".
+  slideshowTimerInput.value = typed;
+});
+slideshowTimerInput.addEventListener('change', () => {
+  setSlideshowDuration(parseInt(slideshowTimerInput.value, 10) || slideshowDurationSeconds());
+});
+
 btnShuffle.addEventListener('click',   shuffleCurrent);
 btnRefresh.addEventListener('click',   () => refresh({ rotate: true }));
 
@@ -4650,11 +4838,7 @@ settingSlider.addEventListener('input', () => {
 });
 
 settingSlideshowDur.addEventListener('change', () => {
-  const sec = Math.max(1, parseInt(settingSlideshowDur.value, 10) || 5);
-  settingSlideshowDur.value  = sec;
-  state.slideshowDuration    = sec * 1000;
-  if (state.slideshow) rescheduleSlideshowTick();
-  persistSettings();
+  setSlideshowDuration(parseInt(settingSlideshowDur.value, 10) || 5);
 });
 
 settingsPanel.addEventListener('click', e => e.stopPropagation());
@@ -4668,6 +4852,7 @@ document.addEventListener('click', () => {
   setSettingsOpen(false);
   setFolderPanelOpen(false);
   closeGridContextMenu();
+  closeSlideshowTimerPopover();
 });
 
 // Suppress the native webview context menu everywhere (removes "More tools"
@@ -4675,6 +4860,12 @@ document.addEventListener('click', () => {
 // name, Hide in any mode, and move-to-category when browsing a categorized root.
 document.addEventListener('contextmenu', e => {
   e.preventDefault();
+
+  // A right-click anywhere else dismisses the slideshow interval popover.
+  if (slideshowTimerPopoverOpen()) {
+    closeSlideshowTimerPopover();
+    return;
+  }
 
   // A right-click while the menu is open dismisses it instead of reopening.
   if (gridContextMenu.classList.contains('open')) {
@@ -4858,6 +5049,10 @@ document.addEventListener('keydown', e => {
     if (state.shortcutsOpen) { setShortcutsOpen(false); return; }
     if (gridContextMenu.classList.contains('open')) {
       closeGridContextMenu({ restoreFocus: true });
+      return;
+    }
+    if (slideshowTimerPopoverOpen()) {
+      closeSlideshowTimerPopover({ restoreFocus: true });
       return;
     }
     if (state.settingsOpen) { setSettingsOpen(false); return; }
@@ -5223,7 +5418,7 @@ armStartupWatchdog();
     emptyDisplayEl.textContent   = state.emptyCount;
     settingSlider.value          = state.imageCount;
     settingCountVal.textContent  = state.imageCount;
-    settingSlideshowDur.value    = Math.round(state.slideshowDuration / 1000);
+    syncSlideshowDurationControls();
     settingSquareAppCorners.checked = appSettings.squareAppCorners;
     settingFocusIndicators.checked = appSettings.focusIndicators;
     applyFocusIndicators();

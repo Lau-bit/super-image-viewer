@@ -15,7 +15,17 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = ["protocol-asset", "devtools"] }
+# NOTE: "devtools" is deliberately NOT here. It used to be, which put the web inspector in RELEASE
+# builds (debug builds have it either way) — so anyone at the keyboard could open F12 on a running
+# window and call every command in the invoke handler. Removing it was measured to cost nothing:
+# against a release build with the feature off, CDP still attaches, Runtime.evaluate works, the
+# window.SIV facade answers, the Tauri IPC bridge is reachable and Page.captureScreenshot returns a
+# real frame — because --remote-debugging-port is a WebView2 browser-process argument and has
+# nothing to do with Tauri's AreDevToolsEnabled. So `td capture` and the whole agent-control recipe
+# are unaffected. This closes "press F12 on the window I already have open"; it does not close
+# "relaunch it yourself with a debug port", which needs the ability to start the app anyway.
+# Add it back temporarily if you ever need the inspector against a release build.
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"

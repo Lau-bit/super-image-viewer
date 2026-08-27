@@ -291,6 +291,21 @@
   <!-- Image context menu; populated by JS -->
   <div id="grid-context-menu" class="context-menu" role="menu"></div>
 
+  <!-- Slideshow interval, opened by right-clicking (or Shift+F10 on) the slideshow button.
+       Same value as Settings > Slideshow > Interval; this is the reachable-without-leaving-the-board
+       copy, because the interval is the one slideshow setting you want to change WHILE watching. -->
+  <div id="slideshow-timer-popover" role="dialog" aria-label="Slideshow interval">
+    <div class="slideshow-timer-title">Slideshow interval</div>
+    <div class="slideshow-timer-row">
+      <button type="button" id="slideshow-timer-dec" aria-label="Shorter interval">&#x2212;</button>
+      <input type="number" id="slideshow-timer-input" min="1" max="3600" step="1" value="5"
+             aria-label="Slideshow interval in seconds">
+      <span class="slideshow-timer-unit" aria-hidden="true">sec</span>
+      <button type="button" id="slideshow-timer-inc" aria-label="Longer interval">+</button>
+    </div>
+    <div class="slideshow-timer-presets" role="group" aria-label="Interval presets"></div>
+  </div>
+
   <!-- Shortcut reference (?); deliberately outside the ui-hidden chrome so it
        still answers "how do I get the UI back?" while the UI is hidden. -->
   <div id="shortcuts-overlay">
@@ -306,6 +321,7 @@
           <div class="shortcut-row"><kbd>Space</kbd><span>New set</span></div>
           <div class="shortcut-row"><kbd>S</kbd><span>Shuffle current set</span></div>
           <div class="shortcut-row"><kbd>P</kbd><span>Play / pause slideshow</span></div>
+          <div class="shortcut-row"><kbd>Right-click</kbd><span>Slideshow button &#8594; interval</span></div>
           <div class="shortcut-row"><kbd>&#8592;</kbd><span>Previous set</span></div>
           <div class="shortcut-row"><kbd>&#8594;</kbd><span>Next set</span></div>
           <div class="shortcut-row"><kbd>Ctrl</kbd><kbd>Z</kbd><span>Undo hide / categorize</span></div>
