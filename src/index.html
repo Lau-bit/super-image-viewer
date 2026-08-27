@@ -43,6 +43,23 @@
           <button type="button" class="folder-mode-tab" data-browse-mode="mix" aria-label="Mix — a country set and the category library on one board, at a ratio you set">Mix</button>
           <button type="button" class="folder-mode-tab" data-browse-mode="alt" aria-label="Alt — whole boards alternating between a country set and the category library">Alt</button>
         </div>
+        <!-- Cell merging sits directly under the tabs and OUTSIDE every .folder-section, because it
+             is a layer over whichever mode the tabs select rather than one of them — the position
+             is the explanation. It is also the only copy reachable in a narrow window, where the
+             toolbar strip scrolls its slider out of sight. -->
+        <div class="folder-panel-group" id="merge-panel-group">
+          <div class="folder-panel-title">Cell merging &#8212; any mode</div>
+          <label class="folder-panel-option" id="merge-panel-toggle-row">
+            <span>Merge cells into larger slots</span>
+            <input type="checkbox" id="merge-panel-toggle">
+          </label>
+          <div id="merge-panel-ratio-row">
+            <input type="range" id="merge-panel-slider" min="0" max="100" step="5" value="50"
+                   aria-label="Merged cell propensity" disabled>
+            <span id="merge-panel-value" class="blend-ratio-value">50%</span>
+          </div>
+          <div id="merge-panel-detail" class="blend-ratio-detail"></div>
+        </div>
         <div class="folder-panel-group">
           <div class="folder-panel-title">Startup</div>
           <label class="folder-panel-option">
@@ -145,6 +162,17 @@
       <button id="btn-empty-dec" aria-label="Fewer empty slots">&#x2212;</button>
       <span id="empty-display">0</span>
       <button id="btn-empty-inc" aria-label="More empty slots">+</button>
+    </div>
+
+    <!-- Merged cells. A layer over whatever browse mode is active, not one of the modes: it fuses
+         some of the board's grid positions into 2x2 cells holding one image, so a set trades
+         quantity for depth without changing the grid it sits in. Lives beside the count and
+         empty-slot steppers because it is the same kind of control — the shape of the board. -->
+    <div id="merge-controls" role="group" aria-label="Merged cells">
+      <button id="btn-merge" class="toggle-btn" aria-label="Merged cells are off — merge cells to show fewer, larger images per set" aria-pressed="false">Merge</button>
+      <input id="merge-ratio-slider" type="range" min="0" max="100" step="5" value="50"
+             aria-label="Merged cell propensity" disabled>
+      <span id="merge-ratio-value" class="merge-ratio-value">50%</span>
     </div>
 
     <!-- Display mode -->
@@ -284,6 +312,7 @@
           <div class="shortcut-row"><kbd>G</kbd><span>Geo &#8596; Categorized</span></div>
           <div class="shortcut-row"><kbd>M</kbd><span>Mix &#8596; Categorized</span></div>
           <div class="shortcut-row"><kbd>A</kbd><span>Alt &#8596; Categorized</span></div>
+          <div class="shortcut-row"><kbd>Shift</kbd><kbd>M</kbd><span>Merged cells on / off</span></div>
           <div class="shortcut-row"><kbd>Shift</kbd><kbd>Q</kbd><span>Show / hide the UI</span></div>
           <div class="shortcut-row"><kbd>?</kbd><span>This list</span></div>
           <div class="shortcut-row"><kbd>Esc</kbd><span>Close menu / panel</span></div>

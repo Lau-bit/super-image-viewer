@@ -249,8 +249,15 @@ body.ui-hidden #startup-loading-overlay {
   top: calc(var(--titlebar-h) + var(--toolbar-h) - 1px);
   left: 6px;
   width: min(360px, calc(100vw - 12px));
-  max-height: min(460px, calc(100vh - 78px));
-  overflow: hidden;
+  /* Runs the full height of the window. This is a transient menu — it is opened, changed and
+     dismissed, never left up while viewing — so there is no reason to stop it at an arbitrary
+     460px and scroll a five-row category list inside a box while a hundred-odd pixels of empty
+     window sit below the panel. The cap is now only the window itself. */
+  max-height: calc(100vh - var(--titlebar-h) - var(--toolbar-h) - 8px);
+  /* auto, not hidden: in a window too short even for the fixed groups above the list, `hidden`
+     silently cut the bottom off the menu. This is the last-resort scrollbar — with any normal
+     window the section below absorbs the difference and it never appears. */
+  overflow-y: auto;
   background: var(--panel-bg);
   border: 1px solid var(--border);
   z-index: 220;
@@ -263,8 +270,11 @@ body.ui-hidden #startup-loading-overlay {
   display: flex;
 }
 
+/* With the chrome hidden the panel starts at the top edge, so it has that much more window to use.
+   The max-height has to follow, or it would keep reserving room for a toolbar that isn't there. */
 body.ui-hidden #folder-panel {
   top: 0;
+  max-height: calc(100vh - 8px);
 }
 
 #folder-mode-tabs {
@@ -392,10 +402,34 @@ body.ui-hidden #folder-panel {
   text-align: left;
 }
 
+/* Everything above the mode section keeps its natural height; the section takes whatever is left of
+   the window, and inside it only the list gives ground. Without this the flex column squeezes the
+   fixed rows (root name, All/None) before it touches the list. */
+#folder-mode-tabs,
+#folder-panel > .folder-panel-group,
+#folder-loading,
+.folder-section > * {
+  flex-shrink: 0;
+}
+
+/* Takes whatever the window has left — but with a floor, so a cramped window shrinks it to a few
+   scrollable rows and then scrolls the panel instead. Without the floor the list is the only thing
+   that can give, so it collapses to nothing while the panel grows a scrollbar over an empty box. */
+.folder-section.visible {
+  flex: 1 1 auto;
+  min-height: 130px;
+}
+
+/* A scrollbar here now means "this list is taller than the window", not "this list is taller than
+   320px". With a handful of categories there is no scrollbar at all — the list simply ends. */
 #multi-folder-list,
-#categories-list {
+#categories-list,
+#sets-list,
+#blend-categories-list,
+#blend-sets-list {
   overflow-y: auto;
-  max-height: 320px;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .multi-folder-row,
@@ -493,10 +527,6 @@ body.ui-hidden #folder-panel {
   padding: 4px 8px;
 }
 
-#sets-list {
-  overflow-y: auto;
-  max-height: 320px;
-}
 
 .set-row {
   display: grid;
@@ -740,6 +770,87 @@ body.ui-hidden #folder-panel {
   height: 22px;
   margin: 0 3px;
   accent-color: var(--accent);
+}
+
+/* Merged cells — the toolbar layer. Narrower slider than zoom-fill's: it has five useful
+   positions, not a hundred, and the toolbar is already a scrolling strip. */
+#merge-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+#merge-controls button {
+  min-width: 24px;
+  height: 22px;
+  padding: 0 6px;
+}
+
+/* Id-scoped so it can beat `#toolbar button { background: transparent }`, which outweighs the
+   plain `.toggle-btn.active` rule on specificity — that is why no toolbar toggle currently shows
+   an "on" fill. Kept to this control rather than fixed globally: merging changes what the whole
+   grid looks like, so "is it on?" has to be answerable at a glance. */
+#merge-controls #btn-merge.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+#merge-ratio-slider {
+  width: 84px;
+  height: 22px;
+  margin: 0 3px;
+  accent-color: var(--accent);
+}
+
+#merge-ratio-slider:disabled {
+  opacity: 0.4;
+}
+
+.merge-ratio-value {
+  min-width: 52px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The same control in the folder panel. Not a duplicate for its own sake: the toolbar strip
+   scrolls, so on a narrow window the slider above is unreachable — and this is where the effect
+   has room to be spelled out in words. The two copies are driven by one syncMergeControls(). */
+#merge-panel-toggle-row {
+  cursor: pointer;
+  margin-bottom: 4px;
+}
+
+#merge-panel-toggle {
+  accent-color: var(--accent);
+  width: 13px;
+  height: 13px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+#merge-panel-ratio-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#merge-panel-slider {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+#merge-panel-slider:disabled {
+  opacity: 0.4;
+}
+
+/* .blend-ratio-detail carries the panel's own 10px gutter; inside a .folder-panel-group that
+   would double up on the 8px already there. */
+#merge-panel-detail {
+  padding: 3px 0 0;
 }
 
 .zoom-level-btn.active {

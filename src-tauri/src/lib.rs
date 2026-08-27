@@ -127,6 +127,17 @@ struct Settings {
     /// who wants a heavy blend does not necessarily want geo four boards out of five.
     #[serde(default = "default_blend_geo_ratio")]
     alt_geo_ratio: u32,
+    /// Merged cells: whether some of each board's grid positions are fused into 2x2 cells holding
+    /// one image. This is a LAYER over the browse mode, not one of them, so it is remembered on
+    /// its own axis and survives every switch between categorized / geo / mix / alt.
+    #[serde(default)]
+    merge_cells_enabled: bool,
+    /// The merge propensity, 0-100: the chance each candidate 2x2 block on a board is merged. It
+    /// is not a count — the maximum moves with `image_count` (four on a sixteen-position board,
+    /// one on a nine), and the roll is per board, so sets vary between depth and quantity rather
+    /// than all coming up the same shape.
+    #[serde(default = "default_merge_cells_ratio")]
+    merge_cells_ratio: u32,
     #[serde(default)]
     startup_browse_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,6 +235,10 @@ fn default_blend_geo_ratio() -> u32 {
     50
 }
 
+fn default_merge_cells_ratio() -> u32 {
+    50
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -241,6 +256,8 @@ impl Default for Settings {
             categorized_set_country: None,
             mix_geo_ratio: 50,
             alt_geo_ratio: 50,
+            merge_cells_enabled: false,
+            merge_cells_ratio: 50,
             startup_browse_mode: "multi".to_string(),
             startup_folder: None,
             startup_multi_folders: Vec::new(),
@@ -1480,6 +1497,8 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     // un-copied one is parsed, dropped, and looks exactly like a stale binary.
     current.mix_geo_ratio = settings.mix_geo_ratio.min(100);
     current.alt_geo_ratio = settings.alt_geo_ratio.min(100);
+    current.merge_cells_enabled = settings.merge_cells_enabled;
+    current.merge_cells_ratio = settings.merge_cells_ratio.min(100);
     current.startup_browse_mode = match settings.startup_browse_mode.as_str() {
         "multi" | "categorized" | "geo" | "mix" | "alt" => settings.startup_browse_mode,
         _ => "multi".to_string(),

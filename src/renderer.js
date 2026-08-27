@@ -35,6 +35,15 @@ const STARTUP_WATCHDOG_INIT_MS = 15000;
 const STARTUP_WATCHDOG_SCAN_MS = 20000;
 const STARTUP_WATCHDOG_IMAGE_MS = 15000;
 const CATEGORIZED_LARGE_LIBRARY_THRESHOLD = 2000;
+// Merged cells. A merged cell is always a 2x2 block of grid positions holding ONE image —
+// "one larger slot", not a family of sizes, so a merged board still reads as the same grid rather
+// than a collage. Four positions in, one image slot out: a 16-position board therefore runs from
+// 16 small images (no merges) to 4 large ones (4 merges), which is the whole depth/quantity dial.
+const MERGE_SPAN = 2;
+// Unaligned blocks (a cell straddling the middle two columns) are the interesting positions, but
+// they fragment the board, so a greedy pass can come up short of the count the slider asked for.
+// Retry a few times before falling back to the aligned tiling, which always reaches the maximum.
+const MERGE_PLACEMENT_ATTEMPTS = 24;
 // Locked cells: the image stays put while the rest of the board refreshes, and
 // the image is filed into this category so it can be found later in the
 // image-categorizer app (the user created this exact category name there).
@@ -110,6 +119,21 @@ const state = {
   chronoOffset: 0,        // index into allImages for chrono mode
 
   displayedSlots: [],     // (string|null)[] — null = intentional empty slot
+
+  // Cell merging — a LAYER over whatever browse mode is active, not another mode. It changes the
+  // SHAPE of the board, never where the images come from, so it composes with categorized / geo /
+  // mix / alt instead of competing with them: some of each board's grid positions are fused into
+  // 2x2 cells holding one image, trading quantity for depth without changing the board's geometry.
+  // `imageCount` therefore keeps meaning grid POSITIONS; merging is what makes the number of
+  // images on a board differ from it, and vary from board to board.
+  mergeEnabled: false,
+  mergeRatio: 50,         // propensity: each candidate 2x2 block merges with this probability
+  // The board's cell geometry — {cols, rows, cells, merged, slotCount} — or null for the plain
+  // one-image-per-position grid. It has to travel WITH the slots (history entries, the slideshow
+  // plan, every re-render) because the slot array alone cannot say which of its entries is the
+  // big one; a board replayed against a newly rolled layout would put the wrong images in the
+  // wrong sizes and drop the tail of the array on the floor.
+  displayedLayout: null,
 
   // Locked cells — Map<path, {path, index}>. A locked image keeps its slot
   // across every board refresh/shuffle/slideshow advance, persists across
@@ -268,6 +292,13 @@ const setsReload         = document.getElementById('sets-reload');
 const blendRootNameEl    = document.getElementById('blend-root-name');
 const blendRootChoose    = document.getElementById('blend-root-choose');
 const blendHintEl        = document.getElementById('blend-hint');
+const btnMerge           = document.getElementById('btn-merge');
+const mergeRatioSlider   = document.getElementById('merge-ratio-slider');
+const mergeRatioValue    = document.getElementById('merge-ratio-value');
+const mergePanelToggle   = document.getElementById('merge-panel-toggle');
+const mergePanelSlider   = document.getElementById('merge-panel-slider');
+const mergePanelValue    = document.getElementById('merge-panel-value');
+const mergePanelDetail   = document.getElementById('merge-panel-detail');
 const blendRatioSlider   = document.getElementById('blend-ratio-slider');
 const blendRatioValue    = document.getElementById('blend-ratio-value');
 const blendRatioDetail   = document.getElementById('blend-ratio-detail');
@@ -327,11 +358,176 @@ let gridContextMenuReturnFocus = null;
 // ==============================
 // Grid layout
 // ==============================
-function applyGridLayout(count) {
-  const cols = Math.ceil(Math.sqrt(count));
-  const rows = Math.ceil(count / cols);
+function gridDimensions(count) {
+  const cols = Math.max(1, Math.ceil(Math.sqrt(count)));
+  const rows = Math.max(1, Math.ceil(count / cols));
+  return { cols, rows };
+}
+
+// A merged board keeps the SAME grid it would have had; only how many cells share it changes. So
+// the track counts come from the layout when there is one, and from the slot count when there
+// isn't — never from the number of cells, which a merged board has fewer of.
+function applyGridLayout(count, layout = null) {
+  const { cols, rows } = layout || gridDimensions(count);
   imageGrid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
   imageGrid.style.gridTemplateRows    = `repeat(${rows}, 1fr)`;
+}
+
+// ==============================
+// Merged cells (varying image sizes within a set)
+// ==============================
+// Merge is a layer over every browse mode, so all of this works off geometry alone and never
+// touches the pool: which images a board draws is the browse mode's business, how big they are is
+// this. See `state.mergeEnabled`.
+
+// Fisher-Yates on a copy — the callers below all want a random ORDER, not a random pick.
+function shuffled(list) {
+  const out = [...list];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+// The grid positions a 2x2 block anchored at (col,row) covers, as row-major indices.
+function blockPositions(col, row, cols) {
+  const out = [];
+  for (let r = row; r < row + MERGE_SPAN; r++) {
+    for (let c = col; c < col + MERGE_SPAN; c++) out.push(r * cols + c);
+  }
+  return out;
+}
+
+// Every 2x2 block that fits inside the `count` USED positions. The grid is often wider than the
+// count (13 images tile a 4x4 with three positions spare), and a block may not straddle one of
+// the spares — that would hand the board a cell the count never asked for.
+function mergeCandidates(cols, rows, count) {
+  const out = [];
+  for (let row = 0; row + MERGE_SPAN <= rows; row++) {
+    for (let col = 0; col + MERGE_SPAN <= cols; col++) {
+      if (blockPositions(col, row, cols).every(index => index < count)) out.push({ col, row });
+    }
+  }
+  return out;
+}
+
+// How many merges this board gets: one Bernoulli trial per slot in the aligned tiling. That makes
+// the slider a *propensity* rather than a count — at 50% on a 4x4 the board comes up anywhere from
+// 0 to 4 merged cells with two typical, which is the variation the mode exists for. A fixed count
+// per board would make every set the same shape, and the point is that they differ.
+function drawMergeCount(maxMerges) {
+  const chance = state.mergeRatio / 100;
+  if (maxMerges <= 0 || chance <= 0) return 0;
+  if (chance >= 1) return maxMerges;
+  let count = 0;
+  for (let i = 0; i < maxMerges; i++) if (Math.random() < chance) count++;
+  return count;
+}
+
+// Claim up to `want` non-overlapping blocks in a random order.
+function greedyBlocks(candidates, cols, want) {
+  const taken = new Set();
+  const blocks = [];
+  for (const block of shuffled(candidates)) {
+    if (blocks.length >= want) break;
+    const positions = blockPositions(block.col, block.row, cols);
+    if (positions.some(index => taken.has(index))) continue;
+    for (const index of positions) taken.add(index);
+    blocks.push(block);
+  }
+  return blocks;
+}
+
+// Unaligned blocks are allowed on purpose — a merged cell straddling the middle two columns is
+// exactly the "randomised position" this mode is for, and restricting merges to the four quadrants
+// makes every merged board look like the same four arrangements. They can fragment the grid though
+// (a block in the dead centre of a 4x4 leaves no room for a second one), so a board that comes up
+// short retries, and only then falls back to the aligned tiling — the one arrangement guaranteed to
+// reach the maximum, which is what the top of the slider has to deliver.
+function placeMergeBlocks(candidates, aligned, cols, want) {
+  if (want <= 0) return [];
+  for (let attempt = 0; attempt < MERGE_PLACEMENT_ATTEMPTS; attempt++) {
+    const blocks = greedyBlocks(candidates, cols, want);
+    if (blocks.length === want) return blocks;
+  }
+  return greedyBlocks(aligned, cols, want);
+}
+
+// The most merges a `count`-position board can hold: the aligned (quadrant) tiling, which is the
+// densest packing of non-overlapping 2x2 blocks. Also the number of Bernoulli trials the slider
+// gets, so "100%" means "as merged as this board size can be".
+function maxMergesFor(count) {
+  const { cols, rows } = gridDimensions(count);
+  return alignedMergeCandidates(cols, rows, count).length;
+}
+
+function alignedMergeCandidates(cols, rows, count) {
+  return mergeCandidates(cols, rows, count)
+    .filter(block => block.col % MERGE_SPAN === 0 && block.row % MERGE_SPAN === 0);
+}
+
+// Roll this board's cell geometry. Returns null for a plain board — including when merging is on
+// but the dice came up empty, since a zero-merge layout IS the default grid and saying so lets
+// every downstream `if (layout)` mean "this board has a big cell in it".
+function buildBoardLayout(count) {
+  if (!state.mergeEnabled || state.mergeRatio <= 0 || count < MERGE_SPAN * MERGE_SPAN) return null;
+  const { cols, rows } = gridDimensions(count);
+  const candidates = mergeCandidates(cols, rows, count);
+  const aligned = alignedMergeCandidates(cols, rows, count);
+  const blocks = placeMergeBlocks(candidates, aligned, cols, drawMergeCount(aligned.length));
+  if (!blocks.length) return null;
+
+  const owner = new Map();                       // grid position -> its block
+  for (const block of blocks) {
+    for (const index of blockPositions(block.col, block.row, cols)) owner.set(index, block);
+  }
+
+  // Row-major walk, so the cells still read left-to-right, top-to-bottom. That order is the one
+  // "Image i of n", Ctrl-drag reordering and the locked-cell indices all speak in, and a merged
+  // cell takes the place of its top-left position rather than being appended at the end.
+  const cells = [];
+  const emitted = new Set();
+  for (let index = 0; index < count; index++) {
+    const block = owner.get(index);
+    if (!block) {
+      cells.push({ col: index % cols, row: Math.floor(index / cols), span: 1 });
+      continue;
+    }
+    const head = block.row * cols + block.col;
+    if (emitted.has(head)) continue;
+    emitted.add(head);
+    cells.push({ col: block.col, row: block.row, span: MERGE_SPAN });
+  }
+  return { cols, rows, cells, merged: blocks.length, slotCount: cells.length };
+}
+
+// grid position -> cell index, for the keyboard walk. Memoised onto the layout, which is immutable
+// once rolled and is shared by reference with its history entry.
+function layoutOwnerMap(layout) {
+  if (layout.ownerMap) return layout.ownerMap;
+  const owner = new Map();
+  layout.cells.forEach((cell, index) => {
+    for (let r = cell.row; r < cell.row + cell.span; r++) {
+      for (let c = cell.col; c < cell.col + cell.span; c++) owner.set(r * layout.cols + c, index);
+    }
+  });
+  layout.ownerMap = owner;
+  return owner;
+}
+
+// How many image slots the NEXT board is likely to have. Merged boards vary, so this is the
+// expectation, not a promise — it exists so the readouts that project a board ("N geo · M
+// categorized per board of B") don't quote a board size merging has already shrunk.
+function expectedSlotCount(count = state.imageCount) {
+  if (!state.mergeEnabled || state.mergeRatio <= 0) return count;
+  const expectedMerges = (maxMergesFor(count) * state.mergeRatio) / 100;
+  return Math.max(1, Math.round(count - expectedMerges * (MERGE_SPAN * MERGE_SPAN - 1)));
+}
+
+// Image slots on the board CURRENTLY shown, which is what chrono paging has to step by.
+function displayedSlotCount() {
+  return state.displayedSlots.length || expectedSlotCount();
 }
 
 // ==============================
@@ -473,12 +669,17 @@ function pickBlendPaths(n, exclude, chronoOffset) {
   return [...geoPicks, ...catPicks, ...spill];
 }
 
-// Build a slot array: image paths + null empty slots, all shuffled together.
-// Locked images are reserved at their saved positions first, kept out of the
-// random/chrono pick so they never appear twice, and everything else fills in
-// around them — so a refresh reshuffles the board but never a locked cell.
+// Build a board: a slot array (image paths + null empty slots, all shuffled together) and the cell
+// geometry it was built for. Locked images are reserved at their saved positions first, kept out
+// of the random/chrono pick so they never appear twice, and everything else fills in around them —
+// so a refresh reshuffles the board but never a locked cell.
+//
+// Returns the layout alongside the slots rather than stashing it, because the two are one board:
+// the slot count is DERIVED from the layout (each merged cell swallows four grid positions and
+// gives back one slot), so a caller holding one without the other holds a board it cannot render.
 function generateSlots(chronoOffset = state.chronoOffset) {
-  const total    = state.imageCount;
+  const layout   = buildBoardLayout(state.imageCount);
+  const total    = layout ? layout.slotCount : state.imageCount;
   const reserved = lockedReservations(total);     // Map<index, path>
   const lockedPaths  = new Set(reserved.values());
   const lockedCount  = reserved.size;
@@ -514,7 +715,7 @@ function generateSlots(chronoOffset = state.chronoOffset) {
   for (let i = 0; i < total; i++) {
     if (slots[i] === undefined) slots[i] = k < nonLocked.length ? nonLocked[k++] : null;
   }
-  return slots;
+  return { slots, layout };
 }
 
 // ==============================
@@ -526,7 +727,11 @@ function pushHistory(slots, chronoOffset) {
   // country belongs to the history entry — not to a mutable "current draw" that has already moved
   // on by the time you arrow back to it.
   const setId = boardSetId();
-  hist.stack.push({ slots: [...slots], chronoOffset, setId });
+  // The cell geometry is stamped too, and read from `state.displayedLayout` rather than passed:
+  // every caller has already installed the layout these slots belong to (a shuffle and a
+  // history-head resync deliberately keep the board's shape while its contents move). Replaying an
+  // entry against a freshly rolled layout would resize the wrong tiles and drop the array's tail.
+  hist.stack.push({ slots: [...slots], chronoOffset, setId, layout: state.displayedLayout });
   if (hist.stack.length > HISTORY_MAX) hist.stack.shift();
   hist.pos = hist.stack.length - 1;
   setDisplayedSet(setId);
@@ -545,6 +750,7 @@ function restoreEntry(entry, options = {}) {
   // Overlay locks onto a copy so a locked cell never changes even when an older
   // set is replayed; the stored history entry itself is left untouched.
   state.displayedSlots = overlayLocks([...entry.slots]);
+  state.displayedLayout = entry.layout || null;
   state.chronoOffset   = entry.chronoOffset;
   // Replaying an older board puts an older country back on screen; the labels must follow it back.
   setDisplayedSet(entry.setId ?? null);
@@ -931,6 +1137,7 @@ function flushImageLoadFailures() {
 function clearGridCells() {
   for (const img of imageGrid.querySelectorAll('img')) deleteImageManualZoom(img);
   imageGrid.textContent = '';
+  state.displayedLayout = null;
   hoveredCell = null;
   lastManualZoomCell = null;
 }
@@ -941,7 +1148,10 @@ function renderGrid(slots, options = {}) {
   closeGridContextMenu({ restoreFocus: true });
   const stagger = !!options.stagger && !prefersReducedMotion();
   const renderToken = ++state.gridRenderToken;
-  applyGridLayout(slots.length || state.imageCount);
+  const layout = state.displayedLayout && state.displayedLayout.cells.length === slots.length
+    ? state.displayedLayout
+    : null;
+  applyGridLayout(slots.length || state.imageCount, layout);
 
   const existing = [...imageGrid.querySelectorAll('.grid-cell')];
   const pendingImageUpdates = [];
@@ -962,11 +1172,14 @@ function renderGrid(slots, options = {}) {
       return c;
     })();
 
+    const placement = layout ? layout.cells[i] : null;
+    applyCellPlacement(cell, placement);
+
     // Where this tile sits, for its accessible name. Passed down rather than
     // recomputed per cell: working it out from the DOM means a querySelectorAll
     // + indexOf inside a loop that already knows the answer, which is O(n²) over
     // the board — 99 tiles was 9,801 cell visits per render.
-    const position = { index: i, total: slots.length };
+    const position = { index: i, total: slots.length, span: placement ? placement.span : 1 };
 
     if (slot === null) {
       cell.classList.add('empty-slot');
@@ -1013,6 +1226,22 @@ function renderGrid(slots, options = {}) {
   });
 }
 
+// A merged board places EVERY cell explicitly. Auto-placement cannot be trusted once one cell
+// spans 2x2: it flows the rest around the span and leaves holes the slot array knows nothing
+// about, so cell i and slot i stop describing the same tile. Plain boards clear the properties
+// back out and go on flowing, since a cell element is reused across renders.
+function applyCellPlacement(cell, placement) {
+  if (!placement) {
+    if (cell.style.gridColumn) cell.style.gridColumn = '';
+    if (cell.style.gridRow) cell.style.gridRow = '';
+    cell.classList.remove('merged-cell');
+    return;
+  }
+  cell.style.gridColumn = `${placement.col + 1} / span ${placement.span}`;
+  cell.style.gridRow    = `${placement.row + 1} / span ${placement.span}`;
+  cell.classList.toggle('merged-cell', placement.span > 1);
+}
+
 function setCellAccessibility(cell, path, position = null) {
   if (!cell) return;
   const button = cell.querySelector('.grid-cell-accessibility');
@@ -1044,8 +1273,14 @@ function accessibleImageName(cell, path, position = null) {
     index = cells.indexOf(cell);
     total = cells.length;
   }
+  // A merged cell is four positions of board given to one image, and that is a visible fact about
+  // the tile — so it belongs in the name a screen reader (or an agent) gets, not only in the CSS.
+  const span = position
+    ? (position.span || 1)
+    : (cell && cell.classList.contains('merged-cell') ? MERGE_SPAN : 1);
   const parts = [];
   if (index >= 0 && total) parts.push(`Image ${index + 1} of ${total}`);
+  if (span > 1) parts.push('large');
   const category = usesCategorizedRoot() ? categoryForPath(path) : null;
   if (category) parts.push(category);
   const ocr = ocrTextCache.get(path);
@@ -1066,16 +1301,26 @@ function refreshAccessibleNames() {
     if (cell.classList.contains('empty-slot')) return;
     const img = cell.querySelector('img');
     const path = img && img.getAttribute('data-src');
-    if (path) setCellAccessibility(cell, path, { index, total: cells.length });
+    if (path) setCellAccessibility(cell, path, { index, total: cells.length, span: cellSpan(cell) });
   });
 }
 
-// 2D roving focus between grid tiles. Columns mirror applyGridLayout's
-// ceil(sqrt(n)); focus lands on the next occupied cell's keyboard button.
+function cellSpan(cell) {
+  return cell && cell.classList.contains('merged-cell') ? MERGE_SPAN : 1;
+}
+
+// 2D roving focus between grid tiles. On a plain board, columns mirror applyGridLayout's
+// ceil(sqrt(n)) and a fixed stride is enough; a merged board has no such stride and goes through
+// moveGridFocusInLayout. Either way focus lands on the next occupied cell's keyboard button.
 function moveGridFocus(fromCell, key) {
   const cells = [...imageGrid.querySelectorAll('.grid-cell')];
   const from = cells.indexOf(fromCell);
   if (from < 0) return;
+  const layout = state.displayedLayout;
+  if (layout && layout.cells.length === cells.length) {
+    moveGridFocusInLayout(cells, layout, from, key);
+    return;
+  }
   const cols = Math.max(1, Math.ceil(Math.sqrt(cells.length)));
   const delta = key === 'ArrowRight' ? 1
     : key === 'ArrowLeft' ? -1
@@ -1085,6 +1330,32 @@ function moveGridFocus(fromCell, key) {
   // so empty slots are skipped rather than trapping focus.
   for (let target = from + delta; target >= 0 && target < cells.length; target += delta) {
     const btn = cells[target].querySelector('.grid-cell-accessibility');
+    if (btn && !btn.hidden && !btn.disabled) { btn.focus(); return; }
+  }
+}
+
+// The same roving over a merged board, where there is no uniform stride to add: a 2x2 cell's
+// right-hand neighbour is one column past its RIGHT edge, and a cell two rows tall is the same
+// neighbour from either of the rows beside it. So walk grid positions from the block's leading
+// edge and take the first different cell that can hold focus.
+function moveGridFocusInLayout(cells, layout, from, key) {
+  const owner = layoutOwnerMap(layout);
+  const cell = layout.cells[from];
+  const step = key === 'ArrowRight' ? { x: 1, y: 0 }
+    : key === 'ArrowLeft' ? { x: -1, y: 0 }
+    : key === 'ArrowDown' ? { x: 0, y: 1 }
+    : { x: 0, y: -1 };
+  let col = step.x > 0 ? cell.col + cell.span - 1 : cell.col;
+  let row = step.y > 0 ? cell.row + cell.span - 1 : cell.row;
+
+  for (let guard = layout.cols * layout.rows; guard > 0; guard--) {
+    col += step.x;
+    row += step.y;
+    if (col < 0 || row < 0 || col >= layout.cols || row >= layout.rows) return;
+    const target = owner.get(row * layout.cols + col);
+    if (target === undefined || target === from) continue;
+    const btn = cells[target].querySelector('.grid-cell-accessibility');
+    // Empty slots are skipped rather than trapping focus, exactly as on a plain board.
     if (btn && !btn.hidden && !btn.disabled) { btn.focus(); return; }
   }
 }
@@ -1398,7 +1669,11 @@ function openFloatingImage(cell) {
 // ==============================
 function nextChronoOffset() {
   if (state.displayMode !== 'chrono') return state.chronoOffset;
-  const step = Math.max(1, state.imageCount - state.emptyCount);
+  // Step by the board actually on screen, not by `imageCount`: merging makes those differ, and a
+  // page step that assumed the unmerged size would skip past images nobody ever saw. Merged boards
+  // vary, so this is the best available answer rather than an exact one — it can only overlap or
+  // page short by a tile or two, never leave a gap.
+  const step = Math.max(1, displayedSlotCount() - state.emptyCount);
   const next = state.chronoOffset + step;
   // `next` is a page start, not an image index. Clamping it to the last index
   // (as this used to) let it settle mid-page, where the page degraded to a
@@ -1414,14 +1689,19 @@ function buildNextSlideshowPlan() {
     const entry = hist.stack[hist.pos + 1];
     return {
       slots: overlayLocks([...entry.slots]),
+      layout: entry.layout || null,
       chronoOffset: entry.chronoOffset,
       fromHistory: true,
     };
   }
 
   const chronoOffset = nextChronoOffset();
+  const board = generateSlots(chronoOffset);
   return {
-    slots: generateSlots(chronoOffset),
+    slots: board.slots,
+    // Rolled here, a whole preload ahead of the swap, and carried to the swap with its slots — the
+    // board's shape is decided when its images are picked, not when they appear.
+    layout: board.layout,
     chronoOffset,
     fromHistory: false,
   };
@@ -1517,8 +1797,9 @@ function refresh(options = {}) {
   // count or the zoom must not teleport you somewhere else.
   if (options.rotate) rotateSetIfActive();
   if (!state.allImages.length) return;
-  const slots = generateSlots();
+  const { slots, layout } = generateSlots();
   state.displayedSlots = slots;
+  state.displayedLayout = layout;
   renderGrid(slots, options);
   pushHistory(slots, state.chronoOffset);
   rescheduleSlideshowTick();
@@ -1557,6 +1838,7 @@ function navigateForward() {
     if (preloadedPlan) {
       state.chronoOffset = preloadedPlan.chronoOffset;
       state.displayedSlots = [...preloadedPlan.slots];
+      state.displayedLayout = preloadedPlan.layout || null;
       renderGrid(state.displayedSlots, { stagger: true });
       pushHistory(state.displayedSlots, state.chronoOffset);
       rescheduleSlideshowTick();
@@ -2429,7 +2711,7 @@ function applyBlendPool(mode = state.browseMode) {
   // share of its tiles come from the set, so sizing to sixteen would blow up a nine-tile board.
   if (set && mode === 'alt') syncImageCountControls(geoScopeImageCount(eligibleSets()));
   loadImagePool(images, categorizedPoolLabel(mode), mode);
-  const board = Math.max(1, state.imageCount - state.emptyCount);
+  const board = Math.max(1, expectedSlotCount() - state.emptyCount);
   const split = blendSlotSplit(board, mode);
   const label = browseModeLabel(mode);
   if (!set) {
@@ -2520,7 +2802,9 @@ function syncBlendControls() {
   }
 
   blendHintEl.textContent = 'Every board blends both — the slider is the tile split.';
-  const split = blendSlotSplit(Math.max(1, state.imageCount - state.emptyCount), 'mix');
+  // `expectedSlotCount()`, not `imageCount`: with merged cells on, a board holds fewer images than
+  // the count says, and quoting the unmerged size here would over-promise both halves of the split.
+  const split = blendSlotSplit(Math.max(1, expectedSlotCount() - state.emptyCount), 'mix');
   const board = split.geo + split.categorized;
   blendRatioDetail.textContent = `${split.geo} geo · ${split.categorized} categorized per board of ${board}`;
   blendRatioSlider.setAttribute('aria-label', 'Share of each board drawn from the geo country set');
@@ -2683,7 +2967,9 @@ function finalizeCategorizedImagePool(images, label) {
     if (state.allImages.length) refresh();
     else {
       state.displayedSlots = [];
-      imageGrid.textContent = '';
+      // clearGridCells(), not a bare textContent wipe: that leaks manualZoomActiveCount, and it
+      // would leave a merged layout installed with no cells for it to describe.
+      clearGridCells();
       syncNavButtons();
     }
   }
@@ -3272,8 +3558,9 @@ function syncImageCountControls(n) {
   emptyDisplayEl.textContent  = state.emptyCount;
   settingSlider.value         = n;
   settingCountVal.textContent = n;
-  // The mix readout is "N geo · M categorized per board" — a board-size change moves both.
-  syncBlendControls();
+  // The mix readout is "N geo · M categorized per board" — a board-size change moves both. It also
+  // moves how many merges fit, so this goes through the merge sync, which refreshes the blend one.
+  syncMergeControls();
   return n;
 }
 
@@ -3285,6 +3572,87 @@ function setImageCount(n) {
 
 function bumpCount(up) {
   setImageCount(state.imageCount + (up ? 1 : -1));
+}
+
+// ==============================
+// Merged cells — the toolbar layer
+// ==============================
+// Toggling or re-aiming the slider re-deals the board rather than only affecting the next one:
+// the point of the control is to see the trade, and waiting a whole slideshow interval to find out
+// what 70% looks like makes it unusable. Like the blend sliders it never rotates the country —
+// a plain `refresh()`, so you re-shape the set you are looking at instead of leaving it.
+function setMergeEnabled(enabled, { rebuild = true } = {}) {
+  const next = !!enabled;
+  const changed = next !== state.mergeEnabled;
+  state.mergeEnabled = next;
+  syncMergeControls();
+  if (rebuild && changed) {
+    if (state.allImages.length) refresh();
+    announce(next ? `Merged cells on — ${mergeDetailText()}` : 'Merged cells off');
+  }
+  persistSettings();
+  return next;
+}
+
+function setMergeRatio(ratio, { rebuild = true } = {}) {
+  const next = clamp(Math.round(Number(ratio) / 5) * 5, 0, 100);
+  const changed = next !== state.mergeRatio;
+  state.mergeRatio = next;
+  syncMergeControls();
+  if (!rebuild) return next;
+  if (changed && state.mergeEnabled) {
+    if (state.allImages.length) refresh();
+    announce(`Merge ${next}% — ${mergeDetailText()}`);
+  }
+  persistSettings();
+  return next;
+}
+
+// What the slider means on the CURRENT board size, in the units the setting is actually felt in.
+// The maximum moves with the image count (4 on a 16-position board, 1 on a 9-position one), so a
+// bare percentage says very little on its own — and the range, not the average, is the point: the
+// mode exists so sets differ from each other.
+function mergeDetailText() {
+  const max = maxMergesFor(state.imageCount);
+  if (!max) return `a ${state.imageCount}-image board has no room for a larger cell`;
+  if (!state.mergeEnabled || state.mergeRatio <= 0) return `all ${state.imageCount} cells the same size`;
+  if (state.mergeRatio >= 100) {
+    return `always ${max} merged — ${state.imageCount - max * (MERGE_SPAN * MERGE_SPAN - 1)} large images per set`;
+  }
+  const typical = Math.round((max * state.mergeRatio) / 100);
+  return `0–${max} merged per set, typically ${typical}`
+    + ` — about ${expectedSlotCount()} images instead of ${state.imageCount}`;
+}
+
+// One sync for BOTH copies of the control — the toolbar strip and the folder panel. They are the
+// same setting, so nothing here may read a widget's value; everything comes off `state`.
+function syncMergeControls() {
+  const max = maxMergesFor(state.imageCount);
+  const detail = mergeDetailText();
+  const compact = state.mergeEnabled && max
+    ? `${state.mergeRatio}% · ~${expectedSlotCount()}`
+    : `${state.mergeRatio}%`;
+
+  btnMerge.classList.toggle('active', state.mergeEnabled);
+  btnMerge.setAttribute('aria-pressed', state.mergeEnabled ? 'true' : 'false');
+  btnMerge.setAttribute('aria-label', state.mergeEnabled
+    ? `Merged cells are on — ${detail}`
+    : 'Merged cells are off — merge cells to show fewer, larger images per set');
+  mergeRatioSlider.disabled = !state.mergeEnabled;
+  if (mergeRatioSlider.value !== String(state.mergeRatio)) mergeRatioSlider.value = state.mergeRatio;
+  mergeRatioValue.textContent = compact;
+  mergeRatioSlider.setAttribute('aria-valuetext', `${state.mergeRatio} percent — ${detail}`);
+
+  mergePanelToggle.checked = state.mergeEnabled;
+  mergePanelSlider.disabled = !state.mergeEnabled;
+  if (mergePanelSlider.value !== String(state.mergeRatio)) mergePanelSlider.value = state.mergeRatio;
+  mergePanelValue.textContent = compact;
+  mergePanelSlider.setAttribute('aria-valuetext', `${state.mergeRatio} percent — ${detail}`);
+  mergePanelDetail.textContent = detail.charAt(0).toUpperCase() + detail.slice(1) + '.';
+
+  // The blend readouts project "per board of N", and merging is what makes N differ from the
+  // image count — so they have to be recomputed whenever this moves.
+  syncBlendControls();
 }
 
 // ==============================
@@ -3921,6 +4289,10 @@ async function persistSettings() {
       categorizedSetCountry: state.setCountry,
       mixGeoRatio:       state.mixRatio,
       altGeoRatio:       state.altRatio,
+      // Merging is a layout layer, not a source, so it persists on its own axis and stays put
+      // across every browse-mode switch.
+      mergeCellsEnabled: state.mergeEnabled,
+      mergeCellsRatio:   state.mergeRatio,
       startupBrowseMode: appSettings.startupBrowseMode,
       startupFolder:     null,
       startupMultiFolders: appSettings.startupMultiFolders,
@@ -4093,6 +4465,18 @@ blendRatioSlider.addEventListener('change', () => {
   setBlendRatio(blendRatioSlider.value);
   blendRatioSlider.blur();
 });
+btnMerge.addEventListener('click', () => setMergeEnabled(!state.mergeEnabled));
+// Same input/change split as the blend slider, and for the same reason.
+mergeRatioSlider.addEventListener('input', () => setMergeRatio(mergeRatioSlider.value, { rebuild: false }));
+mergeRatioSlider.addEventListener('change', () => {
+  setMergeRatio(mergeRatioSlider.value);
+  mergeRatioSlider.blur();
+});
+// The folder-panel copy. Both write through the same setters, so whichever one you touch the other
+// follows — syncMergeControls() repaints both off `state`, never off the widget that moved.
+mergePanelToggle.addEventListener('change', () => setMergeEnabled(mergePanelToggle.checked));
+mergePanelSlider.addEventListener('input', () => setMergeRatio(mergePanelSlider.value, { rebuild: false }));
+mergePanelSlider.addEventListener('change', () => setMergeRatio(mergePanelSlider.value));
 categoriesSelectAll.addEventListener('click', () => setAllCategorizedCategories(true));
 categoriesSelectNone.addEventListener('click', () => setAllCategorizedCategories(false));
 categoriesRescan.addEventListener('click', () => enterCategorizedMode());
@@ -4445,8 +4829,17 @@ document.addEventListener('keydown', e => {
     return;
   }
 
+  // Shift+M — merged cells on/off. A layer over whatever mode is showing, so unlike G/M/A it
+  // switches nothing about the source; it must be tested before plain M, which would otherwise
+  // swallow the chord.
+  if ((e.key === 'M' || e.key === 'm') && e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    setMergeEnabled(!state.mergeEnabled);
+    return;
+  }
+
   // M — flip between the categorized library and the mixed board
-  if ((e.key === 'm' || e.key === 'M') && !e.ctrlKey && !e.metaKey) {
+  if ((e.key === 'm' || e.key === 'M') && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
     e.preventDefault();
     toggleCategorizedRootMode('mix');
     return;
@@ -4568,7 +4961,7 @@ function finishStartupLoadingAfterFirstImage() {
 // category (Explicit), and setAgentSafe(true) extends that guarantee to the
 // whole window (human UI included) for the session.
 window.SIV = {
-  version: '1.4',
+  version: '1.5',
 
   // --- introspection ---
   blockedCategories: () => [...AGENT_BLOCKED_CATEGORIES],
@@ -4599,9 +4992,20 @@ window.SIV = {
       // not a count of what is on screen (locks and a short set both move that).
       mix: {
         ratio: state.mixRatio,
-        geoTiles: blendSlotSplit(Math.max(1, state.imageCount - state.emptyCount), 'mix').geo,
-        categorizedTiles: blendSlotSplit(Math.max(1, state.imageCount - state.emptyCount), 'mix').categorized,
+        geoTiles: blendSlotSplit(Math.max(1, expectedSlotCount() - state.emptyCount), 'mix').geo,
+        categorizedTiles: blendSlotSplit(Math.max(1, expectedSlotCount() - state.emptyCount), 'mix').categorized,
         geoPoolSize: state.geoSidePaths.size,
+      },
+      // Cell merging, which is a LAYER over whichever mode above is active rather than one of
+      // them: `imageCount` stays the number of grid POSITIONS, and `merged`/`cells` describe how
+      // many of them the board on screen fused. `possible` is the ceiling at this board size.
+      merge: {
+        enabled: state.mergeEnabled,
+        ratio: state.mergeRatio,
+        possible: maxMergesFor(state.imageCount),
+        merged: state.displayedLayout ? state.displayedLayout.merged : 0,
+        cells: state.displayedSlots.length,
+        expectedCells: expectedSlotCount(),
       },
       // Alt's alternation. `boardIsGeo` describes the board ON SCREEN; `upcoming` is the pattern
       // from here, so an agent can tell "one more board" from "four more" before the set it wants.
@@ -4630,6 +5034,9 @@ window.SIV = {
       return {
         index: i,
         of: total,
+        // Merged cells make the tiles differ in size, which `rect` already shows but only by
+        // comparison — this states it, so one tile read on its own is still self-describing.
+        large: cellSpan(cell) > 1,
         path,
         filename: baseName(path),
         category: usesCategorizedRoot() ? categoryForPath(path) : null,
@@ -4689,6 +5096,18 @@ window.SIV = {
   setAltRatio(ratio) {
     setBlendRatio(Number(ratio), { mode: 'alt' });
     return this.getState().alt;
+  },
+
+  // --- merged cells (composes with every browse mode) ---
+  // On/off, and the 0-100 propensity in the same 5% steps the slider uses. Both re-deal the board,
+  // so `merged` in the returned state describes what is on screen, not what was asked for.
+  setMergeEnabled(enabled) {
+    setMergeEnabled(!!enabled);
+    return this.getState().merge;
+  },
+  setMergeRatio(ratio) {
+    setMergeRatio(Number(ratio));
+    return this.getState().merge;
   },
 
   // --- category control (always allowlist-enforced) ---
@@ -4756,6 +5175,8 @@ armStartupWatchdog();
     if (state.setMode === 'country' && !state.setCountry) state.setMode = 'off';
     state.mixRatio = clamp(Math.round((s.mixGeoRatio ?? 50) / 5) * 5, 0, 100);
     state.altRatio = clamp(Math.round((s.altGeoRatio ?? 50) / 5) * 5, 0, 100);
+    state.mergeEnabled = !!s.mergeCellsEnabled;
+    state.mergeRatio = clamp(Math.round((s.mergeCellsRatio ?? 50) / 5) * 5, 0, 100);
     state.slideshowDuration = Math.max(1000, s.slideshowDuration || 5000);
     appSettings.squareAppCorners = !!s.squareAppCorners;
     appSettings.focusIndicators = s.focusIndicators !== false;
@@ -4820,6 +5241,7 @@ armStartupWatchdog();
     syncSlideshowButton();
     syncModeButtons();
     syncZoomFillControls();
+    syncMergeControls();
     syncNavButtons();
     if (appSettings.autoHideUiOnStartup) {
       setUiHidden(true);
@@ -4859,6 +5281,7 @@ armStartupWatchdog();
     syncSlideshowButton();
     syncModeButtons();
     syncZoomFillControls();
+    syncMergeControls();
     syncNavButtons();
   }
 
