@@ -3314,6 +3314,69 @@ function categoryForPath(path) {
   return entry ? entry.category : null;
 }
 
+// ==============================
+// Copy image to the clipboard
+// ==============================
+// Deliberately re-fetches the file into a throwaway `Image` instead of drawing
+// the tile that is already on screen: the grid's <img> elements load WITHOUT
+// `crossOrigin`, so the asset: response is opaque and any canvas they touch is
+// tainted — `toBlob` then throws SecurityError. Setting crossOrigin on the grid
+// images instead would fix the taint but change their cache key, so every
+// slideshow preload (which warms plain `new Image()` requests) would miss and
+// refetch. One extra local read on an explicit copy is the cheaper trade.
+// Same technique as the floating viewer's Ctrl+C — see image-view.js.
+function loadImageForCopy(path) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('decode failed'));
+    img.src = window.viewerAPI.getFileUrl(path);
+  });
+}
+
+const COPY_IMAGE_TIMEOUT_MS = 10000;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label)), ms); }),
+  ]);
+}
+
+// PNG regardless of the source format: it is the one bitmap flavour every
+// Windows target pastes, and the clipboard holds pixels, not the file.
+//
+// Both awaits are on a timeout because neither can be trusted to settle. A file
+// the scan listed can be gone or truncated (`loadImageForCopy` would then reject,
+// but a stalled protocol read would not), and WebView2's clipboard-write gate has
+// been measured on this machine to hang forever rather than reject when it wants
+// a permission the window cannot show — it is `granted` for this app's origin,
+// checked in both dev and release, but a silent stall must still surface as a
+// failed toast rather than nothing at all.
+async function copyImageToClipboard(path) {
+  try {
+    const img = await withTimeout(loadImageForCopy(path), COPY_IMAGE_TIMEOUT_MS, 'load timed out');
+    if (!img.naturalWidth || !img.naturalHeight) throw new Error('empty image');
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    canvas.getContext('2d').drawImage(img, 0, 0);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) throw new Error('encode failed');
+    await withTimeout(
+      navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]),
+      COPY_IMAGE_TIMEOUT_MS,
+      'clipboard write timed out',
+    );
+    showToast(`Copied ${baseName(path)}`);
+  } catch (error) {
+    console.error('Copy image failed:', error);
+    showToast('Could not copy image');
+  }
+}
+
 function closeGridContextMenu({ restoreFocus = false } = {}) {
   gridContextMenu.classList.remove('open');
   const returnFocus = gridContextMenuReturnFocus;
@@ -3352,6 +3415,27 @@ function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = nul
   actionSeparator.className = 'context-menu-separator';
   actionSeparator.setAttribute('role', 'separator');
   gridContextMenu.append(actionSeparator);
+
+  // Copy — puts the image's pixels on the clipboard. First because it is the
+  // only item here that changes nothing: everything below alters what the board
+  // or the library holds, so the harmless one is what a mis-aimed click lands on.
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.setAttribute('role', 'menuitem');
+  copyBtn.setAttribute('aria-label', `Copy ${baseName(path)} to the clipboard`);
+  const copyLabel = document.createElement('span');
+  copyLabel.textContent = 'Copy image';
+  copyBtn.append(copyLabel);
+  copyBtn.addEventListener('click', () => {
+    closeGridContextMenu({ restoreFocus: true });
+    copyImageToClipboard(path);
+  });
+  gridContextMenu.append(copyBtn);
+
+  const copySeparator = document.createElement('div');
+  copySeparator.className = 'context-menu-separator';
+  copySeparator.setAttribute('role', 'separator');
+  gridContextMenu.append(copySeparator);
 
   // Lock — pins this cell so board refreshes never swap its image, and files
   // the image into the "Previously pinned" category. Available in every mode.
