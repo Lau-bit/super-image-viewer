@@ -4563,8 +4563,14 @@ async function useCurrentSourceAtStartup() {
 
 async function saveWindowPositionPreset(preset) {
   try {
-    await window.viewerAPI.saveWindowPositionPreset(preset);
-    showToast(preset === 'first' ? 'Saved 1st window default' : 'Saved 2nd+ window default');
+    // Report the logical coordinates back: this record is what puts the window
+    // home again after a monitor layout change has swept it elsewhere, so a bare
+    // "saved" leaves no way to tell a good stamp from one taken on the wrong screen.
+    const saved = await window.viewerAPI.saveWindowPositionPreset(preset);
+    const name = preset === 'first' ? 'Saved 1st window default' : 'Saved 2nd+ window default';
+    showToast(saved
+      ? `${name} — ${saved.x},${saved.y} · ${saved.width}×${saved.height}`
+      : name);
   } catch {
     showToast('Failed to save window default');
   }

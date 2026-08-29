@@ -1629,12 +1629,18 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     save_settings_inner(&app, &current)
 }
 
+// Returns the geometry it wrote so the caller can name it back to the user. A
+// display-topology change (docking, or swapping to a single screen) sweeps every
+// window onto whatever monitor survives, and window-control's "send all apps
+// home" puts them back by reading this very record — so stamping a default is
+// only trustworthy if you can see that the spot recorded is the one you meant
+// and not the swept one you are looking at.
 #[tauri::command]
 fn save_window_position_preset(
     app: AppHandle,
     window: WebviewWindow,
     preset: String,
-) -> Result<(), String> {
+) -> Result<WindowState, String> {
     let state = current_logical_window_state(&window)?;
     let mut settings = load_settings_inner(&app);
 
@@ -1645,7 +1651,8 @@ fn save_window_position_preset(
     }
 
     settings.window = None;
-    save_settings_inner(&app, &settings)
+    save_settings_inner(&app, &settings)?;
+    Ok(state)
 }
 
 #[tauri::command]
