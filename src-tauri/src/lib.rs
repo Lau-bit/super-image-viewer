@@ -115,6 +115,11 @@ struct Settings {
     categorized_set_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     categorized_set_country: Option<String>,
+    /// Which favorites list the Favorites pool is narrowed to. `None` = every favorite, which is
+    /// also what "the user never made a list" means — lists are the optional half of the feature,
+    /// so the unset value has to be the whole collection rather than nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    favorites_list: Option<String>,
     /// Mix mode's tile split: the percentage of each board drawn from the country set, the rest
     /// from the category filter. 0 = all categorized, 100 = all geo. It is a *board* ratio, not a
     /// pool weight — the two pools never merge, because a curated sixteen dropped into a
@@ -254,6 +259,7 @@ impl Default for Settings {
             categorized_category_filter: None,
             categorized_set_mode: None,
             categorized_set_country: None,
+            favorites_list: None,
             mix_geo_ratio: 50,
             alt_geo_ratio: 50,
             merge_cells_enabled: false,
@@ -877,6 +883,401 @@ fn get_geo_excluded_paths(app: AppHandle, root: String) -> Vec<String> {
         .filter(|(_, entry)| excluded.contains_key(&entry.hash))
         .map(|(path, _)| path)
         .collect()
+}
+// ---------------------------------------------------------------------------------------------
+// Favorites
+// ---------------------------------------------------------------------------------------------
+//
+// Favorites live beside `settings.json` in the app data dir, NOT as a sidecar in a library root —
+// and that is the whole point of them. Every other collection this app writes belongs to one
+// scanned root (the category sidecar, the geo sets, the geo exclusions), but a favorite is marked
+// while looking at a board, in whichever browse mode happens to be up, and multi-folder mode has
+// no root to hang a sidecar off at all. So the store is global and keyed by absolute path.
+//
+// Lists are the OPTIONAL half. An image can be a favorite with no list at all — that is the
+// one-click case the feature exists for — and a list is a second axis laid over that, never a
+// bucket the image must be sorted into. Filing into a list therefore also favorites the image;
+// clearing every list does not un-favorite it; deleting a list keeps its images favorited.
+
+const FAVORITES_FILE_NAME: &str = "favorites.json";
+const FAVORITES_NOTE: &str = "Favorite images for super-image-viewer. `lists` are user-defined \
+names; an image with an empty `lists` is a plain favorite. Delete an entry here to un-favorite it, \
+or a name from `lists` to retire that list.";
+const FAVORITE_LIST_MAX_CHARS: usize = 48;
+const FAVORITE_LISTS_MAX: usize = 64;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FavoriteEntry {
+    path: String,
+    #[serde(default)]
+    added_at: String,
+    /// User-defined lists this image is filed under. Empty is the normal case.
+    #[serde(default)]
+    lists: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FavoritesFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    note: String,
+    /// Declared lists, in the order they were created. This is the authority on which names exist;
+    /// an entry naming anything else is dropped on load.
+    #[serde(default)]
+    lists: Vec<String>,
+    #[serde(default)]
+    images: Vec<FavoriteEntry>,
+}
+
+/// What the frontend gets: the file without its self-describing chrome. Counts are deliberately
+/// not computed here — the panel derives them from `images`, so there is one source of truth for
+/// "how many are in this list" rather than two that can disagree mid-edit.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FavoritesView {
+    lists: Vec<String>,
+    images: Vec<FavoriteEntry>,
+}
+
+fn favorites_view(file: FavoritesFile) -> FavoritesView {
+    FavoritesView {
+        lists: file.lists,
+        images: file.images,
+    }
+}
+
+/// Paths are compared case-insensitively because Windows filesystems are: the same image reached
+/// through two spellings must be ONE favorite, or the star on the tile disagrees with the store
+/// depending on which scan produced the path.
+fn favorite_key(path: &str) -> String {
+    path.to_lowercase()
+}
+
+fn favorite_name_eq(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+fn favorites_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?
+        .join(FAVORITES_FILE_NAME))
+}
+
+/// Fold a loaded file back into a shape the rest of the code can assume: no duplicate paths, no
+/// duplicate or blank list names, and no entry filed under a list that does not exist. The file is
+/// meant to be hand-editable (the note inside it says so), so a name deleted by hand has to stop
+/// appearing on images too — otherwise the panel can never show where that image is filed.
+fn normalize_favorites(mut file: FavoritesFile) -> FavoritesFile {
+    let mut lists: Vec<String> = Vec::new();
+    for name in file.lists.drain(..) {
+        let name = name.trim().to_string();
+        if name.is_empty() || lists.iter().any(|existing| favorite_name_eq(existing, &name)) {
+            continue;
+        }
+        lists.push(name);
+    }
+    lists.truncate(FAVORITE_LISTS_MAX);
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut images: Vec<FavoriteEntry> = Vec::new();
+    for mut entry in file.images.drain(..) {
+        if entry.path.trim().is_empty() || !seen.insert(favorite_key(&entry.path)) {
+            continue;
+        }
+        let mut member: Vec<String> = Vec::new();
+        for name in std::mem::take(&mut entry.lists) {
+            // Snap to the declared spelling rather than the one stored on the image, so a list
+            // renamed only in `lists` still matches, and drop anything naming no list at all.
+            let Some(canonical) = lists.iter().find(|list| favorite_name_eq(list, name.trim()))
+            else {
+                continue;
+            };
+            if !member.iter().any(|held| held == canonical) {
+                member.push(canonical.clone());
+            }
+        }
+        entry.lists = member;
+        images.push(entry);
+    }
+
+    file.lists = lists;
+    file.images = images;
+    file
+}
+
+fn load_favorites_file(app: &AppHandle) -> FavoritesFile {
+    favorites_path(app)
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str::<FavoritesFile>(&raw).ok())
+        .map(normalize_favorites)
+        .unwrap_or_default()
+}
+
+fn save_favorites_file(app: &AppHandle, file: &mut FavoritesFile) -> Result<(), String> {
+    file.version = 1;
+    file.note = FAVORITES_NOTE.to_string();
+    let path = favorites_path(app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create settings directory: {error}"))?;
+    }
+    let data = serde_json::to_string_pretty(file)
+        .map_err(|error| format!("Failed to serialize favorites: {error}"))?;
+    fs::write(path, data).map_err(|error| format!("Failed to save favorites: {error}"))
+}
+
+fn favorite_index(file: &FavoritesFile, path: &str) -> Option<usize> {
+    let key = favorite_key(path);
+    file.images
+        .iter()
+        .position(|entry| favorite_key(&entry.path) == key)
+}
+
+#[tauri::command]
+fn load_favorites(app: AppHandle) -> FavoritesView {
+    favorites_view(load_favorites_file(&app))
+}
+
+/// The one-click action. Un-favoriting drops the whole entry, list memberships included: a list is
+/// something hung off "is a favorite", so leaving the rows behind would file an image under a list
+/// while the star says it is not a favorite at all.
+#[tauri::command]
+fn set_favorite(app: AppHandle, path: String, favorite: bool) -> Result<FavoritesView, String> {
+    if path.trim().is_empty() {
+        return Err("No image path given".to_string());
+    }
+    let mut file = load_favorites_file(&app);
+    match (favorite, favorite_index(&file, &path)) {
+        (true, None) => file.images.push(FavoriteEntry {
+            path,
+            added_at: now_iso(),
+            lists: Vec::new(),
+        }),
+        (false, Some(index)) => {
+            file.images.remove(index);
+        }
+        // Already in the state asked for — don't rewrite the file for nothing.
+        _ => return Ok(favorites_view(file)),
+    }
+    save_favorites_file(&app, &mut file)?;
+    Ok(favorites_view(file))
+}
+
+/// File an image into (or out of) one user-defined list. Filing in favorites the image if it was
+/// not one already — the list is an extra axis, never a separate collection that could hold
+/// something the star does not.
+#[tauri::command]
+fn set_favorite_list(
+    app: AppHandle,
+    path: String,
+    list: String,
+    member: bool,
+) -> Result<FavoritesView, String> {
+    if path.trim().is_empty() {
+        return Err("No image path given".to_string());
+    }
+    let mut file = load_favorites_file(&app);
+    let Some(canonical) = file
+        .lists
+        .iter()
+        .find(|name| favorite_name_eq(name, list.trim()))
+        .cloned()
+    else {
+        return Err(format!("No favorites list named {}", list.trim()));
+    };
+
+    let index = match favorite_index(&file, &path) {
+        Some(index) => index,
+        None => {
+            if !member {
+                return Ok(favorites_view(file));
+            }
+            file.images.push(FavoriteEntry {
+                path,
+                added_at: now_iso(),
+                lists: Vec::new(),
+            });
+            file.images.len() - 1
+        }
+    };
+
+    let held = file.images[index]
+        .lists
+        .iter()
+        .any(|name| *name == canonical);
+    if held == member {
+        return Ok(favorites_view(file));
+    }
+    if member {
+        file.images[index].lists.push(canonical);
+    } else {
+        file.images[index].lists.retain(|name| *name != canonical);
+    }
+    save_favorites_file(&app, &mut file)?;
+    Ok(favorites_view(file))
+}
+
+#[tauri::command]
+fn create_favorite_list(app: AppHandle, name: String) -> Result<FavoritesView, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Give the list a name".to_string());
+    }
+    if name.chars().count() > FAVORITE_LIST_MAX_CHARS {
+        return Err(format!(
+            "Keep the name under {FAVORITE_LIST_MAX_CHARS} characters"
+        ));
+    }
+    let mut file = load_favorites_file(&app);
+    if file.lists.iter().any(|held| favorite_name_eq(held, &name)) {
+        return Err(format!("There is already a list called {name}"));
+    }
+    if file.lists.len() >= FAVORITE_LISTS_MAX {
+        return Err(format!("That is the {FAVORITE_LISTS_MAX}-list limit"));
+    }
+    file.lists.push(name);
+    save_favorites_file(&app, &mut file)?;
+    Ok(favorites_view(file))
+}
+
+#[tauri::command]
+fn rename_favorite_list(app: AppHandle, from: String, to: String) -> Result<FavoritesView, String> {
+    let to = to.trim().to_string();
+    if to.is_empty() {
+        return Err("Give the list a name".to_string());
+    }
+    if to.chars().count() > FAVORITE_LIST_MAX_CHARS {
+        return Err(format!(
+            "Keep the name under {FAVORITE_LIST_MAX_CHARS} characters"
+        ));
+    }
+    let mut file = load_favorites_file(&app);
+    let Some(index) = file
+        .lists
+        .iter()
+        .position(|name| favorite_name_eq(name, from.trim()))
+    else {
+        return Err(format!("No favorites list named {}", from.trim()));
+    };
+    // A pure case change is a rename of the same list, so only a collision with a DIFFERENT one
+    // is a conflict.
+    if file
+        .lists
+        .iter()
+        .enumerate()
+        .any(|(other, name)| other != index && favorite_name_eq(name, &to))
+    {
+        return Err(format!("There is already a list called {to}"));
+    }
+    let previous = file.lists[index].clone();
+    file.lists[index] = to.clone();
+    for entry in &mut file.images {
+        for name in &mut entry.lists {
+            if *name == previous {
+                *name = to.clone();
+            }
+        }
+    }
+    save_favorites_file(&app, &mut file)?;
+    Ok(favorites_view(file))
+}
+
+/// Retire a list. Its images STAY favorites — the list is a tag over that membership, not the
+/// thing that created it, so deleting one must never quietly un-favorite a pile of images.
+#[tauri::command]
+fn delete_favorite_list(app: AppHandle, name: String) -> Result<FavoritesView, String> {
+    let mut file = load_favorites_file(&app);
+    let Some(index) = file
+        .lists
+        .iter()
+        .position(|held| favorite_name_eq(held, name.trim()))
+    else {
+        return Ok(favorites_view(file));
+    };
+    let removed = file.lists.remove(index);
+    for entry in &mut file.images {
+        entry.lists.retain(|held| *held != removed);
+    }
+    save_favorites_file(&app, &mut file)?;
+    Ok(favorites_view(file))
+}
+
+/// Open one directory to the `asset:` protocol for a single file's sake.
+///
+/// Non-recursive, unlike `grant_asset_access`: a folder the user pointed the app at is a library
+/// and its subtree is fair game, but one favorited wallpaper is not a reason to open every folder
+/// beneath its parent to the webview.
+fn grant_asset_file_dir(app: &AppHandle, dir: &Path) {
+    if let Err(error) = app.asset_protocol_scope().allow_directory(dir, false) {
+        eprintln!("Failed to grant asset access to {}: {error}", dir.display());
+    }
+}
+
+/// The favorites pool: every favorite, or only those in `list`.
+///
+/// A favorite whose file is gone (deleted, or on a drive that is not plugged in) is skipped here
+/// but deliberately NOT pruned from the store — unplugging a drive must not silently empty a
+/// curated list.
+#[tauri::command]
+async fn list_favorite_images(
+    app: AppHandle,
+    list: Option<String>,
+) -> Result<Vec<ImageInfo>, String> {
+    let file = load_favorites_file(&app);
+    let wanted = list
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let paths: Vec<String> = file
+        .images
+        .iter()
+        .filter(|entry| match wanted {
+            None => true,
+            Some(name) => entry.lists.iter().any(|held| favorite_name_eq(held, name)),
+        })
+        .map(|entry| entry.path.clone())
+        .collect();
+
+    // Before the paths reach the frontend, exactly as in the folder and categorized scans:
+    // `assetProtocol.scope` is `[]`, so an ungranted path renders a blank tile with no error.
+    // Favorites are the THIRD way paths reach the grid and they come from anywhere on disk, so
+    // this grants each distinct parent directory once.
+    let mut granted: HashSet<String> = HashSet::new();
+    for path in &paths {
+        let Some(parent) = Path::new(path).parent() else {
+            continue;
+        };
+        if !granted.insert(parent.to_string_lossy().to_lowercase()) {
+            continue;
+        }
+        grant_asset_file_dir(&app, parent);
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut images: Vec<ImageInfo> = paths
+            .into_iter()
+            .filter_map(|path| {
+                let file_path = PathBuf::from(&path);
+                if !file_path.is_file() {
+                    return None;
+                }
+                Some(ImageInfo {
+                    modified: modified_ms(&file_path),
+                    path,
+                })
+            })
+            .collect();
+        images.sort_by(|a, b| b.modified.cmp(&a.modified));
+        images
+    })
+    .await
+    .map_err(|error| format!("Favorites load failed: {error}"))
 }
 
 /// Lists the curated sets stored beside the categorized library, with member hashes resolved to
@@ -1570,7 +1971,7 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.secondary_display_folder_enabled = settings.secondary_display_folder_enabled;
     current.secondary_display_folder = settings.secondary_display_folder;
     current.browse_mode = match settings.browse_mode.as_str() {
-        "multi" | "categorized" | "geo" | "mix" | "alt" => settings.browse_mode,
+        "multi" | "categorized" | "geo" | "mix" | "alt" | "favorites" => settings.browse_mode,
         _ => "multi".to_string(),
     };
     current.multi_folders = settings.multi_folders;
@@ -1584,12 +1985,18 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.categorized_set_country = settings.categorized_set_country;
     // The struct field alone is not enough — `save_settings` copies field by field, so an
     // un-copied one is parsed, dropped, and looks exactly like a stale binary.
+    current.favorites_list = settings
+        .favorites_list
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
     current.mix_geo_ratio = settings.mix_geo_ratio.min(100);
     current.alt_geo_ratio = settings.alt_geo_ratio.min(100);
     current.merge_cells_enabled = settings.merge_cells_enabled;
     current.merge_cells_ratio = settings.merge_cells_ratio.min(100);
     current.startup_browse_mode = match settings.startup_browse_mode.as_str() {
-        "multi" | "categorized" | "geo" | "mix" | "alt" => settings.startup_browse_mode,
+        "multi" | "categorized" | "geo" | "mix" | "alt" | "favorites" => {
+            settings.startup_browse_mode
+        }
         _ => "multi".to_string(),
     };
     current.startup_folder = settings.startup_folder;
@@ -1621,7 +2028,9 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     current.first_auto_open_slideshow = settings.first_auto_open_slideshow;
     current.secondary_auto_open_slideshow = settings.secondary_auto_open_slideshow;
     current.auto_slideshow_source = match settings.auto_slideshow_source.as_str() {
-        "folders" | "categorized" | "geo" | "mix" | "alt" => settings.auto_slideshow_source,
+        "folders" | "categorized" | "geo" | "mix" | "alt" | "favorites" => {
+            settings.auto_slideshow_source
+        }
         _ => "folders".to_string(),
     };
     current.auto_hide_ui_on_startup = settings.auto_hide_ui_on_startup;
@@ -1997,6 +2406,13 @@ pub fn run() {
             get_categorized_sets,
             exclude_from_geo_sets,
             get_geo_excluded_paths,
+            load_favorites,
+            set_favorite,
+            set_favorite_list,
+            create_favorite_list,
+            rename_favorite_list,
+            delete_favorite_list,
+            list_favorite_images,
             set_image_category,
             find_categorizer_root,
             load_settings,

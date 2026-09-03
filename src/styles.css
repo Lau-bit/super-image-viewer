@@ -20,6 +20,7 @@
   --btn-active:  #333;
   --cell-bg:     #0a0a0a;
   --lock-border: #ffb02e;
+  --favorite:    #ffd166;
   --gap:         2px;
 }
 
@@ -238,7 +239,8 @@ body.ui-hidden #startup-loading-overlay {
 #btn-folder.mode-categorized,
 #btn-folder.mode-geo,
 #btn-folder.mode-mix,
-#btn-folder.mode-alt {
+#btn-folder.mode-alt,
+#btn-folder.mode-favorites {
   color: #fff;
   border-color: var(--accent);
 }
@@ -293,7 +295,7 @@ body.ui-hidden #folder-panel {
   padding: 4px 8px;
 }
 
-/* Four tabs share 360px, and "Categorized" is the long one — trim the padding rather than let it
+/* Six tabs share 360px, and "Categorized" is the long one — trim the padding rather than let it
    ellipsize down to "Categori…". */
 #toolbar #folder-mode-tabs button {
   width: auto;
@@ -301,9 +303,10 @@ body.ui-hidden #folder-panel {
   padding: 4px 5px;
 }
 
-/* Grow from the label's own width, never below it: five tabs at an equal `flex: 1` share would
+/* Grow from the label's own width, never below it: six tabs at an equal `flex: 1` share would
    squeeze "Categorized" into "Categori…" long before the row is actually full. `wrap` is the
-   backstop if a future mode does overflow the 360px panel. */
+   backstop if a future mode does overflow the 360px panel — measured 2026-09-03, all six still
+   fit one row at 360px with nothing clipped. */
 .folder-mode-tab {
   flex: 1 1 auto;
   overflow: hidden;
@@ -426,7 +429,8 @@ body.ui-hidden #folder-panel {
 #categories-list,
 #sets-list,
 #blend-categories-list,
-#blend-sets-list {
+#blend-sets-list,
+#favorites-list {
   overflow-y: auto;
   flex: 1 1 auto;
   min-height: 0;
@@ -1021,6 +1025,24 @@ body.zoom-fill-cover .grid-cell img {
   z-index: 3;
 }
 
+/* Favorited cell — a small star in the top-left corner. Deliberately NOT a frame: the amber
+   inset frame is what a LOCKED cell wears, and one image can be both, so the two marks have to be
+   readable at once. ::before is free here — .locked and .empty-slot both take ::after. The text
+   shadow is what keeps it legible over a white image; the overlay never takes pointer events, so
+   panning and clicking are unaffected. */
+.grid-cell.favorited::before {
+  content: '\2605';
+  position: absolute;
+  top: 2px;
+  left: 4px;
+  color: var(--favorite);
+  font-size: 15px;
+  line-height: 1;
+  text-shadow: 0 0 3px rgba(0, 0, 0, 0.95), 0 1px 2px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+  z-index: 4;
+}
+
 /* Ctrl-drag tile reordering — the picked-up tile dims, the drop target gets an
    accent outline (outline, not ::after, so it composes with a locked cell's
    amber frame), and a floating thumbnail follows the cursor. */
@@ -1284,15 +1306,151 @@ body.ui-hidden #settings-panel {
 }
 
 /* ==============================
+   Favorites panel
+   ============================== */
+#favorites-new-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 0 8px 6px;
+}
+
+#favorites-new-name,
+.favorites-rename-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--btn-hover);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 6px;
+  user-select: text;
+}
+
+#favorites-new-name:focus,
+.favorites-rename-input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+#favorites-new-row .folder-panel-btn {
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+/* Overrides .blend-hint's own padding so the hint lines up with the rows below it. */
+#favorites-hint {
+  padding: 0 8px 6px;
+}
+
+#favorites-list {
+  padding: 0 8px 6px;
+}
+
+/* One row = one scope the pool can be narrowed to: "All favorites" first, then each list. The
+   select button takes the width and the two actions stay at their natural size.
+
+   Everything below is scoped under #favorites-list ON PURPOSE. These buttons live inside #toolbar,
+   and `#toolbar button { background: transparent; border: 1px solid var(--border) }` is (1,0,1) —
+   it beats any plain class selector, which is why no toolbar toggle in this app shows an "on"
+   fill. Drop the ID and the selected row loses its highlight while every row grows a stray box. */
+.favorites-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+#favorites-list .favorites-row-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  padding: 5px 6px;
+  cursor: pointer;
+}
+
+#favorites-list .favorites-row-select:hover {
+  background: var(--btn-hover);
+}
+
+#favorites-list .favorites-row.current .favorites-row-select {
+  background: var(--btn-active);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.favorites-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.favorites-row-count {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.favorites-row.current .favorites-row-count {
+  color: #dbe6ff;
+}
+
+#favorites-list .favorites-row-action {
+  flex: 0 0 auto;
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+#favorites-list .favorites-row-action:hover {
+  background: var(--btn-hover);
+  color: var(--text);
+}
+
+/* Armed delete — one click arms, the next confirms. There is no modal anywhere in this app and a
+   list is not worth introducing one, so the button says so itself. */
+#favorites-list .favorites-row-action.armed {
+  background: #52201f;
+  border-color: #8c3a38;
+  color: #ffd9d7;
+}
+
+/* ==============================
    Right-click image context menu
    ============================== */
+/* The menu is meant to be readable in ONE look: a scrollbar hides items behind a gesture and
+   turns "what can I do with this image" into a two-step question. The cap used to be a flat
+   360px — an arbitrary number that the favorites block pushed the category list straight past,
+   in a 924px-tall window with room to spare. The cap is now the WINDOW, and fitGridContextMenu()
+   walks two further stages (tighter rows, then a second column) before anything is allowed to
+   scroll. `overflow` survives only as the backstop for a window too small for even those — it
+   must never clip an item out of reach. */
 .context-menu {
   position: fixed;
   display: none;
   flex-direction: column;
   min-width: 170px;
-  max-height: min(360px, calc(100vh - 16px));
-  overflow-y: auto;
+  max-height: calc(100vh - 8px);
+  max-width: calc(100vw - 8px);
+  overflow: auto;
   background: var(--panel-bg);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -1303,6 +1461,62 @@ body.ui-hidden #settings-panel {
 
 .context-menu.open {
   display: flex;
+}
+
+/* Stage 2 of the fit — tighter rows. It costs nothing horizontally, which is why it comes before
+   columns: it is the stage that still works in the ~460px-wide window where a second column would
+   not fit. Applied by measurement, never by default; a comfortable menu is the normal one. */
+.context-menu.compact button {
+  padding: 3px 10px;
+}
+
+.context-menu.compact .context-menu-title {
+  padding: 3px 10px 2px;
+}
+
+.context-menu.compact .context-menu-file-name {
+  padding: 1px 10px 4px;
+}
+
+.context-menu.compact .context-menu-separator {
+  margin: 2px 6px;
+}
+
+.context-menu.compact .context-menu-empty {
+  padding: 4px 10px;
+}
+
+/* Stage 3 — flow into a second column rather than scroll. `align-content: flex-start` packs the
+   columns to the left so the menu grows sideways from where it was opened, and the position clamp
+   re-measures after this, so it still lands fully on screen. */
+.context-menu.columns {
+  flex-flow: column wrap;
+  align-content: flex-start;
+  gap: 0 4px;
+}
+
+/* A column is only as wide as it needs to be. Without the cap each one takes the max-content
+   width of its longest label (~205px measured) and two columns overflow a 460px window, which
+   trades the vertical scrollbar for a horizontal one — strictly worse in a menu. The one label
+   long enough to be clipped by this is a very long category or list name, and it ellipsizes
+   rather than wrapping so the row heights stay uniform. */
+.context-menu.columns button,
+.context-menu.columns .context-menu-title,
+.context-menu.columns .context-menu-empty,
+.context-menu.columns .context-menu-file-info {
+  max-width: 176px;
+}
+
+.context-menu.columns button > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The lead item. Its star carries the same amber the tile badge does, so "is this favorited"
+   reads the same in the menu as on the grid. */
+.context-menu-favorite.current span:first-child {
+  color: var(--favorite);
 }
 
 .context-menu-title {

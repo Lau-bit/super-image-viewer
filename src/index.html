@@ -42,6 +42,7 @@
           <button type="button" class="folder-mode-tab" data-browse-mode="geo" aria-label="Geo — curated country sets">Geo</button>
           <button type="button" class="folder-mode-tab" data-browse-mode="mix" aria-label="Mix — a country set and the category library on one board, at a ratio you set">Mix</button>
           <button type="button" class="folder-mode-tab" data-browse-mode="alt" aria-label="Alt — whole boards alternating between a country set and the category library">Alt</button>
+          <button type="button" class="folder-mode-tab" data-browse-mode="favorites" aria-label="Favorites — images you starred, from any folder or library">&#9733; Favorites</button>
         </div>
         <!-- Cell merging sits directly under the tabs and OUTSIDE every .folder-section, because it
              is a layer over whichever mode the tabs select rather than one of them — the position
@@ -70,6 +71,7 @@
               <option value="geo">Geo</option>
               <option value="mix">Mix</option>
               <option value="alt">Alt</option>
+              <option value="favorites">Favorites</option>
             </select>
           </label>
           <button type="button" class="folder-panel-btn" id="setting-use-current-source">Use current source at startup</button>
@@ -85,6 +87,7 @@
               <option value="geo">Geo</option>
               <option value="mix">Mix</option>
               <option value="alt">Alt</option>
+              <option value="favorites">Favorites</option>
             </select>
           </label>
           <button type="button" class="folder-panel-btn" id="setting-auto-slideshow-folder-needed" hidden>Set slideshow startup folder</button>
@@ -144,6 +147,19 @@
           <div id="blend-categories-list"></div>
           <div class="blend-subhead">Geo share — country</div>
           <div id="blend-sets-list"></div>
+        </div>
+        <!-- Favorites is the one mode whose pool is not a folder or a library: it is whatever has
+             been starred, from anywhere on disk. Lists are the optional second axis — the list
+             below always leads with "All favorites", so someone who never makes a list still has a
+             complete mode. -->
+        <div id="folder-section-favorites" class="folder-section">
+          <div id="favorites-new-row">
+            <input type="text" id="favorites-new-name" maxlength="48" placeholder="New list name"
+                   aria-label="Name for a new favorites list" autocomplete="off" spellcheck="false">
+            <button type="button" class="folder-panel-btn" id="favorites-new-add">Add list</button>
+          </div>
+          <div id="favorites-hint" class="blend-hint"></div>
+          <div id="favorites-list"></div>
         </div>
       </div>
     </div>
@@ -328,6 +344,7 @@
           <div class="shortcut-row"><kbd>G</kbd><span>Geo &#8596; Categorized</span></div>
           <div class="shortcut-row"><kbd>M</kbd><span>Mix &#8596; Categorized</span></div>
           <div class="shortcut-row"><kbd>A</kbd><span>Alt &#8596; Categorized</span></div>
+          <div class="shortcut-row"><kbd>Shift</kbd><kbd>F</kbd><span>Favorites &#8596; last mode</span></div>
           <div class="shortcut-row"><kbd>Shift</kbd><kbd>M</kbd><span>Merged cells on / off</span></div>
           <div class="shortcut-row"><kbd>Shift</kbd><kbd>Q</kbd><span>Show / hide the UI</span></div>
           <div class="shortcut-row"><kbd>?</kbd><span>This list</span></div>
@@ -342,7 +359,8 @@
           <div class="shortcut-row"><kbd>Wheel</kbd><span>Zoom the cell</span></div>
           <div class="shortcut-row"><kbd>C</kbd><span>Recenter hovered image</span></div>
           <div class="shortcut-row"><kbd>H</kbd><span>Recenter every image</span></div>
-          <div class="shortcut-row"><kbd>Right-click</kbd><kbd>Shift</kbd><kbd>F10</kbd><span>Copy / lock / hide / categorize</span></div>
+          <div class="shortcut-row"><kbd>F</kbd><span>Favorite / unfavorite hovered image</span></div>
+          <div class="shortcut-row"><kbd>Right-click</kbd><kbd>Shift</kbd><kbd>F10</kbd><span>Favorite / copy / lock / hide / categorize</span></div>
 
           <div class="shortcuts-group-title">Floating viewer</div>
           <div class="shortcut-row"><kbd>Wheel</kbd><span>Zoom at cursor</span></div>

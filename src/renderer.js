@@ -113,6 +113,20 @@ const state = {
   // context menu can show the action as already done without re-reading it per right-click.
   geoExcludedPaths: new Set(),
 
+  // Favorites — the one collection here that belongs to NO root. A category, a geo veto and the
+  // hash cache all live in one scanned library; a favorite is starred off whatever board is up,
+  // and multi-folder mode has no root to write a sidecar into. So the store is global (app data
+  // dir, see the Rust side) and these mirror it.
+  //   favorites     — key(path) -> { path, addedAt, lists:Set }. Membership in `lists` is the
+  //                   OPTIONAL half: an empty set is a plain favorite, which is the whole feature
+  //                   for anyone who never defines a list.
+  //   favoriteLists — declared list names, in creation order. Rust is the authority; nothing may
+  //                   be filed under a name that is not here.
+  //   favoritesList — which list the Favorites POOL is narrowed to. null = every favorite.
+  favorites: new Map(),
+  favoriteLists: [],
+  favoritesList: null,
+
   imageCount: 9,
   emptyCount: 0,
   displayMode: 'random',  // 'random' | 'chrono'
@@ -276,6 +290,11 @@ const folderSectionMulti = document.getElementById('folder-section-multi');
 const folderSectionCategorized = document.getElementById('folder-section-categorized');
 const folderSectionGeo   = document.getElementById('folder-section-geo');
 const folderSectionBlend = document.getElementById('folder-section-blend');
+const folderSectionFavorites = document.getElementById('folder-section-favorites');
+const favoritesListEl    = document.getElementById('favorites-list');
+const favoritesHintEl    = document.getElementById('favorites-hint');
+const favoritesNewName   = document.getElementById('favorites-new-name');
+const favoritesNewAdd    = document.getElementById('favorites-new-add');
 const folderMultiAdd     = document.getElementById('folder-multi-add');
 const multiFolderListEl  = document.getElementById('multi-folder-list');
 const categorizedRootNameEl = document.getElementById('categorized-root-name');
@@ -783,6 +802,9 @@ function syncNavButtons() {
 }
 
 function startupSourceLabel() {
+  if (appSettings.startupBrowseMode === 'favorites') {
+    return state.favoritesList ? `Favorites · ${state.favoritesList}` : 'All favorites';
+  }
   if (appSettings.startupBrowseMode === 'multi') {
     const folders = appSettings.startupMultiFolders || [];
     const enabled = new Set(appSettings.startupMultiFolderFilter || []);
@@ -847,10 +869,19 @@ async function loadAutoSlideshowCategorizedSource(mode) {
 
 function hasConfiguredStartupSource() {
   if (appSettings.startupBrowseMode === 'multi') return !!appSettings.startupMultiFolders.length;
+  // Favorites needs nothing configured — the collection IS the source, and an empty one is a
+  // legitimate (if bare) startup state rather than a missing setting.
+  if (appSettings.startupBrowseMode === 'favorites') return true;
   return !!appSettings.startupCategorizedRoot;
 }
 
 async function loadConfiguredStartupSource() {
+  if (appSettings.startupBrowseMode === 'favorites') {
+    state.viewedBrowseMode = 'favorites';
+    renderFolderPanelSections();
+    await enterFavoritesMode();
+    return;
+  }
   if (appSettings.startupBrowseMode === 'multi') {
     state.multiFolders = [...appSettings.startupMultiFolders];
     state.multiFolderFilter = new Set(appSettings.startupMultiFolderFilter);
@@ -872,6 +903,12 @@ async function loadConfiguredStartupSource() {
 }
 
 async function loadAutoSlideshowSource() {
+  if (appSettings.autoSlideshowSource === 'favorites') {
+    state.viewedBrowseMode = 'favorites';
+    renderFolderPanelSections();
+    await enterFavoritesMode();
+    return;
+  }
   if (['categorized', 'geo', 'mix', 'alt'].includes(appSettings.autoSlideshowSource)) {
     await loadAutoSlideshowCategorizedSource(appSettings.autoSlideshowSource);
     return;
@@ -1190,6 +1227,7 @@ function renderGrid(slots, options = {}) {
     if (slot === null) {
       cell.classList.add('empty-slot');
       cell.classList.remove('locked');
+      cell.classList.remove('favorited');
       setCellAccessibility(cell, null, position);
       const img = cell.querySelector('img');
       if (img) {
@@ -1199,6 +1237,7 @@ function renderGrid(slots, options = {}) {
     } else {
       cell.classList.remove('empty-slot');
       cell.classList.toggle('locked', isLocked(slot));
+      cell.classList.toggle('favorited', isFavorite(slot));
       let img = cell.querySelector('img');
       if (!img) {
         img = document.createElement('img');
@@ -1287,6 +1326,12 @@ function accessibleImageName(cell, path, position = null) {
   const parts = [];
   if (index >= 0 && total) parts.push(`Image ${index + 1} of ${total}`);
   if (span > 1) parts.push('large');
+  // Favoriting is a visible fact about the tile (the star badge), so it belongs in the name a
+  // screen reader — or an agent reading the same string — gets.
+  if (isFavorite(path)) {
+    const listed = [...favoriteListsFor(path)];
+    parts.push(listed.length ? `favorite: ${listed.join(', ')}` : 'favorite');
+  }
   const category = usesCategorizedRoot() ? categoryForPath(path) : null;
   if (category) parts.push(category);
   const ocr = ocrTextCache.get(path);
@@ -2088,7 +2133,7 @@ function fileKey(path) {
   return String(path || '').toLocaleLowerCase();
 }
 
-const BROWSE_MODES = ['multi', 'categorized', 'geo', 'mix', 'alt'];
+const BROWSE_MODES = ['multi', 'categorized', 'geo', 'mix', 'alt', 'favorites'];
 
 function normalizeBrowseMode(mode) {
   return BROWSE_MODES.includes(mode) ? mode : 'multi';
@@ -2098,7 +2143,7 @@ function normalizeBrowseMode(mode) {
 // categorize/exclude actions and the hash cache are all equally available in all of them. Anything
 // that only needs "am I browsing a categorizer library" must ask this, not `=== 'categorized'`.
 function usesCategorizedRoot(mode = state.browseMode) {
-  return mode !== 'multi';
+  return mode !== 'multi' && mode !== 'favorites';
 }
 
 // A country set reaches the grid in these modes and nowhere else, so they are the ones that rotate
@@ -2115,6 +2160,7 @@ function usesBlendPool(mode = state.browseMode) {
 
 function browseModeLabel(mode) {
   if (mode === 'multi') return 'Folders';
+  if (mode === 'favorites') return 'Favorites';
   if (mode === 'geo') return 'Geo';
   if (mode === 'mix') return 'Mix';
   if (mode === 'alt') return 'Alt';
@@ -2223,6 +2269,10 @@ function renderFolderButton() {
       : enabled.length === 1
         ? baseName(enabled[0])
         : `${enabled.length}/${state.multiFolders.length} folders`;
+  } else if (state.browseMode === 'favorites') {
+    // The list beats the word "Favorites" for the same reason the country beats the root name in
+    // geo: the mode never changes but which slice of it is on the grid does.
+    label = state.favoritesList ? `Favorites: ${state.favoritesList}` : 'Favorites';
   } else if (usesGeoSets()) {
     // The country beats the root name here: in these modes the root never changes but the country
     // does, every board, and that is the thing worth reading off the toolbar. It names what is on
@@ -2247,6 +2297,7 @@ function renderFolderButton() {
   btnFolder.classList.toggle('mode-geo', state.browseMode === 'geo');
   btnFolder.classList.toggle('mode-mix', state.browseMode === 'mix');
   btnFolder.classList.toggle('mode-alt', state.browseMode === 'alt');
+  btnFolder.classList.toggle('mode-favorites', state.browseMode === 'favorites');
   const ratio = usesBlendPool() ? ` — ${blendRatio()}% geo` : '';
   btnFolder.setAttribute(
     'aria-label',
@@ -2264,11 +2315,13 @@ function renderFolderPanelSections() {
   folderSectionCategorized.classList.toggle('visible', state.viewedBrowseMode === 'categorized');
   folderSectionGeo.classList.toggle('visible', state.viewedBrowseMode === 'geo');
   folderSectionBlend.classList.toggle('visible', usesBlendPool(state.viewedBrowseMode));
+  folderSectionFavorites.classList.toggle('visible', state.viewedBrowseMode === 'favorites');
   // Categorized and Geo each own a list that Mix/Alt also show. Both render into the tab being
   // VIEWED and only that one, so switching tabs repopulates rather than paying for two copies of
   // a 53-row country list on every board.
   renderCategoriesPanel();
   renderSetsPanel();
+  renderFavoritesPanel();
   syncBlendControls();
 }
 
@@ -2284,6 +2337,10 @@ async function switchBrowseMode(mode) {
   }
   if (mode === 'geo') {
     await enterGeoMode();
+    return;
+  }
+  if (mode === 'favorites') {
+    await enterFavoritesMode();
     return;
   }
   if (usesBlendPool(mode)) {
@@ -2448,6 +2505,444 @@ async function toggleMultiFolder(folder) {
   persistMultiFolderFilter();
   renderMultiFolderList();
   await enterMultiMode();
+}
+
+
+// ==============================
+// Favorites
+// ==============================
+// A GLOBAL, path-keyed collection: whatever has been starred, from any folder or library, visible
+// and editable from every browse mode. That is deliberately unlike every other marking in this
+// app — a category, a geo-set veto and the hash cache all belong to ONE scanned root, and
+// multi-folder mode has no root at all, so a favorite could not live in a sidecar and still be
+// reachable from every board. The store is `favorites.json` in the app data dir (Rust side).
+//
+// Lists are the OPTIONAL second axis, never buckets: filing into one also favorites the image,
+// clearing every list does not un-favorite it, and with no lists defined the context menu shows
+// exactly one item. That is the feature for anyone who never defines a list.
+
+// The image queued by "New list from this image…" — the list is named in the panel (a text field
+// inside a role=menu is a keyboard trap), and this is what gets filed into it once it exists.
+let favoritesPendingImage = null;
+// Inline editing state for the panel rows. Both are view-only; nothing persists until commit.
+let favoritesRenaming = null;
+let favoritesDeleteArmed = null;
+let favoritesDeleteTimer = null;
+// Where Shift+F comes back to. Captured on the way in, so it is always a mode that just worked.
+let lastNonFavoritesMode = 'multi';
+
+function isFavorite(path) {
+  return !!path && state.favorites.has(fileKey(path));
+}
+
+function favoriteEntry(path) {
+  return path ? state.favorites.get(fileKey(path)) || null : null;
+}
+
+function favoriteListsFor(path) {
+  const entry = favoriteEntry(path);
+  return entry ? entry.lists : new Set();
+}
+
+function inFavoriteList(path, list) {
+  return favoriteListsFor(path).has(list);
+}
+
+function favoriteListCount(list) {
+  let count = 0;
+  for (const entry of state.favorites.values()) {
+    if (entry.lists.has(list)) count += 1;
+  }
+  return count;
+}
+
+// Would the CURRENT favorites pool hold this image? Everything that has to drop a tile after a
+// favorites edit asks this, so "unfavorited while browsing favorites" and "removed from the list
+// I am filtered to" behave identically instead of drifting apart.
+function favoritePoolIncludes(path) {
+  if (!isFavorite(path)) return false;
+  return !state.favoritesList || inFavoriteList(path, state.favoritesList);
+}
+
+// Install a snapshot returned by any of the Rust commands. They all return the whole store, so
+// this is the ONLY place that writes `state.favorites` — a local edit that disagreed with the file
+// would show a star the next launch does not.
+function installFavorites(view) {
+  const lists = Array.isArray(view && view.lists) ? view.lists.filter(Boolean) : [];
+  const images = Array.isArray(view && view.images) ? view.images : [];
+  state.favoriteLists = lists;
+  state.favorites = new Map();
+  for (const entry of images) {
+    if (!entry || !entry.path) continue;
+    state.favorites.set(fileKey(entry.path), {
+      path: entry.path,
+      addedAt: entry.addedAt || '',
+      lists: new Set(Array.isArray(entry.lists) ? entry.lists : []),
+    });
+  }
+  // A list can be renamed or deleted out from under the filter; falling back to "all favorites"
+  // beats an empty pool with nothing on screen to explain it.
+  if (state.favoritesList && !lists.includes(state.favoritesList)) state.favoritesList = null;
+  if (favoritesRenaming && !lists.includes(favoritesRenaming)) favoritesRenaming = null;
+  refreshFavoriteCellDecorations();
+  renderFavoritesPanel();
+  renderFolderButton();
+}
+
+async function loadFavorites() {
+  try {
+    installFavorites(await window.viewerAPI.loadFavorites());
+  } catch (error) {
+    console.error('Failed to load favorites:', error);
+    installFavorites(null);
+  }
+}
+
+// Every favorites write goes through here: run the command, install what it returns, and drop the
+// image off the board if the favorites pool no longer holds it. `path` is null for list-only edits
+// (create / rename / delete), which change no image's membership.
+async function applyFavoriteChange(run, { path = null, failure = 'Could not save favorites' } = {}) {
+  try {
+    installFavorites(await run());
+  } catch (error) {
+    console.error('Favorites write failed:', error);
+    // A Tauri command rejects with a PLAIN STRING — there is no `.message` to read, and rendering
+    // one shows nothing while the real reason sits right there.
+    showToast(typeof error === 'string' && error ? error : failure);
+    await loadFavorites();
+    return false;
+  }
+  // Only while the favorites pool IS the board. Everywhere else a star is decoration on a tile
+  // that belongs to some other pool, and pulling it would be a hide the user never asked for.
+  if (path && state.browseMode === 'favorites' && !favoritePoolIncludes(path)) {
+    if (state.displayedSlots.includes(path)) removeDisplayedImage(path);
+    else state.allImages = state.allImages.filter(image => image.path !== path);
+  }
+  return true;
+}
+
+// THE one-click action. A toggle, so a mis-aimed click is undone by the same click — which is why
+// it can sit first in the context menu without breaking the "harmless item leads" rule there.
+async function toggleFavorite(path) {
+  if (!path) return;
+  const nowFavorite = !isFavorite(path);
+  const listed = [...favoriteListsFor(path)];
+  if (!await applyFavoriteChange(() => window.viewerAPI.setFavorite(path, nowFavorite), { path })) {
+    return;
+  }
+  showToast(nowFavorite
+    ? 'Favorited'
+    : (listed.length ? `Removed from favorites (was in ${listed.join(', ')})` : 'Removed from favorites'));
+  announce(`${baseName(path)} ${nowFavorite ? 'favorited' : 'removed from favorites'}`);
+}
+
+async function setFavoriteListMembership(path, list, member) {
+  if (!path || !list) return;
+  if (!await applyFavoriteChange(
+    () => window.viewerAPI.setFavoriteList(path, list, member),
+    { path },
+  )) return;
+  showToast(member ? `Added to ${list}` : `Removed from ${list}`);
+  announce(`${baseName(path)} ${member ? 'added to' : 'removed from'} ${list}`);
+}
+
+// `addPath` files that image into the list as it is created — the moment you want a new list is
+// the moment you are looking at the image that needs one.
+async function createFavoriteList(name, { addPath = null } = {}) {
+  const wanted = String(name || '').trim();
+  if (!wanted) {
+    showToast('Give the list a name');
+    return false;
+  }
+  if (!await applyFavoriteChange(
+    () => window.viewerAPI.createFavoriteList(wanted),
+    { failure: 'Could not create the list' },
+  )) return false;
+  if (addPath) {
+    await applyFavoriteChange(
+      () => window.viewerAPI.setFavoriteList(addPath, wanted, true),
+      { path: addPath },
+    );
+  }
+  showToast(addPath ? `Added to ${wanted}` : `Created ${wanted}`);
+  announce(`Favorites list ${wanted} created`);
+  return true;
+}
+
+async function renameFavoriteList(from, to) {
+  const wanted = String(to || '').trim();
+  // Cleared SYNCHRONOUSLY, before any await: Enter commits and then repaints the panel, which
+  // detaches the input and can fire its blur — and the blur handler commits too. Dropping the
+  // marker first makes the second call a no-op instead of a rename of the already-renamed list.
+  favoritesRenaming = null;
+  if (!wanted || wanted === from) {
+    renderFavoritesPanel();
+    return;
+  }
+  const filtered = state.favoritesList === from;
+  if (!await applyFavoriteChange(
+    () => window.viewerAPI.renameFavoriteList(from, wanted),
+    { failure: 'Could not rename the list' },
+  )) return;
+  // installFavorites drops a filter naming a list that no longer exists; a rename is the one case
+  // where the slice on screen did not actually change, so carry the selection across.
+  if (filtered) {
+    state.favoritesList = wanted;
+    // The pool did not change, only its name — so relabel in place rather than reloading it.
+    if (state.browseMode === 'favorites') {
+      folderNameEl.textContent = favoritesPoolLabel(state.allImages.length);
+    }
+  }
+  renderFavoritesPanel();
+  renderFolderButton();
+  showToast(`Renamed to ${wanted}`);
+}
+
+// Deleting a list KEEPS its images favorited — the list is a tag over that membership, not what
+// created it. Armed by a first click and confirmed by a second, so a mis-aimed click costs
+// nothing; there is no modal anywhere else in this app and one list is not worth the first.
+async function deleteFavoriteList(name) {
+  if (favoritesDeleteArmed !== name) {
+    armFavoriteListDelete(name);
+    return;
+  }
+  armFavoriteListDelete(null);
+  const count = favoriteListCount(name);
+  if (!await applyFavoriteChange(
+    () => window.viewerAPI.deleteFavoriteList(name),
+    { failure: 'Could not delete the list' },
+  )) return;
+  showToast(count ? `Deleted ${name} — ${count} still favorited` : `Deleted ${name}`);
+  announce(`Favorites list ${name} deleted`);
+  if (state.browseMode === 'favorites') await enterFavoritesMode();
+}
+
+function armFavoriteListDelete(name) {
+  clearTimeout(favoritesDeleteTimer);
+  // Arming supersedes an edit in progress, so the panel is free to repaint (renderFavoritesPanel
+  // refuses to while a rename field is focused).
+  favoritesRenaming = null;
+  favoritesDeleteArmed = name;
+  if (name) {
+    favoritesDeleteTimer = setTimeout(() => {
+      if (favoritesDeleteArmed !== name) return;
+      favoritesDeleteArmed = null;
+      renderFavoritesPanel();
+    }, 4000);
+  }
+  renderFavoritesPanel();
+}
+
+// The star badge on each occupied tile, re-applied without rebuilding the grid. Accessible names
+// carry the same fact, so they are refreshed with it — one edit, both channels.
+function refreshFavoriteCellDecorations() {
+  imageGrid.querySelectorAll('.grid-cell').forEach(cell => {
+    if (cell.classList.contains('empty-slot')) {
+      cell.classList.remove('favorited');
+      return;
+    }
+    const img = cell.querySelector('img');
+    const path = img && img.getAttribute('data-src');
+    cell.classList.toggle('favorited', isFavorite(path));
+  });
+  refreshAccessibleNames();
+}
+
+function favoritesPoolLabel(count, missing = 0) {
+  const scope = state.favoritesList ? `Favorites: ${state.favoritesList}` : 'Favorites';
+  const tail = missing ? ` · ${missing} unavailable` : '';
+  return `${scope} — ${count} image${count === 1 ? '' : 's'}${tail}`;
+}
+
+// The store is re-read from disk on every entry rather than trusted from memory: favorites.json is
+// hand-editable and shared by every window of this app, so the pool has to come from the file.
+async function enterFavoritesMode() {
+  const current = claimPoolLoad();
+  setFolderLoading(true, 'Loading favorites...', 'favorites');
+  try {
+    installFavorites(await window.viewerAPI.loadFavorites());
+    if (!current()) return;
+    const images = await window.viewerAPI.listFavoriteImages(state.favoritesList);
+    if (!current()) return;
+    // A favorite whose file is gone (deleted, or on a drive that is not plugged in) is skipped by
+    // the loader but kept in the store — so say how many, rather than silently showing fewer.
+    const expected = state.favoritesList
+      ? favoriteListCount(state.favoritesList)
+      : state.favorites.size;
+    const missing = Math.max(0, expected - images.length);
+    loadImagePool(images, favoritesPoolLabel(images.length, missing), 'favorites');
+    announce(images.length
+      ? `Showing ${favoritesPoolLabel(images.length, missing)}`
+      : 'No favorites yet — right-click an image and choose Favorite');
+  } catch (error) {
+    if (!current()) return;
+    console.error('Failed to load favorites:', error);
+    showToast('Failed to load favorites');
+  } finally {
+    if (current()) setFolderLoading(false);
+  }
+}
+
+// Picking a list is an unambiguous "show me this", exactly like ticking a category — so it enters
+// the mode rather than quietly changing a filter that is driving nothing.
+function selectFavoritesList(name) {
+  favoritesRenaming = null;
+  const next = name || null;
+  if (state.favoritesList !== next) {
+    state.favoritesList = next;
+    renderFavoritesPanel();
+    renderFolderButton();
+  }
+  if (state.browseMode === 'favorites') enterFavoritesMode();
+  else switchBrowseMode('favorites');
+  persistSettings();
+}
+
+function toggleFavoritesMode() {
+  if (state.browseMode === 'favorites') {
+    switchBrowseMode(lastNonFavoritesMode);
+    return;
+  }
+  lastNonFavoritesMode = state.browseMode;
+  switchBrowseMode('favorites');
+}
+
+// Open the panel on the Favorites tab with the name field focused, holding `path` so the list is
+// populated the instant it exists.
+function beginFavoriteListFromImage(path) {
+  favoritesPendingImage = path;
+  if (state.uiHidden) setUiHidden(false);
+  state.viewedBrowseMode = 'favorites';
+  renderFolderPanelSections();
+  // Deferred a frame ON PURPOSE. The click that got here is still bubbling, and the context menu —
+  // unlike the folder panel — does not stop its own clicks, so the document-level handler that
+  // dismisses every popover would close this panel the instant it opened.
+  requestAnimationFrame(() => {
+    setFolderPanelOpen(true);
+    favoritesNewName.value = '';
+    favoritesNewName.focus();
+  });
+  showToast('Name the list, then press Enter');
+}
+
+async function submitNewFavoriteList() {
+  const pending = favoritesPendingImage;
+  if (!await createFavoriteList(favoritesNewName.value, { addPath: pending })) return;
+  favoritesPendingImage = null;
+  favoritesNewName.value = '';
+}
+
+// One row per list plus the "All favorites" row that is always first — the whole collection is a
+// real selection, not a fallback, because lists are optional.
+function renderFavoritesPanel() {
+  // Only the tab being VIEWED is built. renderFolderPanelSections runs on every board, and a
+  // hidden section costs nothing to leave stale.
+  if (state.viewedBrowseMode !== 'favorites') return;
+  // A rename being typed OWNS the panel. renderFolderPanelSections fires on every board — during a
+  // slideshow that is every few seconds — and rebuilding the row would take the field, and the
+  // half-typed name in it, away mid-edit. Every action that legitimately supersedes the edit ends
+  // it first (see armFavoriteListDelete / selectFavoritesList).
+  if (favoritesRenaming
+      && document.activeElement
+      && document.activeElement.classList.contains('favorites-rename-input')) {
+    return;
+  }
+
+  favoritesHintEl.textContent = state.favorites.size
+    ? 'Right-click any image to star it. Lists are optional — an image can be a plain favorite.'
+    : 'No favorites yet. Right-click an image and choose ★ Favorite.';
+
+  favoritesListEl.textContent = '';
+  favoritesListEl.append(favoritesScopeRow(null, 'All favorites', state.favorites.size));
+  for (const list of state.favoriteLists) {
+    favoritesListEl.append(favoritesScopeRow(list, list, favoriteListCount(list)));
+  }
+  if (!state.favoriteLists.length) {
+    const empty = document.createElement('div');
+    empty.className = 'categories-empty';
+    empty.textContent = 'No lists — add one above to sort favorites into groups.';
+    favoritesListEl.append(empty);
+  }
+}
+
+function favoritesScopeRow(list, label, count) {
+  const row = document.createElement('div');
+  row.className = 'favorites-row';
+  const current = (state.favoritesList || null) === list;
+  row.classList.toggle('current', current);
+
+  if (list && favoritesRenaming === list) {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'favorites-rename-input';
+    input.maxLength = 48;
+    input.value = list;
+    input.setAttribute('aria-label', `Rename the ${list} favorites list`);
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        renameFavoriteList(list, input.value);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        favoritesRenaming = null;
+        renderFavoritesPanel();
+      }
+    });
+    // Blur commits rather than discards: clicking away from a field you just typed into and
+    // losing the text is the more surprising of the two.
+    input.addEventListener('blur', () => {
+      if (favoritesRenaming === list) renameFavoriteList(list, input.value);
+    });
+    row.append(input);
+    // Focus after the row is in the DOM, on the next frame — an element not yet attached cannot
+    // take focus.
+    requestAnimationFrame(() => { input.focus(); input.select(); });
+    return row;
+  }
+
+  const select = document.createElement('button');
+  select.type = 'button';
+  select.className = 'favorites-row-select';
+  select.setAttribute('aria-pressed', String(current));
+  select.setAttribute('aria-label', list
+    ? `Show the ${list} favorites list — ${count} image${count === 1 ? '' : 's'}`
+    : `Show every favorite — ${count} image${count === 1 ? '' : 's'}`);
+  const name = document.createElement('span');
+  name.className = 'favorites-row-name';
+  name.textContent = label;
+  const countEl = document.createElement('span');
+  countEl.className = 'favorites-row-count';
+  countEl.textContent = formatCount(count);
+  select.append(name, countEl);
+  select.addEventListener('click', () => selectFavoritesList(list));
+  row.append(select);
+
+  if (!list) return row;
+
+  const rename = document.createElement('button');
+  rename.type = 'button';
+  rename.className = 'favorites-row-action';
+  rename.textContent = '\u270E';
+  rename.setAttribute('aria-label', `Rename ${list}`);
+  rename.addEventListener('click', () => {
+    armFavoriteListDelete(null);
+    favoritesRenaming = list;
+    renderFavoritesPanel();
+  });
+
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'favorites-row-action';
+  const armed = favoritesDeleteArmed === list;
+  remove.classList.toggle('armed', armed);
+  remove.textContent = armed ? 'Sure?' : '\u2715';
+  remove.setAttribute('aria-label', armed
+    ? `Confirm deleting the ${list} list — its ${count} image${count === 1 ? '' : 's'} stay favorited`
+    : `Delete the ${list} list — its images stay favorited`);
+  remove.addEventListener('click', () => deleteFavoriteList(list));
+
+  row.append(rename, remove);
+  return row;
 }
 
 function renderCategorizedRootRow() {
@@ -3387,11 +3882,53 @@ function closeGridContextMenu({ restoreFocus = false } = {}) {
 }
 
 function openGridContextMenu(x, y) {
+  // Park at the top-left BEFORE measuring, and only then place it. The menu is `position: fixed`
+  // and shrink-to-fit, so its available width is the viewport minus its own `left` — measuring it
+  // where the PREVIOUS menu was left standing makes one opened after a right-edge click believe
+  // it has 30px to work with, and the fit below then rejects a second column that would have sat
+  // there comfortably. Cost one line, produced a menu that scrolled or not depending on where the
+  // last one happened to open.
+  gridContextMenu.style.left = '4px';
+  gridContextMenu.style.top = '4px';
   gridContextMenu.classList.add('open');
+  // Size before position, always: every stage of the fit moves BOTH dimensions, and clamping to
+  // a box that is about to change puts the menu half off screen.
+  fitGridContextMenu();
   const maxX = window.innerWidth - gridContextMenu.offsetWidth - 4;
   const maxY = window.innerHeight - gridContextMenu.offsetHeight - 4;
   gridContextMenu.style.left = `${Math.max(4, Math.min(x, maxX))}px`;
   gridContextMenu.style.top = `${Math.max(4, Math.min(y, maxY))}px`;
+}
+
+// Show the whole menu without a scrollbar, in the least invasive way that works. The stages are
+// MEASURED, not guessed — `scrollHeight > clientHeight` is the only honest test of "this would
+// scroll", and it has to be re-read after each change because each one moves the box.
+//
+// Stage order is deliberate: tighter rows first (they cost no width, so they work in a narrow
+// window), a second column only when height alone cannot be found. Both classes are cleared on
+// every open, so a menu that fits is never quietly compacted from a previous one that did not.
+function fitGridContextMenu() {
+  gridContextMenu.classList.remove('compact', 'columns');
+  if (!gridContextMenuOverflows()) return;
+  gridContextMenu.classList.add('compact');
+  if (!gridContextMenuOverflows()) return;
+  gridContextMenu.classList.add('columns');
+  // Columns buy height with width. In a window too small to pay — a short AND narrow one, with
+  // more list rows than either dimension can hold — they produce a HORIZONTAL scrollbar in a
+  // menu, which is strictly worse than the vertical one they replaced. So hand the width back
+  // and let the compact single column scroll: that corner exists, and it should degrade to the
+  // predictable failure rather than the surprising one.
+  if (gridContextMenuOverflowsX()) gridContextMenu.classList.remove('columns');
+}
+
+// The +1 on both absorbs sub-pixel rounding at fractional DPI scaling, where a menu that fits
+// exactly still reports a scroll size a fraction over its client size.
+function gridContextMenuOverflows() {
+  return gridContextMenu.scrollHeight > gridContextMenu.clientHeight + 1;
+}
+
+function gridContextMenuOverflowsX() {
+  return gridContextMenu.scrollWidth > gridContextMenu.clientWidth + 1;
 }
 
 function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = null } = {}) {
@@ -3416,9 +3953,83 @@ function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = nul
   actionSeparator.setAttribute('role', 'separator');
   gridContextMenu.append(actionSeparator);
 
-  // Copy — puts the image's pixels on the clipboard. First because it is the
-  // only item here that changes nothing: everything below alters what the board
-  // or the library holds, so the harmless one is what a mis-aimed click lands on.
+  // Favorite — the one-click action this menu exists for, and first because it is what the menu
+  // is most often opened to do. It keeps the "a mis-aimed click lands on something harmless" rule
+  // that used to put Copy here: it is a TOGGLE, so the same click undoes it, and both the star
+  // badge on the tile and the toast say which way it went.
+  const favorited = isFavorite(path);
+  const favoriteBtn = document.createElement('button');
+  favoriteBtn.type = 'button';
+  favoriteBtn.setAttribute('role', 'menuitem');
+  favoriteBtn.className = 'context-menu-favorite';
+  favoriteBtn.classList.toggle('current', favorited);
+  favoriteBtn.setAttribute('aria-label', favorited
+    ? `Remove ${baseName(path)} from favorites`
+    : `Favorite ${baseName(path)}`);
+  const favoriteLabel = document.createElement('span');
+  favoriteLabel.textContent = favorited ? '\u2605 Favorited' : '\u2606 Favorite';
+  favoriteBtn.append(favoriteLabel);
+  favoriteBtn.addEventListener('click', () => {
+    closeGridContextMenu({ restoreFocus: true });
+    toggleFavorite(path);
+  });
+  gridContextMenu.append(favoriteBtn);
+
+  // The user-defined lists, and ONLY when some exist. Optional by design: with none defined the
+  // menu carries exactly the one item above, which is the whole feature for most use.
+  if (state.favoriteLists.length) {
+    const listTitle = document.createElement('div');
+    listTitle.className = 'context-menu-title';
+    listTitle.textContent = 'Favorite lists';
+    gridContextMenu.append(listTitle);
+    for (const list of state.favoriteLists) {
+      const inList = inFavoriteList(path, list);
+      const listBtn = document.createElement('button');
+      listBtn.type = 'button';
+      // menuitemcheckbox, not menuitem: these are independent memberships, not one choice out of
+      // the group the way "Move to category" below is.
+      listBtn.setAttribute('role', 'menuitemcheckbox');
+      listBtn.setAttribute('aria-checked', String(inList));
+      listBtn.classList.toggle('current', inList);
+      listBtn.setAttribute('aria-label', inList
+        ? `Remove ${baseName(path)} from ${list}`
+        : `Add ${baseName(path)} to ${list}`);
+      const listName = document.createElement('span');
+      listName.textContent = list;
+      const listMark = document.createElement('span');
+      listMark.textContent = inList ? '\u2713' : '';
+      listBtn.append(listName, listMark);
+      listBtn.addEventListener('click', () => {
+        closeGridContextMenu({ restoreFocus: true });
+        setFavoriteListMembership(path, list, !inList);
+      });
+      gridContextMenu.append(listBtn);
+    }
+  }
+
+  // Wanting a new list happens while looking at the image that needs one, so the menu offers it
+  // instead of sending you to the panel to come back later. The NAME is typed in the panel — a
+  // text field inside a role=menu is a keyboard trap — and this image is filed in on creation.
+  const newListBtn = document.createElement('button');
+  newListBtn.type = 'button';
+  newListBtn.setAttribute('role', 'menuitem');
+  newListBtn.setAttribute('aria-label', `Create a favorites list and add ${baseName(path)} to it`);
+  const newListLabel = document.createElement('span');
+  newListLabel.textContent = 'New list from this image\u2026';
+  newListBtn.append(newListLabel);
+  newListBtn.addEventListener('click', () => {
+    closeGridContextMenu();
+    beginFavoriteListFromImage(path);
+  });
+  gridContextMenu.append(newListBtn);
+
+  const favoriteSeparator = document.createElement('div');
+  favoriteSeparator.className = 'context-menu-separator';
+  favoriteSeparator.setAttribute('role', 'separator');
+  gridContextMenu.append(favoriteSeparator);
+
+  // Copy — puts the image's pixels on the clipboard. Second, above everything that alters what
+  // the board or the library holds, for the same reason: it changes nothing.
   const copyBtn = document.createElement('button');
   copyBtn.type = 'button';
   copyBtn.setAttribute('role', 'menuitem');
@@ -3536,7 +4147,7 @@ function openImageContextMenu(path, x, y, { focusMenu = false, returnFocus = nul
   }
 
   openGridContextMenu(x, y);
-  if (focusMenu) lockBtn.focus({ preventScroll: true });
+  if (focusMenu) favoriteBtn.focus({ preventScroll: true });
 }
 
 // Reflect a category change locally so counts and the filter panel update
@@ -4484,6 +5095,9 @@ async function persistSettings() {
       // geo SCOPE, not a mode switch: `browseMode` alone decides whether it drives the pool.
       categorizedSetMode: state.setMode === 'off' ? null : state.setMode,
       categorizedSetCountry: state.setCountry,
+      // Which favorites list the pool is narrowed to. The favorites themselves live in their own
+      // file — this is only the view onto them.
+      favoritesList:     state.favoritesList,
       mixGeoRatio:       state.mixRatio,
       altGeoRatio:       state.altRatio,
       // Merging is a layout layer, not a source, so it persists on its own axis and stays put
@@ -4548,7 +5162,10 @@ async function useCurrentSourceAtStartup() {
   appSettings.startupBrowseMode = state.browseMode;
   appSettings.autoSlideshowSource = autoSlideshowSourceForMode(state.browseMode);
 
-  if (state.browseMode === 'multi') {
+  if (state.browseMode === 'favorites') {
+    // Nothing to record: the favorites pool has no folder or root, and which list it is narrowed
+    // to already persists on its own (`favoritesList`).
+  } else if (state.browseMode === 'multi') {
     appSettings.startupMultiFolders = [...state.multiFolders];
     appSettings.startupMultiFolderFilter = [...state.multiFolderFilter];
   } else {
@@ -4685,6 +5302,18 @@ categoriesSelectNone.addEventListener('click', () => setAllCategorizedCategories
 categoriesRescan.addEventListener('click', () => enterCategorizedMode());
 setsClear.addEventListener('click', leaveGeoMode);
 setsReload.addEventListener('click', reloadCategorizedSets);
+favoritesNewAdd.addEventListener('click', submitNewFavoriteList);
+favoritesNewName.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    submitNewFavoriteList();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    favoritesNewName.value = '';
+    favoritesPendingImage = null;
+    favoritesNewName.blur();
+  }
+});
 folderModeTabs.forEach(tab => {
   tab.addEventListener('click', () => switchBrowseMode(tab.dataset.browseMode));
 });
@@ -4973,7 +5602,11 @@ document.addEventListener('contextmenu', e => {
 });
 
 gridContextMenu.addEventListener('keydown', e => {
-  const items = [...gridContextMenu.querySelectorAll('[role="menuitem"]:not(:disabled)')];
+  // menuitemcheckbox as well as menuitem: the favorites lists are checkbox items, and leaving
+  // them out of the roving set made arrow-keying skip straight over them.
+  const items = [...gridContextMenu.querySelectorAll(
+    '[role="menuitem"]:not(:disabled), [role="menuitemcheckbox"]:not(:disabled)',
+  )];
   const index = items.indexOf(document.activeElement);
 
   if (e.key === 'Escape') {
@@ -5133,6 +5766,28 @@ document.addEventListener('keydown', e => {
     return;
   }
 
+  // Shift+F — flip between the favorites pool and the mode you came from. Tested before plain F
+  // so the chord isn't swallowed, exactly as Shift+M is tested before M.
+  if ((e.key === 'F' || e.key === 'f') && e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    toggleFavoritesMode();
+    return;
+  }
+
+  // F — favorite / unfavorite the hovered tile (or the focused one, for keyboard use). The same
+  // one-click action as the context menu's first item, without opening it.
+  if ((e.key === 'f' || e.key === 'F') && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    const focusedCell = focused && focused.closest ? focused.closest('.grid-cell') : null;
+    const cell = hoveredCell || focusedCell;
+    const img = cell && !cell.classList.contains('empty-slot') ? cell.querySelector('img') : null;
+    const path = img && img.getAttribute('data-src');
+    if (path) {
+      e.preventDefault();
+      toggleFavorite(path);
+    }
+    return;
+  }
+
   // Escape — unwind modals one level at a time
   if (e.key === 'Escape') {
     e.preventDefault();
@@ -5246,7 +5901,7 @@ function finishStartupLoadingAfterFirstImage() {
 // category (Explicit), and setAgentSafe(true) extends that guarantee to the
 // whole window (human UI included) for the session.
 window.SIV = {
-  version: '1.5',
+  version: '1.6',
 
   // --- introspection ---
   blockedCategories: () => [...AGENT_BLOCKED_CATEGORIES],
@@ -5265,6 +5920,13 @@ window.SIV = {
         name: c.name, count: c.count, blocked: isAgentBlocked(c.name),
       })),
       filter: [...state.categorizedCategoryFilter],
+      // Favorites are global and path-keyed, so this describes the whole collection whatever mode
+      // is up; `showing` is only meaningful while browseMode is 'favorites'.
+      favorites: {
+        total: state.favorites.size,
+        lists: state.favoriteLists.map(name => ({ name, count: favoriteListCount(name) })),
+        showing: state.favoritesList,
+      },
       // Geo mode: the scope that is rotating, and the set currently drawn from it. In mix the
       // same fields describe the geo SHARE of the board.
       geo: {
@@ -5325,6 +5987,8 @@ window.SIV = {
         path,
         filename: baseName(path),
         category: usesCategorizedRoot() ? categoryForPath(path) : null,
+        favorite: isFavorite(path),
+        favoriteLists: [...favoriteListsFor(path)],
         ocr: ocrTextCache.get(path) || '',
         name: accessibleImageName(cell, path),
         rect: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) },
@@ -5395,6 +6059,42 @@ window.SIV = {
     return this.getState().merge;
   },
 
+  // --- favorites (global, path-keyed, and reachable from every browse mode) ---
+  favorites() {
+    return {
+      lists: state.favoriteLists.map(name => ({ name, count: favoriteListCount(name) })),
+      images: [...state.favorites.values()].map(entry => ({
+        path: entry.path,
+        addedAt: entry.addedAt,
+        lists: [...entry.lists],
+      })),
+    };
+  },
+  async setFavorite(path, favorite = true) {
+    await applyFavoriteChange(
+      () => window.viewerAPI.setFavorite(path, !!favorite),
+      { path },
+    );
+    return this.favorites();
+  },
+  // Filing into a list favorites the image too — same rule as the menu, enforced in Rust.
+  async setFavoriteList(path, list, member = true) {
+    await applyFavoriteChange(
+      () => window.viewerAPI.setFavoriteList(path, list, !!member),
+      { path },
+    );
+    return this.favorites();
+  },
+  async createFavoriteList(name) {
+    await createFavoriteList(name);
+    return this.favorites();
+  },
+  // null = every favorite. Enters favorites mode, the way picking a list in the panel does.
+  async setFavoritesList(list = null) {
+    selectFavoritesList(list);
+    return this.getState();
+  },
+
   // --- category control (always allowlist-enforced) ---
   setAgentSafe,
   setCategories(names) {
@@ -5460,6 +6160,9 @@ armStartupWatchdog();
     if (state.setMode === 'country' && !state.setCountry) state.setMode = 'off';
     state.mixRatio = clamp(Math.round((s.mixGeoRatio ?? 50) / 5) * 5, 0, 100);
     state.altRatio = clamp(Math.round((s.altGeoRatio ?? 50) / 5) * 5, 0, 100);
+    state.favoritesList = typeof s.favoritesList === 'string' && s.favoritesList.trim()
+      ? s.favoritesList
+      : null;
     state.mergeEnabled = !!s.mergeCellsEnabled;
     state.mergeRatio = clamp(Math.round((s.mergeCellsRatio ?? 50) / 5) * 5, 0, 100);
     state.slideshowDuration = Math.max(1000, s.slideshowDuration || 5000);
@@ -5532,6 +6235,9 @@ armStartupWatchdog();
       setUiHidden(true);
     }
     await window.viewerAPI.setWindowSquareCorners(appSettings.squareAppCorners).catch(() => {});
+    // Before the first pool loads, so the opening board's tiles carry their stars rather than
+    // gaining them a beat later.
+    await loadFavorites();
 
     armStartupWatchdog(STARTUP_WATCHDOG_SCAN_MS);
     if (shouldAutoStartSlideshow() && (windowLabel === 'main' || isSecondWindow())) {
@@ -5540,7 +6246,9 @@ armStartupWatchdog();
       await loadConfiguredStartupSource();
     } else {
       if (windowLabel === 'main' || isSecondWindow()) {
-        if (state.browseMode === 'multi' && state.multiFolders.length) {
+        if (state.browseMode === 'favorites') {
+          await enterFavoritesMode();
+        } else if (state.browseMode === 'multi' && state.multiFolders.length) {
           await enterMultiMode();
         } else if (state.browseMode === 'geo' && state.categorizedRoot) {
           await enterGeoMode();

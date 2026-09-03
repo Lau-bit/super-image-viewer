@@ -30,6 +30,18 @@ window.viewerAPI = {
   // Veto images as geo-set members. Does not recategorize them — see the Rust doc comment.
   excludeFromGeoSets: (root, paths) => invoke('exclude_from_geo_sets', { root, paths }),
   getGeoExcludedPaths: (root) => invoke('get_geo_excluded_paths', { root }),
+  // Favorites — a GLOBAL, path-keyed collection stored beside settings.json, not a sidecar in a
+  // library root: an image is favorited from whatever board is up, and multi-folder mode has no
+  // root to write one into. Every mutator returns the whole store back, so the frontend never has
+  // to guess what the write did.
+  loadFavorites: () => invoke('load_favorites'),
+  setFavorite: (path, favorite) => invoke('set_favorite', { path, favorite }),
+  setFavoriteList: (path, list, member) => invoke('set_favorite_list', { path, list, member }),
+  createFavoriteList: (name) => invoke('create_favorite_list', { name }),
+  renameFavoriteList: (from, to) => invoke('rename_favorite_list', { from, to }),
+  deleteFavoriteList: (name) => invoke('delete_favorite_list', { name }),
+  // `list` = null for every favorite. Grants asset access per parent folder before returning.
+  listFavoriteImages: (list) => invoke('list_favorite_images', { list: list || null }),
   onCategorizedScanProgress: (callback) =>
     listen('categorized-scan-progress', event => callback(event.payload)),
   setImageCategory: (root, path, category) => invoke('set_image_category', { root, path, category }),
