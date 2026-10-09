@@ -52,6 +52,8 @@ window.viewerAPI = {
   saveWindowPositionPreset: (preset) => invoke('save_window_position_preset', { preset }),
   resetWindowPositionPreset: (preset) => invoke('reset_window_position_preset', { preset }),
   setWindowSquareCorners: (square) => invoke('set_window_square_corners', { square }),
+  // Bars hidden (Shift+Q): stop Windows' invisible caption buttons answering at the top-right.
+  setWindowChromeHidden: (hidden) => invoke('set_window_chrome_hidden', { hidden }),
 
   getFileUrl: (filePath) => convertFileSrc(filePath),
 

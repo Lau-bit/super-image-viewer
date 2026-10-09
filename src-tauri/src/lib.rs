@@ -20,6 +20,20 @@ use tauri::{
 
 #[cfg(windows)]
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+    Graphics::Gdi::ScreenToClient,
+    UI::{
+        HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
+        Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+        WindowsAndMessaging::{
+            GetClientRect, GetMessagePos, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTRIGHT,
+            HTTOP, HTTOPRIGHT, SM_CXPADDEDBORDER, SM_CXSIZE, SM_CYCAPTION, SM_CYFRAME,
+            WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN,
+        },
+    },
+};
 
 #[cfg(windows)]
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
@@ -2113,6 +2127,128 @@ fn set_window_square_corners(window: WebviewWindow, square: bool) -> Result<(), 
     set_square_window_corners(&window, square)
 }
 
+// "Clicking the top-right corner closes the app while the bars are hidden" is Windows' own close
+// button. An undecorated tao window still carries WS_CAPTION | WS_SYSMENU, and when the window is
+// flush with the top of a monitor, Windows turns a press on the frame row above where its caption
+// buttons WOULD be into a press on that button (Fitts's-law help for a cursor slammed into the
+// screen edge). Recorded 2026-10-10 with tools/click-recorder.ps1: the click at the screen corner
+// hit-tests as HTTOPRIGHT, yet the title bar's close button (OBJID_TITLEBAR child 5) goes pressed,
+// capture starts, and on release the app exits with code 0. With the bars shown that pixel sits
+// above the app's own ✕, so it is left alone; while they are hidden, this subclass makes the
+// caption-button zone of the frame answer as client area, which never reaches that logic.
+#[cfg(windows)]
+const HIDDEN_CHROME_SUBCLASS_ID: usize = 0x5349_5643;
+
+/// Whether a screen point lies in the frame zone where Windows would place the minimize,
+/// maximize and close buttons: the window's top-right corner, three buttons wide.
+#[cfg(windows)]
+unsafe fn in_caption_button_zone(hwnd: HWND, x: i32, y: i32) -> bool {
+    let mut point = POINT { x, y };
+    let mut client = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if ScreenToClient(hwnd, &mut point) == 0 || GetClientRect(hwnd, &mut client) == 0 {
+        return false;
+    }
+    let dpi = GetDpiForWindow(hwnd);
+    let button_w = GetSystemMetricsForDpi(SM_CXSIZE, dpi).max(46 * dpi as i32 / 96);
+    let padding = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+    let zone_w = 3 * button_w + padding;
+    let zone_h = GetSystemMetricsForDpi(SM_CYCAPTION, dpi)
+        + GetSystemMetricsForDpi(SM_CYFRAME, dpi)
+        + padding;
+    point.x >= client.right - zone_w && point.y < client.top + zone_h
+}
+
+#[cfg(windows)]
+fn is_caption_area_hit(code: u32) -> bool {
+    matches!(
+        code,
+        HTTOP | HTTOPRIGHT | HTRIGHT | HTCLOSE | HTMAXBUTTON | HTMINBUTTON
+    )
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn hidden_chrome_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    _data: usize,
+) -> LRESULT {
+    match msg {
+        WM_NCHITTEST => {
+            let hit = DefSubclassProc(hwnd, msg, wparam, lparam);
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            if is_caption_area_hit(hit as u32) && in_caption_button_zone(hwnd, x, y) {
+                return HTCLIENT as LRESULT;
+            }
+            hit
+        }
+        // Tauri's resize strip along the top edge forwards its clicks here as a posted
+        // WM_NCLBUTTONDOWN (with a pointer where the coordinates belong), so the same remap is
+        // reachable from inside the client area. Judge it by where the cursor really was.
+        WM_NCLBUTTONDOWN if is_caption_area_hit(wparam as u32) => {
+            let pos = GetMessagePos();
+            let x = (pos & 0xFFFF) as i16 as i32;
+            let y = ((pos >> 16) & 0xFFFF) as i16 as i32;
+            if in_caption_button_zone(hwnd, x, y) {
+                return 0;
+            }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        WM_NCDESTROY => {
+            RemoveWindowSubclass(hwnd, Some(hidden_chrome_subclass_proc), id);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Installs the caption-button guard while the window's bars are hidden, removes it when shown.
+#[cfg(windows)]
+fn set_hidden_chrome_guard(window: &WebviewWindow, hidden: bool) -> Result<(), String> {
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("Failed to read window handle: {error}"))?
+        .0 as isize;
+    // Subclassing only works from the thread that owns the window.
+    window
+        .run_on_main_thread(move || unsafe {
+            let hwnd = hwnd as HWND;
+            if hidden {
+                SetWindowSubclass(
+                    hwnd,
+                    Some(hidden_chrome_subclass_proc),
+                    HIDDEN_CHROME_SUBCLASS_ID,
+                    0,
+                );
+            } else {
+                RemoveWindowSubclass(
+                    hwnd,
+                    Some(hidden_chrome_subclass_proc),
+                    HIDDEN_CHROME_SUBCLASS_ID,
+                );
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+fn set_hidden_chrome_guard(_window: &WebviewWindow, _hidden: bool) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+fn set_window_chrome_hidden(window: WebviewWindow, hidden: bool) -> Result<(), String> {
+    set_hidden_chrome_guard(&window, hidden)
+}
+
 #[tauri::command]
 fn get_window_label(window: WebviewWindow) -> String {
     window.label().to_string()
@@ -2421,6 +2557,7 @@ pub fn run() {
             save_settings,
             save_window_position_preset,
             set_window_square_corners,
+            set_window_chrome_hidden,
             window_start_drag,
             window_minimize,
             window_close,

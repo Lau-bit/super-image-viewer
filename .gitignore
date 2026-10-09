@@ -55,3 +55,6 @@ api-token.txt
 .*-config.json
 *-config.local.json
 
+
+# Click-recorder output (tools/click-recorder.ps1)
+tools/recordings/

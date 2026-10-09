@@ -5040,6 +5040,9 @@ function setUiHidden(hidden) {
   state.uiHidden = hidden;
   document.body.classList.toggle('ui-hidden', hidden);
   if (hidden) closeSlideshowTimerPopover();
+  // With the ✕ gone, a click at the screen-corner pixel must not reach Windows' own (invisible)
+  // close button — see the comment above `set_window_chrome_hidden` in lib.rs.
+  window.viewerAPI.setWindowChromeHidden(hidden).catch(() => {});
 }
 
 // ==============================
