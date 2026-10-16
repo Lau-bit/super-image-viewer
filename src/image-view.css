@@ -41,6 +41,52 @@ body.load-error #image {
   height: auto;
 }
 
+/* The same star a favorited grid tile wears (styles.css .grid-cell.favorited::before), so an image
+   reads as favorited the same way in both places. Never takes pointer events: the corner sits in
+   the window-drag band. */
+#favorite-badge {
+  position: absolute;
+  top: 4px;
+  left: 6px;
+  display: none;
+  color: #ffd166;
+  font-size: 18px;
+  line-height: 1;
+  text-shadow: 0 0 3px rgba(0, 0, 0, 0.95), 0 1px 2px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+  z-index: 5;
+}
+
+body.favorited #favorite-badge {
+  display: block;
+}
+
+/* Toast + live region in one: what a favorites click did, said once to the eye and once to a
+   screen reader. Lives in the bottom drag band, so it must never take pointer events. */
+#status {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  max-width: calc(100% - 24px);
+  transform: translateX(-50%);
+  padding: 5px 12px;
+  border-radius: 12px;
+  background: rgba(20, 20, 20, 0.9);
+  color: #eee;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+  z-index: 6;
+}
+
+#status.visible {
+  opacity: 1;
+}
+
 #close-zone {
   position: absolute;
   top: 0;
@@ -101,6 +147,9 @@ body.load-error #image {
   padding: 4px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
   z-index: 10;
+  /* A viewer can be as small as 200x150 and the list rows grow with the favorites lists. */
+  max-height: calc(100vh - 8px);
+  overflow-y: auto;
 }
 
 #context-menu.open {
@@ -122,4 +171,45 @@ body.load-error #image {
 #context-menu button:hover {
   background: #272727;
   color: #fff;
+}
+
+#context-menu .favorite-item.current {
+  color: #ffd166;
+}
+
+#menu-favorite-lists {
+  display: flex;
+  flex-direction: column;
+}
+
+#menu-favorite-lists:empty {
+  display: none;
+}
+
+#menu-favorite-lists .menu-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #888;
+  padding: 5px 10px 4px;
+}
+
+/* Name left, check right — the grid menu's list rows. */
+#menu-favorite-lists button {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+#menu-favorite-lists button > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#context-menu .menu-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: #2a2a2a;
 }

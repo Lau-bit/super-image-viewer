@@ -42,6 +42,10 @@ window.viewerAPI = {
   deleteFavoriteList: (name) => invoke('delete_favorite_list', { name }),
   // `list` = null for every favorite. Grants asset access per parent folder before returning.
   listFavoriteImages: (list) => invoke('list_favorite_images', { list: list || null }),
+  // Every favorites write is broadcast as `{source, lists, images}` — the whole store plus the
+  // label of the window that made it — so a star set in a floating viewer reaches the grid.
+  onFavoritesChanged: (callback) =>
+    listen('favorites-changed', event => callback(event.payload)),
   onCategorizedScanProgress: (callback) =>
     listen('categorized-scan-progress', event => callback(event.payload)),
   setImageCategory: (root, path, category) => invoke('set_image_category', { root, path, category }),

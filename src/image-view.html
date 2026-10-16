@@ -13,6 +13,8 @@
 </head>
 <body>
   <img id="image" draggable="false" alt="">
+  <div id="favorite-badge" aria-hidden="true">&#x2605;</div>
+  <div id="status" role="status" aria-live="polite"></div>
 
   <div id="close-zone">
     <button id="btn-drag" title="Drag to move" aria-label="Drag to move window">&#x2807;&#x2807;</button>
@@ -20,6 +22,9 @@
   </div>
 
   <div id="context-menu">
+    <button type="button" id="menu-favorite" class="favorite-item">&#x2606; Favorite</button>
+    <div id="menu-favorite-lists"></div>
+    <div class="menu-separator" role="separator"></div>
     <button type="button" id="menu-copy">Copy</button>
     <button type="button" id="menu-reveal">Open image folder</button>
     <button type="button" id="menu-close">Close floating image</button>

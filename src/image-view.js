@@ -5,12 +5,16 @@ const closeZone = document.getElementById('close-zone');
 const btnClose = document.getElementById('btn-close');
 const btnDrag = document.getElementById('btn-drag');
 const contextMenu = document.getElementById('context-menu');
+const menuFavorite = document.getElementById('menu-favorite');
+const menuFavoriteLists = document.getElementById('menu-favorite-lists');
 const menuCopy = document.getElementById('menu-copy');
 const menuReveal = document.getElementById('menu-reveal');
 const menuClose = document.getElementById('menu-close');
+const statusEl = document.getElementById('status');
 
 let currentPath = null;
 let keepVisiblePinned = false;
+let windowLabel = null;
 
 // --- Zoom & pan state ---------------------------------------------------
 // The <img> fills the window; we transform it (origin 0,0) to zoom/pan.
@@ -69,6 +73,7 @@ async function init() {
     // the asset: protocol is a different origin from the page itself.
     img.crossOrigin = 'anonymous';
     img.src = window.viewerAPI.getFileUrl(currentPath);
+    await initFavorites();
   } catch (error) {
     console.error('Failed to load floating image:', error);
     showError('Failed to load image.');
@@ -88,6 +93,132 @@ async function copyImageToClipboard() {
   const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
   if (!blob) return;
   await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+}
+
+// --- Favorites ------------------------------------------------------------
+// The same global store the grid's right-click menu writes (favorites.json, Rust side). This
+// window only keeps its own image's slice of it: the declared lists, and the store entry for
+// `currentPath` (null = not a favorite). Rust broadcasts every write, so a star set on the grid
+// while this viewer is open shows up here, and one set here reaches the grid's tile badge.
+let favoriteLists = [];
+let favoriteEntry = null;
+let statusTimer = null;
+
+// Lowercased like the grid's fileKey and Rust's favorite_key — Windows paths are
+// case-insensitive, and the same file reached two ways is ONE favorite.
+const fileKey = (path) => String(path || '').toLocaleLowerCase();
+const baseName = (path) => String(path || '').split(/[\\/]/).pop();
+
+function installFavorites(view) {
+  favoriteLists = Array.isArray(view && view.lists) ? view.lists.filter(Boolean) : [];
+  const images = Array.isArray(view && view.images) ? view.images : [];
+  const key = fileKey(currentPath);
+  favoriteEntry = currentPath
+    ? images.find(entry => entry && fileKey(entry.path) === key) || null
+    : null;
+  document.body.classList.toggle('favorited', !!favoriteEntry);
+  if (contextMenu.classList.contains('open')) renderFavoriteMenu();
+}
+
+async function loadFavorites() {
+  try {
+    installFavorites(await window.viewerAPI.loadFavorites());
+  } catch (error) {
+    console.error('Failed to load favorites:', error);
+  }
+}
+
+function showStatus(message) {
+  clearTimeout(statusTimer);
+  // Cleared first so the same message twice in a row is still announced.
+  statusEl.textContent = '';
+  statusEl.textContent = message;
+  statusEl.classList.add('visible');
+  statusTimer = setTimeout(() => statusEl.classList.remove('visible'), 1600);
+}
+
+async function applyFavoriteChange(run, message) {
+  try {
+    installFavorites(await run());
+  } catch (error) {
+    console.error('Favorites write failed:', error);
+    // A Tauri command rejects with a plain string, not an Error.
+    showStatus(typeof error === 'string' && error ? error : 'Could not save favorites');
+    await loadFavorites();
+    return;
+  }
+  showStatus(message);
+}
+
+// A toggle, exactly like the grid menu's lead item: the same click undoes a mis-aimed one.
+function toggleFavorite() {
+  if (!currentPath) return;
+  const nowFavorite = !favoriteEntry;
+  const listed = favoriteEntry ? favoriteEntry.lists || [] : [];
+  applyFavoriteChange(
+    () => window.viewerAPI.setFavorite(currentPath, nowFavorite),
+    nowFavorite
+      ? 'Favorited'
+      : (listed.length ? `Removed from favorites (was in ${listed.join(', ')})` : 'Removed from favorites'),
+  );
+}
+
+function setFavoriteListMembership(list, member) {
+  if (!currentPath) return;
+  applyFavoriteChange(
+    () => window.viewerAPI.setFavoriteList(currentPath, list, member),
+    member ? `Added to ${list}` : `Removed from ${list}`,
+  );
+}
+
+// Rebuilt on every open. Lists appear only when some exist — with none defined the menu carries
+// the one Favorite item, same as the grid's. Creating a list stays in the main window's panel.
+function renderFavoriteMenu() {
+  const name = baseName(currentPath);
+  const favorited = !!favoriteEntry;
+  menuFavorite.textContent = favorited ? '★ Favorited' : '☆ Favorite';
+  menuFavorite.classList.toggle('current', favorited);
+  menuFavorite.setAttribute('aria-pressed', String(favorited));
+  menuFavorite.setAttribute('aria-label', favorited
+    ? `Remove ${name} from favorites`
+    : `Favorite ${name}`);
+
+  menuFavoriteLists.textContent = '';
+  if (!favoriteLists.length) return;
+  const held = new Set(favoriteEntry ? favoriteEntry.lists || [] : []);
+  const title = document.createElement('div');
+  title.className = 'menu-title';
+  title.textContent = 'Favorite lists';
+  menuFavoriteLists.append(title);
+  for (const list of favoriteLists) {
+    const inList = held.has(list);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.setAttribute('aria-pressed', String(inList));
+    button.setAttribute('aria-label', inList ? `Remove ${name} from ${list}` : `Add ${name} to ${list}`);
+    const label = document.createElement('span');
+    label.textContent = list;
+    const mark = document.createElement('span');
+    mark.textContent = inList ? '✓' : '';
+    button.append(label, mark);
+    button.addEventListener('click', () => {
+      closeContextMenu();
+      setFavoriteListMembership(list, !inList);
+    });
+    menuFavoriteLists.append(button);
+  }
+}
+
+async function initFavorites() {
+  windowLabel = await window.viewerAPI.getWindowLabel().catch(() => null);
+  // Listen BEFORE the first load, so a write landing in between is not missed. This window's own
+  // writes are skipped: their return value is already installed, and a late echo could only roll
+  // a newer edit back.
+  await window.viewerAPI.onFavoritesChanged((payload) => {
+    if (!payload || payload.source === windowLabel) return;
+    installFavorites(payload);
+  }).catch(error => console.error('Failed to listen for favorites changes:', error));
+  await loadFavorites();
 }
 
 function openContextMenu(x, y) {
@@ -215,11 +346,18 @@ document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 img.addEventListener('contextmenu', (e) => {
   e.preventDefault();
+  // Before opening: openContextMenu clamps by the menu's size, which the list rows change.
+  renderFavoriteMenu();
   openContextMenu(e.clientX, e.clientY);
 });
 
 document.addEventListener('click', (e) => {
   if (!contextMenu.contains(e.target)) closeContextMenu();
+});
+
+menuFavorite.addEventListener('click', () => {
+  closeContextMenu();
+  toggleFavorite();
 });
 
 menuCopy.addEventListener('click', () => {
@@ -248,6 +386,12 @@ document.addEventListener('keydown', (e) => {
     }
     e.preventDefault();
     closeWindow();
+    return;
+  }
+  // F favorites, as it does for the hovered tile on the grid.
+  if ((e.key === 'f' || e.key === 'F') && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    toggleFavorite();
     return;
   }
   if (e.key === 'c' || e.key === 'C') {

@@ -2612,13 +2612,33 @@ async function applyFavoriteChange(run, { path = null, failure = 'Could not save
     await loadFavorites();
     return false;
   }
-  // Only while the favorites pool IS the board. Everywhere else a star is decoration on a tile
-  // that belongs to some other pool, and pulling it would be a hide the user never asked for.
-  if (path && state.browseMode === 'favorites' && !favoritePoolIncludes(path)) {
-    if (state.displayedSlots.includes(path)) removeDisplayedImage(path);
-    else state.allImages = state.allImages.filter(image => image.path !== path);
-  }
+  if (path) dropIfLeftFavoritesPool(path);
   return true;
+}
+
+// Only while the favorites pool IS the board. Everywhere else a star is decoration on a tile
+// that belongs to some other pool, and pulling it would be a hide the user never asked for.
+function dropIfLeftFavoritesPool(path) {
+  if (state.browseMode !== 'favorites' || favoritePoolIncludes(path)) return;
+  if (state.displayedSlots.includes(path)) removeDisplayedImage(path);
+  else state.allImages = state.allImages.filter(image => image.path !== path);
+}
+
+// An edit made in ANOTHER window — a floating viewer's right-click menu, or the second grid
+// window. This window's own edits are skipped: applyFavoriteChange already installed what the
+// command returned, so the echo adds nothing — and arriving late, it could roll a newer edit back.
+function onFavoritesChangedElsewhere(payload) {
+  if (!payload || payload.source === windowLabel) return;
+  const filteredTo = state.favoritesList;
+  installFavorites(payload);
+  if (state.browseMode !== 'favorites') return;
+  // installFavorites drops a filter whose list was renamed or deleted over there; the board is
+  // still that list's slice, so reload it rather than leave the label and the tiles disagreeing.
+  if (state.favoritesList !== filteredTo) {
+    enterFavoritesMode();
+    return;
+  }
+  for (const image of [...state.allImages]) dropIfLeftFavoritesPool(image.path);
 }
 
 // THE one-click action. A toggle, so a mis-aimed click is undone by the same click — which is why
@@ -6241,6 +6261,8 @@ armStartupWatchdog();
     // Before the first pool loads, so the opening board's tiles carry their stars rather than
     // gaining them a beat later.
     await loadFavorites();
+    window.viewerAPI.onFavoritesChanged(onFavoritesChangedElsewhere)
+      .catch(error => console.error('Failed to listen for favorites changes:', error));
 
     armStartupWatchdog(STARTUP_WATCHDOG_SCAN_MS);
     if (shouldAutoStartSlideshow() && (windowLabel === 'main' || isSecondWindow())) {

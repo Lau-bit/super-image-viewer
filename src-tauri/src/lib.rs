@@ -1046,6 +1046,35 @@ fn save_favorites_file(app: &AppHandle, file: &mut FavoritesFile) -> Result<(), 
     fs::write(path, data).map_err(|error| format!("Failed to save favorites: {error}"))
 }
 
+/// The broadcast after every favorites write. Each window holds its own copy of the store — the
+/// grid's star badges and panel, a floating viewer's menu — and a star set in one has to show in
+/// the others. `source` is the window that made the edit, so it can skip its own echo: it already
+/// installed the command's return value, and a late echo could only ever be older than that.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FavoritesChanged<'a> {
+    source: &'a str,
+    #[serde(flatten)]
+    view: &'a FavoritesView,
+}
+
+fn commit_favorites(
+    app: &AppHandle,
+    source: &WebviewWindow,
+    mut file: FavoritesFile,
+) -> Result<FavoritesView, String> {
+    save_favorites_file(app, &mut file)?;
+    let view = favorites_view(file);
+    let _ = app.emit(
+        "favorites-changed",
+        FavoritesChanged {
+            source: source.label(),
+            view: &view,
+        },
+    );
+    Ok(view)
+}
+
 fn favorite_index(file: &FavoritesFile, path: &str) -> Option<usize> {
     let key = favorite_key(path);
     file.images
@@ -1062,7 +1091,12 @@ fn load_favorites(app: AppHandle) -> FavoritesView {
 /// something hung off "is a favorite", so leaving the rows behind would file an image under a list
 /// while the star says it is not a favorite at all.
 #[tauri::command]
-fn set_favorite(app: AppHandle, path: String, favorite: bool) -> Result<FavoritesView, String> {
+fn set_favorite(
+    app: AppHandle,
+    window: WebviewWindow,
+    path: String,
+    favorite: bool,
+) -> Result<FavoritesView, String> {
     if path.trim().is_empty() {
         return Err("No image path given".to_string());
     }
@@ -1079,8 +1113,7 @@ fn set_favorite(app: AppHandle, path: String, favorite: bool) -> Result<Favorite
         // Already in the state asked for — don't rewrite the file for nothing.
         _ => return Ok(favorites_view(file)),
     }
-    save_favorites_file(&app, &mut file)?;
-    Ok(favorites_view(file))
+    commit_favorites(&app, &window, file)
 }
 
 /// File an image into (or out of) one user-defined list. Filing in favorites the image if it was
@@ -1089,6 +1122,7 @@ fn set_favorite(app: AppHandle, path: String, favorite: bool) -> Result<Favorite
 #[tauri::command]
 fn set_favorite_list(
     app: AppHandle,
+    window: WebviewWindow,
     path: String,
     list: String,
     member: bool,
@@ -1133,12 +1167,15 @@ fn set_favorite_list(
     } else {
         file.images[index].lists.retain(|name| *name != canonical);
     }
-    save_favorites_file(&app, &mut file)?;
-    Ok(favorites_view(file))
+    commit_favorites(&app, &window, file)
 }
 
 #[tauri::command]
-fn create_favorite_list(app: AppHandle, name: String) -> Result<FavoritesView, String> {
+fn create_favorite_list(
+    app: AppHandle,
+    window: WebviewWindow,
+    name: String,
+) -> Result<FavoritesView, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("Give the list a name".to_string());
@@ -1156,12 +1193,16 @@ fn create_favorite_list(app: AppHandle, name: String) -> Result<FavoritesView, S
         return Err(format!("That is the {FAVORITE_LISTS_MAX}-list limit"));
     }
     file.lists.push(name);
-    save_favorites_file(&app, &mut file)?;
-    Ok(favorites_view(file))
+    commit_favorites(&app, &window, file)
 }
 
 #[tauri::command]
-fn rename_favorite_list(app: AppHandle, from: String, to: String) -> Result<FavoritesView, String> {
+fn rename_favorite_list(
+    app: AppHandle,
+    window: WebviewWindow,
+    from: String,
+    to: String,
+) -> Result<FavoritesView, String> {
     let to = to.trim().to_string();
     if to.is_empty() {
         return Err("Give the list a name".to_string());
@@ -1198,14 +1239,17 @@ fn rename_favorite_list(app: AppHandle, from: String, to: String) -> Result<Favo
             }
         }
     }
-    save_favorites_file(&app, &mut file)?;
-    Ok(favorites_view(file))
+    commit_favorites(&app, &window, file)
 }
 
 /// Retire a list. Its images STAY favorites — the list is a tag over that membership, not the
 /// thing that created it, so deleting one must never quietly un-favorite a pile of images.
 #[tauri::command]
-fn delete_favorite_list(app: AppHandle, name: String) -> Result<FavoritesView, String> {
+fn delete_favorite_list(
+    app: AppHandle,
+    window: WebviewWindow,
+    name: String,
+) -> Result<FavoritesView, String> {
     let mut file = load_favorites_file(&app);
     let Some(index) = file
         .lists
@@ -1218,8 +1262,7 @@ fn delete_favorite_list(app: AppHandle, name: String) -> Result<FavoritesView, S
     for entry in &mut file.images {
         entry.lists.retain(|held| *held != removed);
     }
-    save_favorites_file(&app, &mut file)?;
-    Ok(favorites_view(file))
+    commit_favorites(&app, &window, file)
 }
 
 /// Open one directory to the `asset:` protocol for a single file's sake.
